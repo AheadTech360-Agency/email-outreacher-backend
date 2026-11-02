@@ -257,6 +257,9 @@ class QueueOutcome:
 
 
 RISKY = "Risky email address (the domain accepts any address, so it may bounce). Confirm it separately to queue it."
+WEBSITE = "A general address from their website (like orders@), not a person's. Confirm it separately to queue it."
+# Addresses that need their own OK to queue, and why.
+CONFIRM_FIRST = {"risky": RISKY, "website": WEBSITE}
 
 
 async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozenset()) -> list[QueueOutcome]:
@@ -274,8 +277,8 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
     for email, lead in pairs:
         if not lead.email:
             outcomes.append(QueueOutcome(email.id, "skipped", "The lead has no email address"))
-        elif lead.email_status == "risky" and email.id not in risky_ok:
-            outcomes.append(QueueOutcome(email.id, "skipped", RISKY))
+        elif lead.email_status in CONFIRM_FIRST and email.id not in risky_ok:
+            outcomes.append(QueueOutcome(email.id, "skipped", CONFIRM_FIRST[lead.email_status]))
         elif hit := is_excluded(person_keys(lead.email, lead.domain)):
             outcomes.append(QueueOutcome(email.id, "skipped", exclusion_note(hit)))
         elif not lead.lead_intel_icp_id:

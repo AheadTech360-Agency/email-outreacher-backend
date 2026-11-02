@@ -250,6 +250,15 @@ def test_a_risky_address_needs_its_own_confirmation_to_queue() -> None:
     assert risky[0].status == "approved"  # still approved, waiting for its own confirmation
 
 
+def test_a_website_address_needs_its_own_confirmation_to_queue() -> None:
+    """orders@ or info@ from a company's site reaches a shared inbox, not a person: reviewed and confirmed separately."""
+    site, confirmed = (email(), lead(email="orders@quicktransfers.com", email_status="website")),         (email(), lead(email="info@dtfaffordable.com", email_status="website"))  # fmt: skip
+    out = run(outreach.queue(deps(Sending([site, confirmed]), Sequencer([CAMPAIGN])), [site[0].id, confirmed[0].id], {confirmed[0].id}))
+    by_id = {o.email_id: o for o in out}
+    assert by_id[site[0].id].status == "skipped" and by_id[site[0].id].reason == outreach.WEBSITE
+    assert by_id[confirmed[0].id].status == "queued"
+
+
 def test_queue_needs_the_sender_address() -> None:
     with pytest.raises(SendingError, match="physical address"):
         run(outreach.queue(deps(Sending([]), Sequencer([]), settings=SETTINGS | {"sender_address": " "}), [uuid4()]))

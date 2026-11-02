@@ -366,6 +366,8 @@ async def generate(
             flags.append("not_scored")
         if lead.email_status == "risky":
             flags.append("risky_email")  # a catch-all domain: it may bounce, so it needs its own approval to queue
+        if lead.email_status == "website":
+            flags.append("website_email")  # orders@ or info@ from their site, not a person: it needs its own approval too
         row = await emails.save_draft(
             workspace_id, lead, points=points,
             email={
