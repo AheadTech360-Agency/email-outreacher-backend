@@ -373,7 +373,7 @@ async def run_sort(
     lists: dict[str, Any] = {}
     icp_ids = {i["name"]: i["id"] for i in icps}
     by_icp: dict[Any, list[Any]] = {}
-    unmatched_lists: set[str] = set()
+    unmatched: dict[str, int] = {}  # list -> how many of its companies no ICP fits
     for key, choice in result.picks.items():
         nk = name_key(choice.list)
         if nk not in lists:
@@ -388,7 +388,7 @@ async def run_sort(
                 by_icp.setdefault(icp_ids[choice.icp], []).extend(m.id for m in ask[key])
                 out.matched_icp += len(ask[key])
             else:
-                unmatched_lists.add(nk)
+                unmatched[nk] = unmatched.get(nk, 0) + len(ask[key])
     out.by_claude = len(result.picks)
     await repo.add_members(workspace_id, kind, rows)
     out.sorted = len(rows)
@@ -396,7 +396,10 @@ async def run_sort(
         await repo.assign_icp(workspace_id, icp_id, company_ids)
 
     # New ICPs aren't created, only drafted: one per list that got companies no ICP fits.
-    to_draft = [lists[nk] for nk in unmatched_lists if not lists[nk].lead_intel_icp_id and not lists[nk].icp_draft][:MAX_DRAFTS]
+    # Biggest first, so the lists that matter most get one within the cap; never "Uncategorized".
+    ranked = sorted(unmatched, key=lambda nk: -unmatched[nk])
+    to_draft = [lists[nk] for nk in ranked
+                if nk != name_key("Uncategorized") and not lists[nk].lead_intel_icp_id and not lists[nk].icp_draft][:MAX_DRAFTS]  # fmt: skip
     for i, lst in enumerate(to_draft):
         await progress("Drafting ICPs", i, len(to_draft))
         drafted = await draft_for(workspace_id, lst, repo, claude, spec.model, record)

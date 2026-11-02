@@ -241,3 +241,11 @@ def test_sites_are_read_with_plain_requests_only_and_batches_run_together(client
     reader.jina_off = lambda off=True: (jina.append(off), __import__("contextlib").nullcontext())[1]
     out, _ = run_sort_endpoint(client, FakeRepo(shops), FakeClaude(lambda text: ("Retail", "")), reader)
     assert jina == [True] and len(reader.read_domains) == 60 and out["sorted"] == 60 and out["byClaude"] == 60
+
+
+def test_drafts_go_to_the_biggest_lists_first_and_never_uncategorized(client) -> None:
+    shops = [company(f"Shop {i}", f"s{i}.com") for i in range(30)]
+    pick = lambda text: ("Retail" if int(text.split("Shop ")[1].split()[0]) < 20 else "Uncategorized", "")  # noqa: E731
+    repo = FakeRepo(shops)
+    out, _ = run_sort_endpoint(client, repo, FakeClaude(pick))
+    assert out["drafted"] == ["Retail"]
