@@ -11,7 +11,7 @@ from sqlalchemy.orm import aliased
 
 from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
-    Exclusion, Job, QuickstartRun, SendEvent, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
+    Exclusion, Job, QuickstartRun, SendEvent, SmartList, SmartListMember, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
 )  # fmt: skip
 from services.apify import Employee, FetchedPost, search_name
 from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
@@ -1309,6 +1309,37 @@ class CompanyRepo:
         await self.session.commit()
         return added, dupes
 
+    async def csv_company_adder(self, workspace_id: UUID, icp_id: UUID | None):
+        """A function adding the company of a person from an Apollo export (one with an Apollo Account Id), so CSV
+        companies reach the Companies page and smart lists. A company already here (same Apollo account or domain)
+        is returned, not added twice. Each one added is committed with the person."""
+        _, by_apollo, by_domain = await self._by_keys(workspace_id)
+
+        def add(person: Any, domain: str | None) -> Company | None:
+            account = person.apollo_account_id
+            if not account or not person.company:
+                return None
+            if found := by_apollo.get(account) or (by_domain.get(domain) if domain else None):
+                return found
+            extra = person.extra or {}
+            row = Company(
+                workspace_id=workspace_id, icp_id=icp_id, source="apollo", apollo_org_id=account, name=person.company,
+                domain=domain, website_url=person.website or None, linkedin_url=person.company_linkedin_url or None,
+                facebook_url=person.facebook_url or None, twitter_url=person.twitter_url or None,
+                city=extra.get("Company City") or person.city or None, state=extra.get("Company State") or person.state or None,
+                phone=extra.get("Company Phone") or None, status="found",
+                raw={"added": "csv", "industry": extra.get("Industry") or None, "keywords": extra.get("Keywords") or None,
+                     "employees": extra.get("# Employees") or None, "address": extra.get("Company Address") or None,
+                     "country": extra.get("Company Country") or person.country or None},
+            )  # fmt: skip
+            self.session.add(row)
+            by_apollo[account] = row
+            if domain:
+                by_domain[domain] = row
+            return row
+
+        return add
+
     async def add_google_maps(self, workspace_id: UUID, icp_id: UUID, places: list[tuple[Place, str | None]]) -> tuple[int, int]:
         """Add Google Maps businesses to be researched, each with its website domain (or None).
         Returns (added, duplicates). A duplicate shares any identity key with a company already here,
@@ -1851,3 +1882,109 @@ class QuickstartRepo:
             return {}
         rows = await self.session.execute(select(Post.lead_id, func.count()).where(Post.lead_id.in_(lead_ids)).group_by(Post.lead_id))
         return {lead_id: n for lead_id, n in rows}
+
+
+class SmartListRepo:
+    """Smart lists (`outreach.eo_smart_lists`) and who's in them (`eo_smart_list_members`). Companies and people
+    themselves are only read here."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def lists(self, workspace_id: UUID, kind: str) -> list[tuple[SmartList, int]]:
+        count = (
+            select(SmartListMember.list_id, func.count().label("n"))
+            .where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind)
+            .group_by(SmartListMember.list_id)
+            .subquery()
+        )
+        rows = await self.session.execute(
+            select(SmartList, func.coalesce(count.c.n, 0))
+            .outerjoin(count, count.c.list_id == SmartList.id)
+            .where(SmartList.workspace_id == workspace_id, SmartList.kind == kind)
+            .order_by(func.coalesce(count.c.n, 0).desc(), SmartList.name)
+        )
+        return [(row[0], int(row[1])) for row in rows]
+
+    async def get(self, workspace_id: UUID, list_id: UUID) -> SmartList | None:
+        return await self.session.scalar(select(SmartList).where(SmartList.workspace_id == workspace_id, SmartList.id == list_id))
+
+    def _unsorted(self, workspace_id: UUID, kind: str):
+        model = Company if kind == "company" else Stakeholder
+        sorted_ids = select(SmartListMember.member_id).where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind)
+        return model, select(model).where(model.workspace_id == workspace_id, model.id.not_in(sorted_ids))
+
+    async def unsorted(self, workspace_id: UUID, kind: str, limit: int) -> list[Any]:
+        model, query = self._unsorted(workspace_id, kind)
+        order = model.created_at if kind == "company" else model.found_at
+        return list(await self.session.scalars(query.order_by(order).limit(limit)))
+
+    async def count_unsorted(self, workspace_id: UUID, kind: str) -> int:
+        _, query = self._unsorted(workspace_id, kind)
+        return int(await self.session.scalar(select(func.count()).select_from(query.subquery())) or 0)
+
+    async def sorted_keys(self, workspace_id: UUID, kind: str) -> dict[str, UUID]:
+        rows = await self.session.execute(
+            select(SmartListMember.dedupe_key, SmartListMember.list_id).where(
+                SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind
+            )
+        )
+        return {key: list_id for key, list_id in rows}
+
+    async def get_or_create(self, workspace_id: UUID, kind: str, name: str, key: str) -> SmartList:
+        statement = insert(SmartList).values(workspace_id=workspace_id, kind=kind, name=name, name_key=key)
+        await self.session.execute(statement.on_conflict_do_nothing(index_elements=["workspace_id", "kind", "name_key"]))
+        return await self.session.scalar(
+            select(SmartList).where(SmartList.workspace_id == workspace_id, SmartList.kind == kind, SmartList.name_key == key)
+        )
+
+    async def add_members(self, workspace_id: UUID, kind: str, rows: list[tuple[UUID, UUID, str, str]]) -> None:
+        """(member_id, list_id, dedupe_key, reason); a member already sorted keeps its list."""
+        for member_id, list_id, key, reason in rows:
+            statement = insert(SmartListMember).values(
+                workspace_id=workspace_id, kind=kind, member_id=member_id, list_id=list_id, dedupe_key=key, reason=reason
+            )
+            await self.session.execute(statement.on_conflict_do_nothing())
+        await self.session.commit()
+
+    async def members(self, workspace_id: UUID, lst: SmartList) -> list[tuple[Any, SmartListMember]]:
+        model = Company if lst.kind == "company" else Stakeholder
+        rows = await self.session.execute(
+            select(model, SmartListMember)
+            .join(SmartListMember, (SmartListMember.member_id == model.id) & (SmartListMember.kind == lst.kind))
+            .where(SmartListMember.workspace_id == workspace_id, SmartListMember.list_id == lst.id)
+            .order_by(model.name if lst.kind == "company" else model.first_name)
+        )
+        return [(row[0], row[1]) for row in rows]
+
+    async def list_names(self, workspace_id: UUID, kind: str, member_ids: list[UUID]) -> dict[UUID, str]:
+        if not member_ids:
+            return {}
+        rows = await self.session.execute(
+            select(SmartListMember.member_id, SmartList.name)
+            .join(SmartList, SmartList.id == SmartListMember.list_id)
+            .where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind, SmartListMember.member_id.in_(member_ids))
+        )
+        return {member_id: name for member_id, name in rows}
+
+    async def people_at(self, workspace_id: UUID, company_ids: list[UUID]) -> list[Stakeholder]:
+        if not company_ids:
+            return []
+        return list(await self.session.scalars(
+            select(Stakeholder).where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(company_ids))
+        ))  # fmt: skip
+
+    async def all_people(self, workspace_id: UUID) -> list[Stakeholder]:
+        query = select(Stakeholder).where(Stakeholder.workspace_id == workspace_id).order_by(Stakeholder.found_at)
+        return list(await self.session.scalars(query))
+
+    async def companies(self, workspace_id: UUID, ids: list[UUID]) -> dict[UUID, Company]:
+        if not ids:
+            return {}
+        rows = await self.session.scalars(select(Company).where(Company.workspace_id == workspace_id, Company.id.in_(ids)))
+        return {c.id: c for c in rows}
+
+    async def save(self, lst: SmartList) -> None:
+        self.session.add(lst)
+        await self.session.commit()
+

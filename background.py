@@ -44,6 +44,7 @@ LONG_RUNNING: dict[str, str] = {
     "/sending/queue": "Queueing emails",
     "/sending/follow-ups/run": "Writing follow-ups",
     "/sending/campaigns/sync": "Syncing campaigns",
+    "/smart-lists/sort": "Sorting smart lists",
 }
 
 

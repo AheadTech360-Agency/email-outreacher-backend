@@ -38,6 +38,8 @@ MANAGEMENT_ONLY = [
     ("post", "/leads/delete", {}), ("post", "/leads/move", {}),
     ("post", "/sending/follow-ups/run", {}),
     ("put", "/settings/feedback", {}), ("put", "/settings/research", {}),
+    ("post", "/smart-lists/sort", {"kind": "company"}), ("patch", f"/smart-lists/{uuid4()}", {}),
+    ("post", f"/smart-lists/{uuid4()}/draft-icp", {}), ("post", f"/smart-lists/{uuid4()}/create-icp", {}),
     ("post", "/quickstart/runs", {}), ("post", f"/quickstart/runs/{uuid4()}/stop", {}), ("post", f"/quickstart/runs/{uuid4()}/resume", {}),
 ]  # fmt: skip
 

@@ -563,6 +563,49 @@ class QuickstartRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class SmartList(Base):
+    """A high-level group Claude sorted companies or people into, like GoHighLevel's smart lists: "Retail",
+    "Manufacturing" for companies, "Owners & Executives", "Marketing" for people. Never a sub-category. A company
+    list can hold a draft base ICP, and the Lead Intel ICP made from it."""
+
+    __tablename__ = "eo_smart_lists"
+    __table_args__ = (
+        CheckConstraint(_in("kind", ("company", "person")), name="kind"),
+        # The name compared without case or punctuation: "Food & Beverage" and "food and beverage" are one list.
+        UniqueConstraint("workspace_id", "kind", "name_key"),
+    )
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    kind: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    name_key: Mapped[str] = mapped_column(Text)
+    # Claude's draft ICP for a company list (schemas.SmartListIcpDraft), until someone creates it.
+    icp_draft: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    lead_intel_icp_id: Mapped[UUID | None] = mapped_column(default=None)  # no foreign key: Lead Intel's table
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class SmartListMember(Base):
+    """Which list a company (eo_companies) or person (eo_stakeholders) is in: one list each. `dedupe_key` is how
+    duplicates are recognised (domain, email...): a duplicate joins its twin's list without asking Claude again."""
+
+    __tablename__ = "eo_smart_list_members"
+    __table_args__ = (
+        CheckConstraint(_in("kind", ("company", "person")), name="kind"),
+        Index("eo_smart_list_members_key_idx", "workspace_id", "kind", "dedupe_key"),
+    )
+
+    workspace_id: Mapped[UUID] = mapped_column(ForeignKey("eo_workspaces.id", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    member_id: Mapped[UUID] = mapped_column(primary_key=True)  # a company's or a person's id, by kind
+    list_id: Mapped[UUID] = mapped_column(ForeignKey("eo_smart_lists.id", ondelete="CASCADE"), index=True)
+    dedupe_key: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text, server_default="")
+    sorted_at: Mapped[datetime] = _created()
+
+
 class ProviderCall(Base):
     """Every paid call: the spend ledger, and the check that stops a retry paying twice."""
 

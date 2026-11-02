@@ -172,12 +172,18 @@ async def import_people(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     find = await companies.matcher(workspace_id)
+    add_company = await companies.csv_company_adder(workspace_id, icp_id)
     added = updated = leads_created = linked = 0
     for _, person in parsed.people:
         company = find(company_domain(person), person.company)
         linked += company is not None
         if dry_run:
             continue
+        if company is None:
+            # From an Apollo export: the company comes too (Companies page, smart lists), saved with the person.
+            company = add_company(person, company_domain(person))
+            if company is not None:
+                await session.flush()
         _, new, lead_created = await _add(session, stakeholders, workspace_id, icp_id, person, company, "csv")
         added += new
         updated += not new

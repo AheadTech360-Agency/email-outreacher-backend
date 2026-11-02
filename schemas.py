@@ -1428,3 +1428,81 @@ class QuickstartDetailOut(QuickstartRunOut):
     companies: list[QuickstartCompanyOut]
     leads: list[QuickstartLeadOut]
     drafts: list[QuickstartDraftOut]
+
+
+# ---------- Smart lists ----------
+
+
+class SmartListIcpDraft(ApiModel):
+    """Claude's base ICP for a company list. Fields may be empty."""
+
+    name: str = Field(default="", max_length=100)
+    industry: str = Field(default="", max_length=100)
+    description: str = ""
+    search_terms: list[str] = Field(default=[], max_length=50)
+    any_of: list[str] = Field(default=[], max_length=100)
+    titles: list[str] = Field(default=[], max_length=30)
+    places: list[str] = Field(default=[], max_length=100)
+
+
+class SmartListOut(ApiModel):
+    id: UUID
+    kind: str
+    name: str
+    count: int
+    icp_draft: SmartListIcpDraft | None
+    lead_intel_icp_id: UUID | None
+    created_at: datetime
+
+
+class SmartListCompanyOut(ApiModel):
+    id: UUID
+    name: str
+    domain: str | None
+    city: str | None
+    state: str | None
+    source: str
+    status: str
+    reason: str
+
+
+class SmartListPersonOut(ApiModel):
+    id: UUID
+    name: str
+    title: str
+    company: str | None
+    email: str | None
+    email_status: str | None
+    linkedin_url: str | None
+    reason: str
+
+
+class SmartListDetailOut(SmartListOut):
+    companies: list[SmartListCompanyOut]
+    people: list[SmartListPersonOut]
+
+
+class SmartListsSummary(ApiModel):
+    lists: list[SmartListOut]
+    unsorted: int
+
+
+class SortListsIn(ApiModel):
+    kind: Literal["company", "person"]
+    limit: int = Field(default=200, ge=1, le=500)
+
+
+class SortListsResult(ApiModel):
+    sorted: int
+    by_claude: int
+    duplicates: int  # joined a twin's list without asking Claude
+    new_lists: list[str]
+    sites_read: int
+    left: int
+    cost_usd: float
+    errors: list[str]
+
+
+class SmartListUpdateIn(ApiModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    lead_intel_icp_id: UUID | None = None

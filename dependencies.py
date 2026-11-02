@@ -20,6 +20,7 @@ from crud import (
     IcpProfileRepo,
     JobRepo,
     QuickstartRepo,
+    SmartListRepo,
     LeadRepo,
     PostRepo,
     ProductRepo,
@@ -162,6 +163,10 @@ def get_quickstart_queue() -> Callable[[UUID], None]:
 
 def get_quickstart_repo(session: AsyncSession = Depends(get_session)) -> QuickstartRepo:
     return QuickstartRepo(session)
+
+
+def get_smart_list_repo(session: AsyncSession = Depends(get_session)) -> SmartListRepo:
+    return SmartListRepo(session)
 
 
 def get_job_repo(session: AsyncSession = Depends(get_session)) -> JobRepo:

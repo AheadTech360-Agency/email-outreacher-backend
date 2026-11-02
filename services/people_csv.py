@@ -39,17 +39,31 @@ PERSON_FIELDS: dict[str, list[str]] = {
     "apollo_account_id": ["apolloaccountid", "accountid"],
 }
 
-# The template: Apollo's people export columns, in Apollo's order, that we use.
-TEMPLATE_HEADERS = [
-    "First Name", "Last Name", "Title", "Company Name", "Email", "Email Status", "Seniority",
-    "Person Linkedin Url", "Website", "Company Linkedin Url", "Facebook Url", "Twitter Url",
-    "City", "State", "Country", "Work Direct Phone", "Apollo Contact Id", "Apollo Account Id",
+# Apollo's people export, every column in Apollo's order: the template, and every CSV we write. A file exported
+# from Apollo imports as is, and one we export opens in anything that reads Apollo's.
+APOLLO_HEADERS = [
+    "First Name", "Last Name", "Title", "Company Name", "Company Name for Emails", "Email", "Email Status",
+    "Primary Email Source", "Primary Email Verification Source", "Email Confidence", "Primary Email Catch-all Status",
+    "Primary Email Last Verified At", "Seniority", "Departments", "Sub Departments", "Contact Owner",
+    "Work Direct Phone", "Home Phone", "Mobile Phone", "Corporate Phone", "Other Phone", "Do Not Call", "Stage",
+    "Lists", "Last Contacted", "Account Owner", "# Employees", "Industry", "Keywords", "Person Linkedin Url",
+    "Website", "Company Linkedin Url", "Facebook Url", "Twitter Url", "City", "State", "Country", "Company Address",
+    "Company City", "Company State", "Company Country", "Company Phone", "Technologies", "Annual Revenue",
+    "Total Funding", "Latest Funding", "Latest Funding Amount", "Last Raised At", "Subsidiary of",
+    "Subsidiary of (Organization ID)", "Email Sent", "Email Open", "Email Bounced", "Replied", "Demoed",
+    "Number of Retail Locations", "Apollo Contact Id", "Apollo Account Id", "Secondary Email",
+    "Secondary Email Source", "Secondary Email Status", "Secondary Email Verification Source", "Tertiary Email",
+    "Tertiary Email Source", "Tertiary Email Status", "Tertiary Email Verification Source", "Primary Intent Topic",
+    "Primary Intent Score", "Secondary Intent Topic", "Secondary Intent Score", "Qualify Contact", "SIC Codes",
+    "NAICS Codes", "Apollo Record Id", "Persona Brief",
 ]  # fmt: skip
-TEMPLATE_EXAMPLE = [
-    "Ava", "Morgan", "Founder", "Brightloom", "ava@brightloom.example", "Verified", "founder",
-    "http://www.linkedin.com/in/ava-morgan-example", "http://www.brightloom.example", "", "", "",
-    "Austin", "Texas", "United States", "", "", "",
-]  # fmt: skip
+TEMPLATE_HEADERS = APOLLO_HEADERS
+TEMPLATE_EXAMPLE = {
+    "First Name": "Ava", "Last Name": "Morgan", "Title": "Founder", "Company Name": "Brightloom",
+    "Company Name for Emails": "Brightloom", "Email": "ava@brightloom.example", "Email Status": "Verified",
+    "Seniority": "founder", "Person Linkedin Url": "http://www.linkedin.com/in/ava-morgan-example",
+    "Website": "http://www.brightloom.example", "City": "Austin", "State": "Texas", "Country": "United States",
+}  # fmt: skip
 
 SENIORITIES = {"owner", "founder", "c_suite", "partner", "vp", "head", "director", "manager", "senior", "entry", "intern"}
 
@@ -61,8 +75,18 @@ def _key(header: str) -> str:
 def template_csv() -> str:
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(TEMPLATE_HEADERS)
-    writer.writerow(TEMPLATE_EXAMPLE)
+    writer.writerow(APOLLO_HEADERS)
+    writer.writerow([TEMPLATE_EXAMPLE.get(h, "") for h in APOLLO_HEADERS])
+    return out.getvalue()
+
+
+def export_csv(rows: list[dict[str, str]]) -> str:
+    """Rows keyed by Apollo's column names, written with every column in Apollo's order; blank where unknown."""
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(APOLLO_HEADERS)
+    for row in rows:
+        writer.writerow([row.get(h) or "" for h in APOLLO_HEADERS])
     return out.getvalue()
 
 
