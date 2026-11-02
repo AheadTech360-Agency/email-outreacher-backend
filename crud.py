@@ -920,8 +920,9 @@ class StakeholderRepo:
         """save_person and lead_from_stakeholder for many people in a few round trips (an import of 1,805 took an
         hour one at a time). Same rules: a known person is updated, blank cells never wipe what's stored, and
         anyone with an email or LinkedIn URL who isn't on the do-not-contact list (`blocked`) becomes a lead, or
-        is linked to the lead already here with that email or LinkedIn URL. Returns (added, updated, leads made,
-        the people's ids)."""
+        is linked to the lead already here with that email or LinkedIn URL. Leads go in first, so each person is
+        saved with their lead already linked (one update per person made a batch take 30 seconds). Returns
+        (added, updated, leads made, the people's ids)."""
         pairs = [person.external_id for person, _ in items]
         known = {
             (s.source, s.external_id): s
@@ -931,51 +932,37 @@ class StakeholderRepo:
                 )
             )
         }
-        added = updated = 0
-        saved: list[tuple[Stakeholder, Any, Company | None]] = []
+        prepared = []
         for person, company in items:
-            source, external_id = person.external_id
             values = _person_values(icp_id, person, company, origin)
-            row = known.get((source, external_id))
-            if row is None:
-                row = Stakeholder(workspace_id=workspace_id, source=source, external_id=external_id,
-                                  revealed_at=func.now() if person.email else None, **values)  # fmt: skip
-                self.session.add(row)
-                known[(source, external_id)] = row
-                added += 1
-            else:
-                for key, value in values.items():
-                    if key == "raw":
-                        row.raw = {**(row.raw or {}), **value}
-                    elif value not in (None, ""):
-                        setattr(row, key, value)
-                if person.email and row.revealed_at is None:
-                    row.revealed_at = func.now()
-                updated += 1
-            saved.append((row, person, company))
-        await self.session.flush()
+            row = known.get(person.external_id)
+            prepared.append((person, company, values, row))
 
-        want: list[tuple[Stakeholder, LeadInput]] = []
+        # 1. Leads, for people without one yet.
+        want: list[tuple[int, LeadInput]] = []
         lead_rows: list[dict[str, Any]] = []
-        for row, person, company in saved:
-            if row.lead_id or not (person.email or person.linkedin_url):
+        for i, (person, company, values, row) in enumerate(prepared):
+            if (row is not None and row.lead_id) or not (person.email or person.linkedin_url):
                 continue
+            def pick(key: str) -> Any:
+                return values.get(key) if values.get(key) not in (None, "") or row is None else getattr(row, key)
             lead = clean_lead({
                 "first_name": person.first_name, "last_name": person.last_name, "email": person.email,
-                "title": person.title, "company": row.organization_name or person.company,
+                "title": person.title, "company": pick("organization_name") or person.company,
                 "website": person.website or (company.website_url if company else "") or "", "linkedin_url": person.linkedin_url,
             })  # fmt: skip
             if any(key in blocked for key in person_keys(lead.email, lead.domain)):
                 continue
-            want.append((row, lead))
+            want.append((i, lead))
             lead_rows.append({
-                "workspace_id": workspace_id, "lead_intel_icp_id": row.lead_intel_icp_id,
-                "lead_intel_business_id": row.lead_intel_business_id, "first_name": lead.first_name, "last_name": lead.last_name,
-                "email": lead.email or None, "email_status": row.email_status, "title": lead.title, "company": lead.company,
+                "workspace_id": workspace_id, "lead_intel_icp_id": pick("lead_intel_icp_id"),
+                "lead_intel_business_id": pick("lead_intel_business_id"), "first_name": lead.first_name, "last_name": lead.last_name,
+                "email": lead.email or None, "email_status": pick("email_status"), "title": lead.title, "company": lead.company,
                 "website": lead.website, "domain": lead.domain or None, "linkedin_url": lead.linkedin_url or None,
-                "origin": origin, "external_id": row.external_id,
+                "origin": origin, "external_id": person.external_id[1],
             })  # fmt: skip
         made = 0
+        lead_for: dict[int, UUID | None] = {}
         if lead_rows:
             made = len((await self.session.execute(insert(Lead).values(lead_rows).on_conflict_do_nothing().returning(Lead.id))).all())
             # Every lead, made now or already here, by its email and LinkedIn URL: the unique indexes decided which.
@@ -993,12 +980,37 @@ class StakeholderRepo:
                     by_email.setdefault(email, lead_id)
                 if profile:
                     by_profile.setdefault(profile, lead_id)
-            for row, lead in want:
-                row.lead_id = (by_email.get(lead.email) if lead.email else None) or (
+            for i, lead in want:
+                lead_for[i] = (by_email.get(lead.email) if lead.email else None) or (
                     by_profile.get(lead.linkedin_url.lower()) if lead.linkedin_url else None
                 )
+
+        # 2. The people, each with their lead.
+        added = updated = 0
+        rows: list[Stakeholder] = []
+        for i, (person, company, values, row) in enumerate(prepared):
+            source, external_id = person.external_id
+            if row is None:
+                row = Stakeholder(workspace_id=workspace_id, source=source, external_id=external_id, lead_id=lead_for.get(i),
+                                  revealed_at=func.now() if person.email else None, **values)  # fmt: skip
+                self.session.add(row)
+                known[(source, external_id)] = row
+                added += 1
+            else:
+                for key, value in values.items():
+                    if key == "raw":
+                        row.raw = {**(row.raw or {}), **value}
+                    elif value not in (None, ""):
+                        setattr(row, key, value)
+                if person.email and row.revealed_at is None:
+                    row.revealed_at = func.now()
+                if lead_for.get(i) and not row.lead_id:
+                    row.lead_id = lead_for[i]
+                updated += 1
+            rows.append(row)
+        await self.session.flush()
         await self.session.commit()
-        return added, updated, made, [row.id for row, _, _ in saved]
+        return added, updated, made, [row.id for row in rows]
 
     async def commit(self) -> None:
         await self.session.commit()

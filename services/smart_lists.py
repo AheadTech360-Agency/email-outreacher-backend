@@ -24,7 +24,9 @@ from services.prompts import render
 
 BATCH = 25  # companies or people per Claude call
 SITE_CHARS = 700  # of a company's website text, enough to tell what it does
-SITE_READS = 5  # websites read at once
+SITE_READS = 20  # websites read at once while sorting
+SITE_SECONDS = 15  # the most one homepage may take; a slow or dead site is sorted from what else we have
+CLAUDE_AT_ONCE = 4  # sorting calls in flight after the first (which sets the starting lists alone)
 
 
 def name_key(name: str) -> str:
@@ -149,17 +151,29 @@ async def sort(
     names = list(existing)
     icp_names = {i["name"].strip().lower(): i["name"] for i in icps}
     output = CompanySorted if kind == "company" else Sorted
-    for start in range(0, len(entries), BATCH):
-        batch = entries[start : start + BATCH]
-        user = render(spec.user, sort_variables(names, icps, batch))
-        try:
-            response = await client.messages.parse(
-                model=spec.model, max_tokens=spec.max_tokens, system=spec.system, output_format=output,
-                messages=[{"role": "user", "content": user}],
-            )  # fmt: skip
-        except anthropic.APIError as exc:
-            out.errors.append(error_message(exc))
-            break
+    batches = [entries[start : start + BATCH] for start in range(0, len(entries), BATCH)]
+    gate, finished = asyncio.Semaphore(CLAUDE_AT_ONCE), 0
+
+    async def one(batch: list[tuple[str, str]]) -> None:
+        nonlocal finished
+        if out.errors:
+            return  # a failed call stops the rest (a bad key or no credit fails them all)
+        async with gate:
+            user = render(spec.user, sort_variables(names, icps, batch))  # the lists as they are now
+            try:
+                response = await client.messages.parse(
+                    model=spec.model, max_tokens=spec.max_tokens, system=spec.system, output_format=output,
+                    messages=[{"role": "user", "content": user}],
+                )  # fmt: skip
+            except anthropic.APIError as exc:
+                out.errors.append(error_message(exc))
+                return
+        take(batch, response)
+        finished += len(batch)
+        if on_batch:
+            await on_batch(finished)
+
+    def take(batch: list[tuple[str, str]], response: Any) -> None:
         out.calls += 1
         out.input_tokens += response.usage.input_tokens
         out.output_tokens += response.usage.output_tokens
@@ -175,8 +189,11 @@ async def sort(
                 names.append(name)
             icp = icp_names.get((getattr(pick, "icp", "") or "").strip().lower(), "")
             out.picks[pick.id] = Choice(list=same or name, icp=icp, reason=pick.reason.strip()[:200])
-        if on_batch:
-            await on_batch(min(start + BATCH, len(entries)))
+
+    # The first batch alone sets the starting lists, so the ones running together reuse them, not invent their own.
+    if batches:
+        await one(batches[0])
+        await asyncio.gather(*(one(b) for b in batches[1:]))
     out.cost_usd = round(out.cost_usd, 6)
     return out
 
@@ -321,15 +338,22 @@ async def run_sort(
         async def read(company: Any) -> None:
             nonlocal done
             async with gate:
-                site = await reader.read(company.domain, max_pages=1)
-            if site.reached:
+                try:
+                    site = await asyncio.wait_for(reader.read(company.domain, max_pages=1), SITE_SECONDS)
+                except TimeoutError:
+                    site = None
+            if site is not None and site.reached:
                 company._site_text = site.text  # only for the description below; never saved
                 out.sites_read += 1
             done += 1
-            if done % 10 == 0 or done == len(unread):
+            if done % 20 == 0 or done == len(unread):
                 await progress("Reading websites", done, len(unread))
 
-        await asyncio.gather(*(read(c) for c in unread))
+        # Plain HTTP requests only, no Jina: its rate limit (about 18 pages a minute without a key) made 1,607 sites
+        # take over an hour on 2026-11-02. A site that blocks us or doesn't answer is skipped, and the company is
+        # sorted from its name, listing and Apollo's industry and keywords.
+        with reader.jina_off():
+            await asyncio.gather(*(read(c) for c in unread))
 
     describe = describe_company if kind == "company" else describe_person
     entries = [(key, describe(group[0])) for key, group in ask.items()]

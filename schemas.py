@@ -1492,7 +1492,7 @@ class SmartListsSummary(ApiModel):
 
 class SortListsIn(ApiModel):
     kind: Literal["company", "person"]
-    limit: int = Field(default=200, ge=1, le=500)
+    limit: int = Field(default=2000, ge=1, le=5000)
 
 
 class SortListsResult(ApiModel):

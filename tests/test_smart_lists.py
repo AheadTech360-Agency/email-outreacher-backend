@@ -135,6 +135,11 @@ class Reader:
     def __init__(self) -> None:
         self.read_domains = []
 
+    def jina_off(self, off=True):
+        import contextlib
+
+        return contextlib.nullcontext()
+
     async def read(self, domain, max_pages=1):
         self.read_domains.append(domain)
         return SimpleNamespace(reached=True, text="We print custom DTF transfers and gang sheets.")
@@ -225,3 +230,14 @@ def test_template_and_exports_use_apollos_columns_in_order() -> None:
     rows = list(csv.reader(io.StringIO(export_csv([{"Email": "ava@x.com", "Lists": "Retail", "SIC Codes": "5699"}]))))
     assert rows[0] == APOLLO_HEADERS and rows[1][APOLLO_HEADERS.index("Email")] == "ava@x.com"
     assert rows[1][APOLLO_HEADERS.index("SIC Codes")] == "5699" and rows[1][0] == ""
+
+
+def test_sites_are_read_with_plain_requests_only_and_batches_run_together(client) -> None:
+    """2026-11-02: Jina's rate limit made 1,607 homepages take over an hour. Sorting reads with plain requests only
+    (a site that blocks us is skipped), and after the first batch, Claude calls run several at once."""
+    shops = [company(f"Shop {i}", f"shop{i}.com") for i in range(60)]
+    reader = Reader()
+    jina = []
+    reader.jina_off = lambda off=True: (jina.append(off), __import__("contextlib").nullcontext())[1]
+    out, _ = run_sort_endpoint(client, FakeRepo(shops), FakeClaude(lambda text: ("Retail", "")), reader)
+    assert jina == [True] and len(reader.read_domains) == 60 and out["sorted"] == 60 and out["byClaude"] == 60
