@@ -12,7 +12,7 @@ from dependencies import (
     get_optional_apify, get_prompt_repo, get_provider_call_repo, get_settings_repo, require_manager, require_workspace_id,
 )  # fmt: skip
 from schemas import (
-    ClaudePrice, CostEstimate, CostReference, FeedbackSettings, GeneralSettings, MeasuredUse, ResearchSettings, ScoringSettings,
+    ClaudePrice, CompanyApprovalSettings, CostEstimate, CostReference, FeedbackSettings, GeneralSettings, MeasuredUse, ResearchSettings, ScoringSettings,
 )  # fmt: skip
 from services.auth import CurrentUser
 from services.apify import ApifyClient, ApifyError
@@ -55,6 +55,7 @@ def _general_out(values: dict) -> GeneralSettings:
         monthly_budget_usd=values["monthly_budget_usd"],
         scoring=ScoringSettings(prompt_id=values["scoring_prompt_id"], threshold=values["score_threshold"],
                                 auto_send=values["auto_send"], daily_auto_send_cap=values["daily_auto_send_cap"]),
+        company_approval=CompanyApprovalSettings(threshold=values["company_threshold"], auto_approve=values["company_auto_approve"]),
     )  # fmt: skip
 
 
@@ -82,6 +83,8 @@ async def save_general_settings(
         "default_model": body.default_model, "posts_per_lead": body.posts_per_lead, "max_post_age_days": body.max_post_age_days,
         "monthly_budget_usd": body.monthly_budget_usd, "score_threshold": body.scoring.threshold, "auto_send": body.scoring.auto_send,
         "daily_auto_send_cap": body.scoring.daily_auto_send_cap, "scoring_prompt_id": body.scoring.prompt_id,
+        "company_threshold": body.company_approval.threshold if body.company_approval else now["company_threshold"],
+        "company_auto_approve": body.company_approval.auto_approve if body.company_approval else now["company_auto_approve"],
     }  # fmt: skip
     admin_fields = ("monthly_budget_usd", "score_threshold", "auto_send", "daily_auto_send_cap", "scoring_prompt_id")
     if not user.is_admin and any(values[k] != now[k] for k in admin_fields):

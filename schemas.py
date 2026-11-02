@@ -884,10 +884,22 @@ class ResearchResult(ApiModel):
     errors: int
     cost_usd: float
     notes: list[str]
+    to_approve: int = 0  # waiting for a person to approve or reject
 
 
 class CompanyStatusIn(ApiModel):
     status: Literal["qualified", "not_fit"]
+
+
+class CompanyDecisionIn(ApiModel):
+    """Approve (qualified) or reject (not_fit) companies, from the To approve queue."""
+
+    company_ids: list[UUID] = Field(min_length=1, max_length=2000)
+    status: Literal["qualified", "not_fit"]
+
+
+class CompanyDecisionResult(ApiModel):
+    changed: int
 
 
 class PipelineStakeholdersIn(ApiModel):
@@ -1185,6 +1197,14 @@ class ScoringSettings(ApiModel):
     daily_auto_send_cap: int = Field(ge=0, le=10000)
 
 
+class CompanyApprovalSettings(ApiModel):
+    """Company verification, like email scoring: with auto-approve on, companies scoring at least the threshold
+    are approved; the rest wait for you to approve or reject them."""
+
+    threshold: int = Field(ge=0, le=100)
+    auto_approve: bool
+
+
 class GeneralSettings(ApiModel):
     """The Settings page's defaults and review settings, kept for the whole workspace. The budget and scoring are
     the admins' (the Roles tab's "Administration"); the rest is Management's."""
@@ -1194,6 +1214,7 @@ class GeneralSettings(ApiModel):
     max_post_age_days: int = Field(ge=1, le=365)
     monthly_budget_usd: float = Field(ge=0, le=1_000_000)
     scoring: ScoringSettings
+    company_approval: CompanyApprovalSettings | None = None  # left out by an older page: kept as saved
 
 
 class ResearchSettings(ApiModel):

@@ -31,7 +31,7 @@ MANAGEMENT_ONLY = [
     ("put", f"/icps/{uuid4()}/profile", {}),
     ("post", "/emails/generate", {}), ("post", "/posts/fetch", {}), ("post", "/improve/email-prompt", {}),
     ("post", "/pipeline/find", {}), ("post", "/pipeline/research", {}), ("post", "/pipeline/stakeholders", {}),
-    ("patch", f"/pipeline/companies/{uuid4()}", {}),
+    ("patch", f"/pipeline/companies/{uuid4()}", {}), ("post", "/pipeline/companies/decide", {"companyIds": [str(uuid4())], "status": "qualified"}),
     ("post", "/stakeholders/search", {}), ("post", "/stakeholders/search-icp", {}), ("post", "/stakeholders/search-linkedin", {}),
     ("post", "/stakeholders/reveal", {}),
     ("post", "/companies/import", {}), ("post", "/companies/remove", {}),
@@ -80,7 +80,8 @@ def test_management_may_run_jobs(client) -> None:
 class FakeSettings:
     def __init__(self) -> None:
         self.row = {"default_model": "claude-haiku-5-5", "posts_per_lead": 5, "max_post_age_days": 60, "monthly_budget_usd": 150.0,
-                    "score_threshold": 80, "auto_send": False, "daily_auto_send_cap": 50, "scoring_prompt_id": None}  # fmt: skip
+                    "score_threshold": 80, "auto_send": False, "daily_auto_send_cap": 50, "scoring_prompt_id": None,
+                    "company_threshold": 60, "company_auto_approve": True}  # fmt: skip
 
     async def workspace_exists(self, workspace_id) -> bool:
         return True

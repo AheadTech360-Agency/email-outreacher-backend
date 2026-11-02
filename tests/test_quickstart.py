@@ -242,3 +242,27 @@ def test_a_company_not_on_linkedin_is_reached_by_the_email_on_its_website(world,
     assert run.progress["people"]["note"] == "0 found on LinkedIn, 0 with an email; 2 companies reached by the email on their website"
     assert run.progress["leads"]["note"] == "2 leads: 2 valid emails, 0 risky"
     assert run.detail.startswith("Done: 2 drafts")
+
+
+def test_it_waits_for_companies_to_be_approved_then_continues(world, monkeypatch) -> None:
+    """Companies under the threshold wait for a person, as emails do; the run continues once they're decided."""
+    real_job = world.job
+
+    async def research_to_review(session, run, path, body, label):
+        out = await real_job(session, run, path, body, label)
+        if path == "/pipeline/research":
+            for c in world.companies.values():
+                if c.name == "Big Box":
+                    c.status = "review"
+        return out
+
+    monkeypatch.setattr(quickstart, "_job", research_to_review)
+    run = new_run()
+    run_all(run, world)
+    assert run.status == "waiting" and run.step == "research" and "approve or reject 1 company" in run.detail
+    assert "/pipeline/stakeholders" not in world.calls
+    # Rejected by hand, then Continue (resume sets it running again).
+    next(c for c in world.companies.values() if c.name == "Big Box").status = "not_fit"
+    run.status = "running"
+    run_all(run, world)
+    assert "/pipeline/stakeholders" in world.calls and run.detail.startswith("Done: 2 drafts")

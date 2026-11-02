@@ -1480,6 +1480,10 @@ class CompanyRepo:
         await self.session.commit()
         return added, dupes
 
+    async def save_all(self, rows: list[Company]) -> None:
+        self.session.add_all(rows)
+        await self.session.commit()
+
     async def save(self, company: Company) -> None:
         await self.session.commit()
         await self.session.refresh(company)
@@ -1680,6 +1684,7 @@ RESEARCH_DEFAULTS = {"research_max_pages": 6, "research_max_seconds": 120}
 GENERAL_DEFAULTS: dict[str, Any] = {
     "default_model": "claude-haiku-5-5", "posts_per_lead": 5, "max_post_age_days": 60, "monthly_budget_usd": 150,
     "score_threshold": 80, "auto_send": False, "daily_auto_send_cap": 50, "scoring_prompt_id": None,
+    "company_threshold": 60, "company_auto_approve": True,
 }  # fmt: skip
 SENDING_DEFAULTS: dict[str, Any] = {
     "sender_company": "", "sender_address": "", "followup_fallback_2": FALLBACK_2, "followup_fallback_3": FALLBACK_3,

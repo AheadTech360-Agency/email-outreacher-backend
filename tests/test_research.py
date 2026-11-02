@@ -106,13 +106,14 @@ async def test_research_reads_checks_scores_and_decides() -> None:
     apify, scorer = FakeApify(), FakeScorer(82)
     summary = await research_companies([good, wrong, sells_machines, down], ICP, None, reader, apify, scorer, 60)
 
-    assert (summary.qualified, summary.not_fit, summary.errors) == (1, 3, 0)
+    # Only a person rejects: the rest wait for approval.
+    assert (summary.qualified, summary.not_fit, summary.review, summary.errors) == (1, 0, 3, 0)
     assert good.status == "qualified" and good.score == 82 and good.status_reason.startswith("Scored 82")
     assert good.instagram_url == "https://instagram.com/inkco"
     assert good.research["instagram"]["followers"] == 1200 and good.research["website"]["via"] == "own_crawl"
-    assert wrong.status == "not_fit" and "None of the ICP's words" in wrong.status_reason
-    assert sells_machines.status == "not_fit" and '"equipment"' in sells_machines.status_reason
-    assert down.status == "not_fit" and "couldn't be read" in down.status_reason
+    assert wrong.status == "review" and "None of the ICP's words" in wrong.status_reason
+    assert sells_machines.status == "review" and '"equipment"' in sells_machines.status_reason
+    assert down.status == "review" and "couldn't be read" in down.status_reason
     # Places were applied by Apollo's search, so they're skipped, not failed.
     assert good.rule_detail["skipped"]
     # Claude reads every site that could be reached (it picks the pages the rule then checks), so the
@@ -131,12 +132,12 @@ async def test_research_reads_checks_scores_and_decides() -> None:
 
 
 @sync
-async def test_low_score_is_not_a_fit_and_overrides_stick() -> None:
+async def test_a_low_score_waits_for_approval_and_overrides_stick() -> None:
     low, kept = company("Ink Co", "inkco.com"), company("Kept Co", "keptco.com")
     kept.overridden, kept.status = True, "qualified"
     reader = FakeReader({"inkco.com": site("inkco.com", "screen printing"), "keptco.com": site("keptco.com", "bakery")})
     await research_companies([low, kept], ICP, None, reader, None, FakeScorer(40), 60)
-    assert low.status == "not_fit" and low.status_reason.startswith("Scored 40, under 60")
+    assert low.status == "review" and low.status_reason.startswith("Scored 40, under 60")
     assert kept.status == "qualified" and kept.rule_fit is False  # research recorded, decision kept
 
 
@@ -258,7 +259,7 @@ async def test_an_icp_with_its_website_switched_off_never_reads_it() -> None:
     await research_companies([ink], ICP, None, reader, None, None, 60, read_website=False)
     assert reader.read_calls == []
     # The rule needs website words it never got, and says why.
-    assert ink.status == "not_fit" and "website not read: off for this ICP" in ink.status_reason
+    assert ink.status == "review" and "website not read: off for this ICP" in ink.status_reason
 
 
 @sync
@@ -278,3 +279,12 @@ def test_jina_can_be_switched_off_for_a_while() -> None:
     assert reader._jina is not None
     with reader.jina_off(False):
         assert reader._jina is not None
+
+
+@sync
+async def test_with_auto_approve_off_every_company_waits_for_approval() -> None:
+    """Like auto-send for emails: off, even a high score waits for a person."""
+    high = company("Ink Co", "inkco.com")
+    reader = FakeReader({"inkco.com": site("inkco.com", "screen printing")})
+    summary = await research_companies([high], ICP, None, reader, None, FakeScorer(95), 60, auto_approve=False)
+    assert high.status == "review" and high.status_reason.startswith("Scored 95:") and summary.review == 1

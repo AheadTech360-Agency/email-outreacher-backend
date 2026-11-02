@@ -5,8 +5,9 @@ For each company:
   2. read its Instagram profile, if the website links one (one Apify run for the whole batch);
   3. check the ICP's rule (Lead Intel's matcher, services/icp_rules.py);
   4. if it passes, score it with Claude (services/scoring.py);
-  5. qualified when it passes the rule and scores at least the threshold; not a fit otherwise,
-     with the reason. A company someone kept or dropped by hand keeps that decision.
+  5. with auto-approve on, approved (qualified) when it passes the rule and scores at least the threshold;
+     otherwise it waits for a person to approve or reject it (review), with the reason. Only a person rejects.
+     A company someone kept or dropped by hand keeps that decision.
 
 Lead Intel's companies never come through here: Lead Intel already verified them.
 """
@@ -31,6 +32,7 @@ READ_CONCURRENCY = 3  # sites read at once; each site is still read one page at 
 class ResearchSummary:
     qualified: int = 0
     not_fit: int = 0
+    review: int = 0
     errors: int = 0
     apify_cost_usd: float = 0.0
     # Each Apify run as (run id, cost), logged one by one so its cost can be corrected once Apify settles it.
@@ -105,6 +107,7 @@ async def research_companies(
     max_seconds: float = AI_BUDGET_SECONDS,
     read_website: bool = True,
     unscored: str = "ANTHROPIC_API_KEY is not set",
+    auto_approve: bool = True,
 ) -> ResearchSummary:
     """`read_website` False: the ICP has its website switched off as a verification source. `unscored`:
     why there's no Claude score when `scorer` is None."""
@@ -234,14 +237,15 @@ async def research_companies(
 
         unread = "" if site and site.reached else (" (their website couldn't be read)" if read_website else " (website not read: off for this ICP)")
         if not rule.fit:
-            status, reason = "not_fit", rule.reason + unread
+            status, reason = "review", f"Doesn't match the ICP's rule: {rule.reason}{unread}"
             # Claude read the site before the rule ran: keep what it said, the rule still decides.
             if reading is None:
                 company.score, company.score_detail = None, None
             else:
                 keep_score(*reading)
         elif scorer is None:
-            status, reason = "qualified", f"Passes the ICP's rule: {rule.reason}. Not scored: {unscored}"
+            status = "qualified" if auto_approve else "review"
+            reason = f"Passes the ICP's rule: {rule.reason}. Not scored: {unscored}"
         else:
             if reading is None:
                 # The site couldn't be read: Claude scores from Instagram and Apollo alone.
@@ -256,15 +260,18 @@ async def research_companies(
                 keep_score(result, chosen)
             if result.error:
                 status, reason = "error", result.error
-            elif result.score is not None and result.score >= threshold:
+            elif auto_approve and result.score is not None and result.score >= threshold:
                 status, reason = "qualified", f"Scored {result.score}: {result.summary}"
+            elif result.score is not None and result.score >= threshold:
+                status, reason = "review", f"Scored {result.score}: {result.summary}"
             else:
-                status, reason = "not_fit", f"Scored {result.score}, under {threshold}: {result.summary}"
+                status, reason = "review", f"Scored {result.score}, under {threshold}: {result.summary}"
 
         if not company.overridden:
             company.status, company.status_reason = status, reason
         summary.qualified += status == "qualified"
         summary.not_fit += status == "not_fit"
+        summary.review += status == "review"
         summary.errors += status == "error"
 
     await asyncio.gather(*(decide(c, s) for c, s in zip(companies, sites, strict=True)))

@@ -172,7 +172,7 @@ def test_override_sticks(client, env) -> None:
     find(client)
     ink = next(r for r in env.repo.rows.values() if r.name == "Ink Co")
     out = client.patch(f"/api/v1/pipeline/companies/{ink.id}", json={"status": "qualified"}, headers=WS).json()
-    assert out["status"] == "qualified" and out["overridden"] and out["statusReason"] == "Kept by hand"
+    assert out["status"] == "qualified" and out["overridden"] and out["statusReason"].startswith("Approved")
 
 
 def test_stakeholders_only_for_qualified_companies(client, env) -> None:

@@ -179,7 +179,7 @@ class WorkspaceCompany(Base):
     imported_at: Mapped[datetime] = _created()
 
 
-COMPANY_STATUSES = ("found", "qualified", "not_fit", "error")
+COMPANY_STATUSES = ("found", "review", "qualified", "not_fit", "error")  # review: waits for a person to approve
 
 
 class Company(Base):
@@ -277,6 +277,10 @@ class Settings(Base):
     scoring_prompt_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_prompts.id", ondelete="SET NULL"), default=None)
     score_threshold: Mapped[int] = mapped_column(SmallInteger, server_default="80")
     auto_send: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    # Company verification, like email scoring: with auto-approve on, a company scoring at least the threshold is
+    # approved; every other verified company waits for a person to approve or reject it.
+    company_threshold: Mapped[int] = mapped_column(SmallInteger, server_default="60")
+    company_auto_approve: Mapped[bool] = mapped_column(Boolean, server_default="true")
     daily_auto_send_cap: Mapped[int] = mapped_column(Integer, server_default="50")
     # Learning from feedback: how many rated emails Claude sees as examples when it writes an email
     # (the ICP's latest good and bad ones), and how many it reads when suggesting a better prompt.
@@ -537,7 +541,7 @@ class QuickstartRun(Base):
 
     __tablename__ = "eo_quickstart_runs"
     __table_args__ = (
-        CheckConstraint(_in("status", ("queued", "running", "done", "stopped", "failed", "cancelled")), name="status"),
+        CheckConstraint(_in("status", ("queued", "running", "waiting", "done", "stopped", "failed", "cancelled")), name="status"),
         Index("eo_quickstart_runs_workspace_idx", "workspace_id", "created_at"),
     )
 

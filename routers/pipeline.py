@@ -42,6 +42,8 @@ from schemas import (
     CompanyPageOut,
     CompanyPostOut,
     CompanySearchResult,
+    CompanyDecisionIn,
+    CompanyDecisionResult,
     CompanyStatusIn,
     FindCompaniesIn,
     FindCompaniesResult,
@@ -59,7 +61,7 @@ from services.google_places import CENTER_COST_USD, SEARCH_COST_USD, PlacesClien
 from services.identity import identity_keys
 from services.research import research_companies
 from services.scoring import CompanyScorer, PromptSpec
-from models import VERIFICATION_SOURCES
+from models import VERIFICATION_SOURCES, Company
 from services.website import WebsiteReader, normalize_domain
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
@@ -270,6 +272,7 @@ async def research(
 
     settings = get_settings()
     limits = await workspace_settings.research(workspace_id)
+    approval = await workspace_settings.general(workspace_id)
     summary_total = ResearchResult(researched=0, skipped=skipped, qualified=0, not_fit=0, errors=0, cost_usd=0, notes=[])
     by_icp: dict[UUID | None, list] = {}
     for c in todo:
@@ -294,9 +297,9 @@ async def research(
         with reader.jina_off("jina" not in sources):
             summary = await research_companies(
                 group, icp, profile_dict, reader, apify if "instagram" in sources else None,
-                scorer if "score" in sources else None, settings.company_score_threshold, spec,
+                scorer if "score" in sources else None, approval["company_threshold"], spec,
                 max_pages=limits["research_max_pages"], max_seconds=limits["research_max_seconds"],
-                read_website="website" in sources,
+                read_website="website" in sources, auto_approve=approval["company_auto_approve"],
                 unscored="Claude's fit score is off for this ICP" if scorer and "score" not in sources else "ANTHROPIC_API_KEY is not set",
             )  # fmt: skip
         for company in group:
@@ -320,6 +323,7 @@ async def research(
         summary_total.researched += len(group)
         summary_total.qualified += summary.qualified
         summary_total.not_fit += summary.not_fit
+        summary_total.to_approve += summary.review
         summary_total.errors += summary.errors
         summary_total.cost_usd = round(summary_total.cost_usd + summary.apify_cost_usd, 4)
         summary_total.notes += summary.notes
@@ -353,11 +357,32 @@ async def set_status(
     company = await companies.get(workspace_id, company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-    company.status = body.status
-    company.status_reason = "Kept by hand" if body.status == "qualified" else "Dropped by hand"
-    company.overridden = True
+    _decide(company, body.status)
     await companies.save(company)
     return PipelineCompanyOut.model_validate(company)
+
+
+def _decide(company: Company, status: str) -> None:
+    """A person's decision, with what Claude said kept after it."""
+    said = (company.status_reason or "").split(" · ", 1)[-1] if company.status_reason else ""
+    said = "" if said in ("Kept by hand", "Dropped by hand") or said.startswith(("Approved", "Rejected")) else said
+    company.status = status
+    company.status_reason = ("Approved" if status == "qualified" else "Rejected") + (f" · {said}" if said else "")
+    company.overridden = True
+
+
+@router.post("/companies/decide", response_model=CompanyDecisionResult, dependencies=[Depends(require_manager)])
+async def decide_companies(
+    body: CompanyDecisionIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+) -> CompanyDecisionResult:
+    """Approve or reject companies in bulk (the To approve queue). Research won't change them back."""
+    rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
+    for company in rows:
+        _decide(company, body.status)
+    await companies.save_all(rows)
+    return CompanyDecisionResult(changed=len(rows))
 
 
 @router.post("/stakeholders", response_model=StakeholderSearchResult, dependencies=[Depends(require_manager)])

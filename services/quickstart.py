@@ -58,7 +58,7 @@ async def advance(run_id: UUID) -> bool:
         run.busy_until = None
         if not more and run.status == "running":
             run.status = "done"
-        if run.status != "running":
+        if run.status not in ("running", "waiting"):
             run.finished_at = datetime.now(UTC)
         await repo.save(run)
         more = more and run.status == "running"
@@ -111,12 +111,21 @@ async def _research(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> b
     done = [c for c in companies if c.researched_at is not None]
     qualified = sum(c.status == "qualified" for c in companies)
     not_fit = sum(c.status == "not_fit" for c in companies)
+    waiting = sum(c.status == "review" for c in companies)
     unfinished = sum(c.status == "error" for c in companies)
-    note = f"{qualified} qualified, {not_fit} not a fit" + (f", {unfinished} couldn't finish" if unfinished else "")
+    note = f"{qualified} qualified, {not_fit} not a fit" + (f", {waiting} to approve" if waiting else "") + (
+        f", {unfinished} couldn't finish" if unfinished else "")  # fmt: skip
     left = len(companies) - len(done)
     _set(run, "research", state="running" if left and todo else "done", done=len(done), total=len(companies), note=note)
     if left and todo:
         return True
+    if waiting:
+        # Like email review: companies under the threshold wait for a person. The run picks up again when they
+        # press Continue on its page (resume), and waits again if any are still undecided.
+        _set(run, "research", state="waiting", note=note)
+        run.status = "waiting"
+        run.detail = f"Waiting for you to approve or reject {waiting} {'company' if waiting == 1 else 'companies'}, then press Continue."
+        return False
     if not qualified:
         return _finish(run, "None of the companies qualified for this ICP, so there's no one to write to.")
     return _next(run, "people")

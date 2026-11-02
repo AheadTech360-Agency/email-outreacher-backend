@@ -155,7 +155,7 @@ async def stop_run(
 ) -> QuickstartRunOut:
     """Stop after the batch it's on. What it made so far stays."""
     run = await _run(runs, workspace_id, run_id)
-    if run.status in ("queued", "running"):
+    if run.status in ("queued", "running", "waiting"):
         run.status, run.detail, run.finished_at = "cancelled", "Stopped. What it made so far is below.", datetime.now(UTC)
         await runs.save(run)
     return QuickstartRunOut(**_out(run, await _name(lead_intel, run.icp_id)))
@@ -172,13 +172,14 @@ async def resume_run(
     """Pick a run up again: after the worker restarted mid-step, or after a step failed (it's tried again, and
     nothing before it is redone or paid for twice)."""
     run = await _run(runs, workspace_id, run_id)
-    if run.status not in ("queued", "running", "failed"):
+    if run.status not in ("queued", "running", "failed", "waiting"):
         raise HTTPException(status_code=409, detail="This run has finished.")
     if run.busy_until and run.busy_until > datetime.now(UTC):
         raise HTTPException(status_code=409, detail="It's still working on a step.")
-    if run.status == "failed":
+    if run.status in ("failed", "waiting"):
         progress = dict(run.progress)
-        progress[run.step] = {**progress.get(run.step, {}), "state": "waiting", "note": "Trying again"}
+        note = "Trying again" if run.status == "failed" else "Continuing"
+        progress[run.step] = {**progress.get(run.step, {}), "state": "waiting", "note": note}
         run.progress, run.status, run.detail, run.finished_at = progress, "running", None, None
         await runs.save(run)
     try:
