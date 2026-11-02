@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-KINDS = ("verify", "hook", "email", "score", "followup2", "followup3")
+KINDS = ("verify", "hook", "email", "score", "followup2", "followup3", "sort", "sort_people")
 PAGE_CHARS = 4000  # per page, when pages are shown one by one
 POST_CHARS = 700  # per company post in {{company.posts}} for verification
 PLACEHOLDER = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
@@ -528,6 +528,54 @@ Never use these words: {{icp.wordsToAvoid}}
 
 Close the loop politely, leave one easy door open, and end with a yes-or-no question or an easy out. 25 to 55 words, no em dashes, no invented facts, no repeating the earlier emails."""
 
+# ---------------------------------------------------------------------------------------------------
+# Smart list sorting (services/smart_lists.py): companies (lists and ICP fit) and people (lists)
+# ---------------------------------------------------------------------------------------------------
+
+SORT_SYSTEM = """You sort businesses for a sales team. For each one you choose two things.
+
+1. Its smart list: one high-level industry, named in one to three plain words, like "Retail", "Manufacturing", "Healthcare", "Construction", "Food & Beverage", "Printing", "Professional Services", "Real Estate", "Automotive", "Education", "Nonprofit".
+- Always the broad industry, never a sub-category or a combination. "Retail", never "Retail - DTF", "Apparel Retail" or "Online T-shirt Store".
+- If an existing list is even remotely similar, use it, spelled exactly as given. Start a new list only when nothing existing fits at all.
+- When there's too little to tell what the business does, use "Uncategorized".
+
+2. Its ICP: the name of the one ICP (ideal customer profile) this business is, spelled exactly as given, or an empty string when none of them fits. Fit means the business is the kind the ICP describes (what it does and sells, who it serves), not merely in a related trade. Don't stretch: an empty ICP is the right answer for a business no ICP describes.
+
+Judge from what the business says about itself first (its website), then its listing. Use only the evidence given.
+reason: a few words naming the evidence, e.g. "sells custom DTF transfers online".
+Return one item for every id you're given, with the same id."""
+
+SORT_USER = """Sort these businesses.
+
+## Our ICPs
+{{sort.icps}}
+
+## Existing smart lists
+{{sort.lists}}
+
+## The businesses
+{{sort.items}}"""
+
+SORT_PEOPLE_SYSTEM = """You sort people for a sales team into smart lists. Each list is one high-level role, named in one to three plain words, like "Owners & Executives", "Sales", "Marketing", "Operations", "Finance", "Technology", "Human Resources", "Customer Service", "Production".
+
+Rules:
+- Always the broad role, never a specific title or a seniority split. "Marketing", never "Senior Marketing Manager" or "Marketing - Social".
+- Owners, founders, presidents, CEOs and other top executives are "Owners & Executives".
+- If an existing list is even remotely similar, use it, spelled exactly as given. Start a new list only when nothing existing fits at all.
+- When there's too little to tell, use "Uncategorized".
+reason: a few words naming the evidence, e.g. "title: Head of Growth".
+Return one item for every id you're given, with the same id."""
+
+SORT_PEOPLE_USER = """Sort these people.
+
+## Existing smart lists
+{{sort.lists}}
+
+## The people
+{{sort.items}}"""
+
+SORT_MODEL = "claude-haiku-5-5"  # many short, simple judgements: the fast model
+
 DEFAULTS: dict[str, DefaultPrompt] = {
     "verify": DefaultPrompt("Default company verification", VERIFY_SYSTEM, VERIFY_USER, 0, 4096),
     "hook": DefaultPrompt("Default hook selection", HOOK_SYSTEM, HOOK_USER, 0.2, 4096, max_posts=25),
@@ -535,6 +583,8 @@ DEFAULTS: dict[str, DefaultPrompt] = {
     "score": DefaultPrompt("Default email scoring", SCORE_SYSTEM, SCORE_USER, 0, 4096),
     "followup2": DefaultPrompt("Default follow-up (email 2)", FOLLOWUP2_SYSTEM, FOLLOWUP2_USER, 0.7, 4096),
     "followup3": DefaultPrompt("Default follow-up (email 3)", FOLLOWUP3_SYSTEM, FOLLOWUP3_USER, 0.7, 4096),
+    "sort": DefaultPrompt("Default company sorting", SORT_SYSTEM, SORT_USER, 0, 8192, model=SORT_MODEL),
+    "sort_people": DefaultPrompt("Default people sorting", SORT_PEOPLE_SYSTEM, SORT_PEOPLE_USER, 0, 8192, model=SORT_MODEL),
 }
 
 

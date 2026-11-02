@@ -45,12 +45,13 @@ LONG_RUNNING: dict[str, str] = {
     "/sending/follow-ups/run": "Writing follow-ups",
     "/sending/campaigns/sync": "Syncing campaigns",
     "/smart-lists/sort": "Sorting smart lists",
+    "/stakeholders/import-run": "Importing people",
 }
 
 
 # The background jobs Sales may start: sending approved emails (the Roles tab's "Send approved emails"). Every
 # other one spends budget or changes the campaign setup, so it's for Management and admins.
-SALES_JOBS = {"/sending/queue"}
+SALES_JOBS = {"/sending/queue", "/stakeholders/import-run"}  # an import sorts only for Management
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,16 @@ class JobContext:
 
 
 current_job: ContextVar[JobContext | None] = ContextVar("coldbrew_current_job", default=None)
+
+
+async def report(step: str, done: int | None = None, total: int | None = None) -> None:
+    """Show a running job's progress ("Saving people", 300 of 1,805). Its own session, so it's seen at once whatever
+    the job's session is in the middle of. Outside a job (a direct call, a test) it does nothing."""
+    job = current_job.get()
+    if job is None:
+        return
+    async with get_sessionmaker()() as session:
+        await JobRepo(session).progress(job.job_id, step, done, total)
 
 GONE = "Its starter is no longer a user here, so it wasn't run."
 CRASHED = "Something went wrong running it. The worker's log has the details."

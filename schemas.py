@@ -944,7 +944,7 @@ class UsageOut(ApiModel):
 
 # ---------- Prompts ----------
 
-PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3"]
+PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "sort", "sort_people"]
 
 
 class PromptVersionIn(ApiModel):
@@ -1335,6 +1335,9 @@ class JobOut(ApiModel):
     status: JobStatus
     # What's happening now, in words: "Waiting for a worker", say.
     step: str | None = None
+    # How far along the step is, for a progress bar: `done` of `total` (total null when unknown).
+    done: int = 0
+    total: int | None = None
     # Why it failed.
     detail: str | None = None
     # The endpoint's answer once finished: its status code and its body, as a request would have had them.
@@ -1498,6 +1501,8 @@ class SortListsResult(ApiModel):
     duplicates: int  # joined a twin's list without asking Claude
     new_lists: list[str]
     sites_read: int
+    matched_icp: int = 0  # companies put under an existing ICP
+    drafted: list[str] = []  # lists given a draft ICP, because no ICP fits their companies
     left: int
     cost_usd: float
     errors: list[str]
@@ -1506,3 +1511,26 @@ class SortListsResult(ApiModel):
 class SmartListUpdateIn(ApiModel):
     name: str | None = Field(default=None, min_length=1, max_length=60)
     lead_intel_icp_id: UUID | None = None
+
+
+class ImportRunIn(ApiModel):
+    """A people CSV imported as a background job: the file's text, the ICP to give them (or none), and whether
+    to sort what it brings in into smart lists and ICPs with Claude afterwards."""
+
+    csv: str = Field(min_length=1, max_length=5_000_000)
+    icp_id: UUID | None = None
+    sort: bool = True
+
+
+class ImportRunResult(ApiModel):
+    total_rows: int
+    valid: int
+    added: int
+    updated: int
+    leads_created: int
+    companies_added: int
+    duplicates_in_file: int
+    errors: list[PeopleRowError]
+    companies_sorted: SortListsResult | None = None
+    people_sorted: SortListsResult | None = None
+    cost_usd: float = 0.0

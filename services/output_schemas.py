@@ -13,6 +13,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from services.generation import EmailDraft, EmailScore, FollowUpDraft, HookChoice
 from services.scoring import CompanyScore, CompanyScoreOrRead
+from services.smart_lists import CompanySorted, Sorted
 
 # kind -> [(name, model, when it's used)]
 OUTPUTS: dict[str, list[tuple[str, type[BaseModel], str]]] = {
@@ -33,6 +34,8 @@ OUTPUTS: dict[str, list[tuple[str, type[BaseModel], str]]] = {
     "score": [("Email score", EmailScore, "Used every time a draft is scored.")],
     "followup2": [("Follow-up", FollowUpDraft, "Used when email 2 is nearly due and the person hasn't replied.")],
     "followup3": [("Follow-up", FollowUpDraft, "Used when email 3 is nearly due and the person hasn't replied.")],
+    "sort": [("Smart list and ICP for each company", CompanySorted, "Used every time companies are sorted, 25 at a time.")],
+    "sort_people": [("Smart list for each person", Sorted, "Used every time people are sorted, 25 at a time.")],
 }
 
 

@@ -6,7 +6,10 @@ import io
 from types import SimpleNamespace
 from uuid import uuid4
 
-from dependencies import get_optional_anthropic, get_provider_call_repo, get_smart_list_repo, get_website_reader
+from dependencies import (
+    get_icp_profile_repo, get_lead_intel_repo, get_optional_anthropic, get_prompt_repo, get_provider_call_repo, get_smart_list_repo,
+    get_website_reader,
+)  # fmt: skip
 from main import app
 from services import smart_lists
 from services.people_csv import APOLLO_HEADERS, export_csv, template_csv
@@ -15,21 +18,36 @@ from tests.conftest import WORKSPACE_ID
 H = {"X-Workspace-Id": str(WORKSPACE_ID)}
 
 
+SPEC = smart_lists.SortSpec("Sort them.", "ICPS:\n{{sort.icps}}\nLISTS:\n{{sort.lists}}\nITEMS:\n{{sort.items}}", "claude-haiku-5-5", 4096)
+
+
 class FakeClaude:
-    """Answers each batch with `pick(entry_text)` for every item; records what it was told."""
+    """Answers each batch with `pick(entry_text)` -> list name (or (list, icp) for companies); records the prompts.
+    A draft request (output IcpDraft) gets a fixed draft."""
 
     def __init__(self, pick) -> None:
-        self.pick, self.prompts = pick, []
+        self.pick, self.prompts, self.systems = pick, [], []
         self.messages = self
 
     async def parse(self, *, model, max_tokens, system, output_format, messages):
+        usage = SimpleNamespace(input_tokens=1000, output_tokens=100)
+        if output_format is smart_lists.IcpDraft:
+            draft = smart_lists.IcpDraft(name="Printing", industry="Printing", description="Print shops.", search_terms=["dtf transfers"],
+                                         any_of=[], titles=["Owner"], places=[])  # fmt: skip
+            return SimpleNamespace(parsed_output=draft, usage=usage)
         user = messages[0]["content"]
         self.prompts.append(user)
+        self.systems.append(system)
         items = []
         for chunk in user.split('<item id="')[1:]:
             item_id, text = chunk.split('">', 1)
-            items.append(smart_lists.Pick(id=item_id, list=self.pick(text), reason="from the site"))
-        return SimpleNamespace(parsed_output=smart_lists.Sorted(items=items), usage=SimpleNamespace(input_tokens=1000, output_tokens=100))
+            got = self.pick(text)
+            lst, icp = got if isinstance(got, tuple) else (got, "")
+            if output_format is smart_lists.CompanySorted:
+                items.append(smart_lists.CompanyPick(id=item_id, list=lst, icp=icp, reason="from the site"))
+            else:
+                items.append(smart_lists.Pick(id=item_id, list=lst, reason="from the site"))
+        return SimpleNamespace(parsed_output=output_format(items=items), usage=usage)
 
 
 def test_list_names_compare_without_case_punctuation_or_and() -> None:
@@ -51,9 +69,19 @@ def test_claude_reuses_existing_lists_and_lists_it_starts() -> None:
     """An existing list spelled differently is the existing list; a list started in one batch is offered to the next."""
     claude = FakeClaude(lambda text: "food and beverage" if "Cafe" in text else "Printing")
     entries = [(f"k{i}", f"Name: {'Cafe' if i % 2 else 'Print shop'} {i}") for i in range(30)]
-    out = asyncio.run(smart_lists.sort(claude, "claude-haiku-5-5", "company", ["Food & Beverage"], entries))
+    out = asyncio.run(smart_lists.sort(claude, SPEC, "company", ["Food & Beverage"], [], entries))
     assert {p.list for p in out.picks.values()} == {"Food & Beverage", "Printing"} and len(out.picks) == 30
     assert out.calls == 2 and "- Printing" in claude.prompts[1]
+
+
+def test_the_prompt_is_rendered_and_only_our_icps_count() -> None:
+    """The editable prompt is what's sent; an ICP name that isn't one of ours is "none fits"."""
+    claude = FakeClaude(lambda text: ("Printing", "dtf transfers") if "Ink" in text else ("Retail", "Made Up ICP"))
+    icps = [{"id": uuid4(), "name": "DTF Transfers", "industry": "Printing", "description": "Shops selling DTF transfers",
+             "search_terms": ["DTF transfers"], "any_of": []}]  # fmt: skip
+    out = asyncio.run(smart_lists.sort(claude, SPEC, "company", [], icps, [("a", "Name: Ink Co"), ("b", "Name: Tee Shop")]))
+    assert claude.systems == ["Sort them."] and claude.prompts[0].startswith("ICPS:\n- DTF Transfers; industry: Printing")
+    assert (out.picks["a"].icp, out.picks["b"].icp) == ("DTF Transfers", "")
 
 
 # ---------- The sort endpoint ----------
@@ -61,22 +89,35 @@ def test_claude_reuses_existing_lists_and_lists_it_starts() -> None:
 
 class FakeRepo:
     def __init__(self, members, known=None) -> None:
-        self.members, self.known, self.saved, self.created = members, known or {}, [], {}
+        self.todo, self.known, self.saved, self.created, self.assigned = members, known or {}, [], {}, {}
 
     async def unsorted(self, workspace_id, kind, limit):
-        return self.members[:limit]
+        return self.todo[:limit]
 
     async def sorted_keys(self, workspace_id, kind):
         return dict(self.known)
 
     async def lists(self, workspace_id, kind):
-        return [(SimpleNamespace(name="Retail", name_key="retail"), 4)]
+        return [(SimpleNamespace(name="Retail", name_key="retail", lead_intel_icp_id=None, icp_draft=None), 4)]
 
     async def get_or_create(self, workspace_id, kind, name, key):
-        return self.created.setdefault(key, SimpleNamespace(id=uuid4(), name=name))
+        return self.created.setdefault(key, SimpleNamespace(id=uuid4(), name=name, lead_intel_icp_id=None, icp_draft=None))
 
     async def add_members(self, workspace_id, kind, rows):
         self.saved += rows
+
+    async def assign_icp(self, workspace_id, icp_id, company_ids):
+        self.assigned.setdefault(icp_id, []).extend(company_ids)
+
+    async def members(self, workspace_id, lst):
+        ids = {m for m, list_id, *_ in self.saved if list_id == lst.id}
+        return [(m, None) for m in self.todo if m.id in ids]
+
+    async def people_at(self, workspace_id, company_ids):
+        return []
+
+    async def save(self, lst):
+        pass
 
     async def count_unsorted(self, workspace_id, kind):
         return 0
@@ -104,30 +145,66 @@ def company(name, domain=None, **kw):
                            research=None, raw={}, **kw)  # fmt: skip
 
 
-def test_sorting_companies_reads_sites_asks_claude_once_per_twin_and_reuses_sorted_twins(client) -> None:
-    retail_id = uuid4()
-    twin_a, twin_b = company("Ink Co", "inkco.com"), company("Ink Co LLC", "inkco.com")
-    already = company("Tee Shop", "teeshop.com")  # a duplicate of one sorted earlier
-    repo, calls, reader = FakeRepo([twin_a, twin_b, already], known={"domain:teeshop.com": retail_id}), Calls(), Reader()
-    claude = FakeClaude(lambda text: "Printing" if "DTF" in text else "Retail")
+DTF_ICP = {"id": uuid4(), "name": "DTF Transfers", "industry": "Printing", "enabled": True, "search_terms": ["DTF transfers"], "any_of": []}
+
+
+class Prompts:
+    async def for_icp(self, workspace_id, kind, chosen_id):
+        return None  # the built-in default
+
+
+class LeadIntel:
+    async def list_icps(self):
+        return [DTF_ICP, {**DTF_ICP, "id": uuid4(), "name": "Switched off", "enabled": False}]
+
+
+class Profiles:
+    async def get_many(self, workspace_id, ids):
+        return {DTF_ICP["id"]: SimpleNamespace(description="Shops that sell DTF transfers")}
+
+
+def run_sort_endpoint(client, repo, claude, reader=None):
+    calls = Calls()
     app.dependency_overrides.update({
         get_smart_list_repo: lambda: repo, get_provider_call_repo: lambda: calls, get_optional_anthropic: lambda: claude,
-        get_website_reader: lambda: reader,
+        get_website_reader: lambda: reader or Reader(), get_prompt_repo: lambda: Prompts(), get_lead_intel_repo: lambda: LeadIntel(),
+        get_icp_profile_repo: lambda: Profiles(),
     })  # fmt: skip
     from background import current_job
 
-    token = current_job.set(SimpleNamespace(job_id=uuid4()))  # as the worker runs it
+    token = current_job.set(None)  # report() is a no-op outside a job; refuse_inline is off in tests
     try:
         r = client.post("/api/v1/smart-lists/sort", headers=H, json={"kind": "company"})
     finally:
         current_job.reset(token)
     assert r.status_code == 200, r.text
-    out = r.json()
+    return r.json(), calls
+
+
+def test_sorting_companies_reads_sites_asks_claude_once_per_twin_and_reuses_sorted_twins(client) -> None:
+    retail_id = uuid4()
+    twin_a, twin_b = company("Ink Co", "inkco.com"), company("Ink Co LLC", "inkco.com")
+    already = company("Tee Shop", "teeshop.com")  # a duplicate of one sorted earlier
+    repo, reader = FakeRepo([twin_a, twin_b, already], known={"domain:teeshop.com": retail_id}), Reader()
+    claude = FakeClaude(lambda text: ("Printing", "DTF Transfers") if "DTF" in text else "Retail")
+    out, calls = run_sort_endpoint(client, repo, claude, reader)
     assert (out["sorted"], out["byClaude"], out["duplicates"], out["sitesRead"], out["newLists"]) == (3, 1, 2, 1, ["Printing"])
     assert reader.read_domains == ["inkco.com"] and len(claude.prompts) == 1 and claude.prompts[0].count("<item") == 1
     lists = {m: lst for m, lst, *_ in repo.saved}
     assert lists[twin_a.id] == lists[twin_b.id] == repo.created["printing"].id and lists[already.id] == retail_id
+    # Both twins fit the DTF ICP (the switched-off ICP isn't offered); no draft, since an ICP fits.
+    assert out["matchedIcp"] == 2 and repo.assigned == {DTF_ICP["id"]: [twin_a.id, twin_b.id]} and out["drafted"] == []
+    assert "Switched off" not in claude.prompts[0] and "Shops that sell DTF transfers" in claude.prompts[0]
     assert calls.records[0][1]["action"] == "Sort smart lists"
+
+
+def test_a_new_list_no_icp_fits_gets_a_draft_icp_not_a_new_icp(client) -> None:
+    shop = company("Bolt Hardware", "bolthardware.com")
+    repo = FakeRepo([shop])
+    out, calls = run_sort_endpoint(client, repo, FakeClaude(lambda text: ("Hardware Stores", "")))
+    assert out["drafted"] == ["Hardware Stores"] and out["matchedIcp"] == 0 and repo.assigned == {}
+    assert repo.created["hardware stores"].icp_draft["search_terms"] == ["dtf transfers"]
+    assert [c[1]["action"] for c in calls.records] == ["Sort smart lists", "Draft ICP"]
 
 
 def test_sorting_runs_only_as_a_background_job(client) -> None:

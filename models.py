@@ -306,7 +306,7 @@ class Prompt(Base):
     __tablename__ = "eo_prompts"
     __table_args__ = (
         # verify: company verification, hook: hook selection, email: email generation, score: email scoring.
-        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3")), name="kind"),
+        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "sort", "sort_people")), name="kind"),
         # At most one default per kind in a workspace.
         Index(
             "eo_prompts_one_default_idx",

@@ -13,13 +13,27 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from crud import CompanyRepo, ProviderCallRepo, StakeholderRepo, WorkspaceCompanyRepo, lead_from_stakeholder
+import anthropic
+
+from background import report
+from crud import (
+    CompanyRepo, ExclusionRepo, IcpProfileRepo, PromptRepo, ProviderCallRepo, SmartListRepo, StakeholderRepo, WorkspaceCompanyRepo,
+    lead_from_stakeholder,
+)  # fmt: skip
 from database import get_session
 from dependencies import (
+    MANAGERS_ONLY,
     get_apify,
     get_apollo,
     get_company_repo,
+    get_current_user,
+    get_exclusion_repo,
+    get_icp_profile_repo,
     get_lead_intel_repo,
+    get_optional_anthropic,
+    get_prompt_repo,
+    get_smart_list_repo,
+    get_website_reader,
     get_provider_call_repo,
     get_stakeholder_repo,
     get_workspace_company_repo,
@@ -27,7 +41,11 @@ from dependencies import (
     require_workspace_id,
 )
 from lead_intel import LeadIntelRepo
+from routers.smart_lists import recorder, sort_context, sort_out
+from services.auth import CurrentUser
 from schemas import (
+    ImportRunIn,
+    ImportRunResult,
     AddAsLeadsIn,
     AddAsLeadsResult,
     CompanySearchResult,
@@ -47,7 +65,9 @@ from schemas import (
 )
 from services.apify import EMPLOYEES_ACTOR, ApifyClient, ApifyError, elsewhere
 from services.apollo import SENIORITIES, ApolloClient, ApolloError
+from services import smart_lists
 from services.leads import CsvError, clean_lead
+from services.website import WebsiteReader
 from services.people_csv import (
     PersonRow,
     clean_person,
@@ -200,6 +220,96 @@ async def import_people(
         errors=[PeopleRowError(row=r, reason=reason) for r, reason in parsed.errors[:200]],
         columns=parsed.columns,
     )
+
+
+IMPORT_BATCH = 100  # people saved per round of database writes
+
+
+@router.post("/import-run", response_model=ImportRunResult)
+async def import_run(
+    body: ImportRunIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    companies: CompanyRepo = Depends(get_company_repo),
+    exclusions: ExclusionRepo = Depends(get_exclusion_repo),
+    lists: SmartListRepo = Depends(get_smart_list_repo),
+    prompts: PromptRepo = Depends(get_prompt_repo),
+    profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    claude: anthropic.AsyncAnthropic | None = Depends(get_optional_anthropic),
+    reader: WebsiteReader = Depends(get_website_reader),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
+) -> ImportRunResult:
+    """Import a people CSV (Apollo's export format) as a background job, showing its progress: people saved in
+    batches (with their leads, and their companies from an Apollo export), then, with `sort`, what it brought in
+    sorted into smart lists and ICPs by Claude. Importing is free; sorting spends a little, logged on Usage."""
+    if not await companies.workspace_exists(workspace_id):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    await _check_icp(lead_intel, body.icp_id)
+    if body.sort and user.role not in ("admin", "management"):
+        raise HTTPException(status_code=403, detail=MANAGERS_ONLY)  # adding people is Sales' too; spending isn't
+    if body.sort and claude is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set, so it can't sort. Untick sorting to import only.")
+    await report("Reading the file")
+    try:
+        parsed = parse_people_csv(body.csv)
+    except CsvError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    blocked = {(e.key_type, e.key_value) for e in await exclusions.list()}
+    find = await companies.matcher(workspace_id)
+    add_company = await companies.csv_company_adder(workspace_id, body.icp_id)
+    people = [person for _, person in parsed.people]
+    added = updated = leads_created = 0
+    new_companies: set[int] = set()  # by object: a company added earlier in the same batch has no id yet
+    person_ids: list[UUID] = []
+    company_ids: set[UUID] = set()
+    await report("Saving people", 0, len(people))
+    for start in range(0, len(people), IMPORT_BATCH):
+        items = []
+        for person in people[start : start + IMPORT_BATCH]:
+            company = find(company_domain(person), person.company)
+            if company is None and (company := add_company(person, company_domain(person))) is not None and company.id is None:
+                new_companies.add(id(company))
+            items.append((person, company))
+        await session.flush()  # new companies get their ids
+        company_ids |= {c.id for _, c in items if c is not None}
+        a, u, made, ids = await stakeholders.import_batch(workspace_id, body.icp_id, items, "csv", blocked)
+        added, updated, leads_created = added + a, updated + u, leads_created + made
+        person_ids += ids
+        await report("Saving people", min(start + IMPORT_BATCH, len(people)), len(people))
+
+    result = ImportRunResult(
+        total_rows=len(parsed.people) + len(parsed.errors) + parsed.duplicates, valid=len(parsed.people), added=added,
+        updated=updated, leads_created=leads_created, companies_added=len(new_companies), duplicates_in_file=parsed.duplicates,
+        errors=[PeopleRowError(row=r, reason=reason) for r, reason in parsed.errors[:200]],
+    )  # fmt: skip
+    if not body.sort:
+        return result
+    record = recorder(calls, workspace_id)
+    for kind, ids in (("company", list(company_ids)), ("person", person_ids)):
+        members = await lists.unsorted_among(workspace_id, kind, ids)
+        if not members:
+            continue
+        spec, icps = await sort_context(workspace_id, kind, prompts, lead_intel, profiles)
+        what = "companies" if kind == "company" else "people"
+
+        async def progress(step: str, done: int | None, total: int | None, what: str = what) -> None:
+            await report(f"{step} ({what})", done, total)
+
+        outcome = await smart_lists.run_sort(
+            workspace_id=workspace_id, kind=kind, members=members, repo=lists, claude=claude, spec=spec, icps=icps,
+            reader=reader if kind == "company" else None, record=record, progress=progress,
+        )  # fmt: skip
+        out = sort_out(outcome, await lists.count_unsorted(workspace_id, kind))
+        if kind == "company":
+            result.companies_sorted = out
+        else:
+            result.people_sorted = out
+        result.cost_usd = round(result.cost_usd + outcome.cost_usd, 6)
+    return result
 
 
 @router.get("", response_model=list[StakeholderOut])

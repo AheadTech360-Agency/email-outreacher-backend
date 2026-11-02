@@ -18,7 +18,7 @@ from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
 from services.apollo import ApolloOrganization, FoundPerson, RevealedPerson
 from services.google_places import Place
 from services.identity import identity_keys
-from services.leads import Existing, LeadInput
+from services.leads import Existing, LeadInput, clean_lead
 from services.prompts import DEFAULTS
 
 
@@ -697,6 +697,26 @@ class UserRepo:
             self.session.add(WorkspaceMember(workspace_id=workspace_id, user_id=user_id))
 
 
+def _person_values(icp_id: UUID | None, person: Any, company: Company | None, origin: str) -> dict[str, Any]:
+    """A typed-in or imported person (services.people_csv.PersonRow) as eo_stakeholders columns."""
+    return {
+        "first_name": person.first_name, "last_name": person.last_name, "title": person.title,
+        "seniority": person.seniority or None, "linkedin_url": person.linkedin_url or None,
+        "email": person.email or None, "email_status": person.email_status or None,
+        "has_email": True if person.email else None,
+        "organization_name": (company.name if company else None) or person.company or None,
+        "company_id": company.id if company else None,
+        "lead_intel_business_id": company.lead_intel_business_id if company else None,
+        "lead_intel_icp_id": icp_id or (company.icp_id if company else None),
+        "raw": {
+            "added": origin, "company": person.company, "website": person.website, "phone": person.phone,
+            "city": person.city, "state": person.state, "country": person.country,
+            "company_linkedin_url": person.company_linkedin_url, "facebook_url": person.facebook_url,
+            "twitter_url": person.twitter_url, "apollo_account_id": person.apollo_account_id, "extra": person.extra,
+        },
+    }  # fmt: skip
+
+
 class StakeholderRepo:
     """People found at a company, before and after their email is revealed. `outreach.eo_stakeholders`."""
 
@@ -871,22 +891,7 @@ class StakeholderRepo:
         stored under the same id. Returns (the person, whether they're new). A known email is never
         replaced by an empty one."""
         source, external_id = person.external_id
-        values = {
-            "first_name": person.first_name, "last_name": person.last_name, "title": person.title,
-            "seniority": person.seniority or None, "linkedin_url": person.linkedin_url or None,
-            "email": person.email or None, "email_status": person.email_status or None,
-            "has_email": True if person.email else None,
-            "organization_name": (company.name if company else None) or person.company or None,
-            "company_id": company.id if company else None,
-            "lead_intel_business_id": company.lead_intel_business_id if company else None,
-            "lead_intel_icp_id": icp_id or (company.icp_id if company else None),
-            "raw": {
-                "added": origin, "company": person.company, "website": person.website, "phone": person.phone,
-                "city": person.city, "state": person.state, "country": person.country,
-                "company_linkedin_url": person.company_linkedin_url, "facebook_url": person.facebook_url,
-                "twitter_url": person.twitter_url, "apollo_account_id": person.apollo_account_id, "extra": person.extra,
-            },
-        }  # fmt: skip
+        values = _person_values(icp_id, person, company, origin)
         known = await self.session.scalar(
             select(Stakeholder).where(
                 Stakeholder.workspace_id == workspace_id, Stakeholder.source == source, Stakeholder.external_id == external_id
@@ -907,6 +912,93 @@ class StakeholderRepo:
         if person.email and known.revealed_at is None:
             known.revealed_at = func.now()
         return known, False
+
+    async def import_batch(
+        self, workspace_id: UUID, icp_id: UUID | None, items: list[tuple[Any, Company | None]], origin: str,
+        blocked: set[tuple[str, str]],
+    ) -> tuple[int, int, int, list[UUID]]:  # fmt: skip
+        """save_person and lead_from_stakeholder for many people in a few round trips (an import of 1,805 took an
+        hour one at a time). Same rules: a known person is updated, blank cells never wipe what's stored, and
+        anyone with an email or LinkedIn URL who isn't on the do-not-contact list (`blocked`) becomes a lead, or
+        is linked to the lead already here with that email or LinkedIn URL. Returns (added, updated, leads made,
+        the people's ids)."""
+        pairs = [person.external_id for person, _ in items]
+        known = {
+            (s.source, s.external_id): s
+            for s in await self.session.scalars(
+                select(Stakeholder).where(
+                    Stakeholder.workspace_id == workspace_id, tuple_(Stakeholder.source, Stakeholder.external_id).in_(pairs)
+                )
+            )
+        }
+        added = updated = 0
+        saved: list[tuple[Stakeholder, Any, Company | None]] = []
+        for person, company in items:
+            source, external_id = person.external_id
+            values = _person_values(icp_id, person, company, origin)
+            row = known.get((source, external_id))
+            if row is None:
+                row = Stakeholder(workspace_id=workspace_id, source=source, external_id=external_id,
+                                  revealed_at=func.now() if person.email else None, **values)  # fmt: skip
+                self.session.add(row)
+                known[(source, external_id)] = row
+                added += 1
+            else:
+                for key, value in values.items():
+                    if key == "raw":
+                        row.raw = {**(row.raw or {}), **value}
+                    elif value not in (None, ""):
+                        setattr(row, key, value)
+                if person.email and row.revealed_at is None:
+                    row.revealed_at = func.now()
+                updated += 1
+            saved.append((row, person, company))
+        await self.session.flush()
+
+        want: list[tuple[Stakeholder, LeadInput]] = []
+        lead_rows: list[dict[str, Any]] = []
+        for row, person, company in saved:
+            if row.lead_id or not (person.email or person.linkedin_url):
+                continue
+            lead = clean_lead({
+                "first_name": person.first_name, "last_name": person.last_name, "email": person.email,
+                "title": person.title, "company": row.organization_name or person.company,
+                "website": person.website or (company.website_url if company else "") or "", "linkedin_url": person.linkedin_url,
+            })  # fmt: skip
+            if any(key in blocked for key in person_keys(lead.email, lead.domain)):
+                continue
+            want.append((row, lead))
+            lead_rows.append({
+                "workspace_id": workspace_id, "lead_intel_icp_id": row.lead_intel_icp_id,
+                "lead_intel_business_id": row.lead_intel_business_id, "first_name": lead.first_name, "last_name": lead.last_name,
+                "email": lead.email or None, "email_status": row.email_status, "title": lead.title, "company": lead.company,
+                "website": lead.website, "domain": lead.domain or None, "linkedin_url": lead.linkedin_url or None,
+                "origin": origin, "external_id": row.external_id,
+            })  # fmt: skip
+        made = 0
+        if lead_rows:
+            made = len((await self.session.execute(insert(Lead).values(lead_rows).on_conflict_do_nothing().returning(Lead.id))).all())
+            # Every lead, made now or already here, by its email and LinkedIn URL: the unique indexes decided which.
+            emails = {lead.email for _, lead in want if lead.email}
+            profiles = {lead.linkedin_url.lower() for _, lead in want if lead.linkedin_url}
+            found = await self.session.execute(
+                select(Lead.id, func.lower(Lead.email), func.lower(Lead.linkedin_url)).where(
+                    Lead.workspace_id == workspace_id,
+                    or_(func.lower(Lead.email).in_(emails or {""}), func.lower(Lead.linkedin_url).in_(profiles or {""})),
+                )
+            )
+            by_email, by_profile = {}, {}
+            for lead_id, email, profile in found:
+                if email:
+                    by_email.setdefault(email, lead_id)
+                if profile:
+                    by_profile.setdefault(profile, lead_id)
+            for row, lead in want:
+                row.lead_id = (by_email.get(lead.email) if lead.email else None) or (
+                    by_profile.get(lead.linkedin_url.lower()) if lead.linkedin_url else None
+                )
+        await self.session.commit()
+        return added, updated, made, [row.id for row, _, _ in saved]
 
     async def commit(self) -> None:
         await self.session.commit()
@@ -1784,6 +1876,13 @@ class JobRepo:
         await self.session.commit()
         return await self.session.get(Job, job_id, populate_existing=True) if claimed else None
 
+    async def progress(self, job_id: UUID, step: str, done: int | None, total: int | None) -> None:
+        """What a running job is on, for its progress bar: "Saving people", 300 of 1,805."""
+        await self.session.execute(
+            update(Job).where(Job.id == job_id, Job.status == "running").values(step=step, done=done or 0, total=total)
+        )
+        await self.session.commit()
+
     async def finish(self, job_id: UUID, status: str, result: dict[str, Any] | None, detail: str | None) -> None:
         await self.session.execute(
             update(Job).where(Job.id == job_id)
@@ -1919,6 +2018,13 @@ class SmartListRepo:
         order = model.created_at if kind == "company" else model.found_at
         return list(await self.session.scalars(query.order_by(order).limit(limit)))
 
+    async def unsorted_among(self, workspace_id: UUID, kind: str, ids: list[UUID]) -> list[Any]:
+        """Which of these companies or people aren't in a list yet (those an import just brought in, say)."""
+        if not ids:
+            return []
+        model, query = self._unsorted(workspace_id, kind)
+        return list(await self.session.scalars(query.where(model.id.in_(ids))))
+
     async def count_unsorted(self, workspace_id: UUID, kind: str) -> int:
         _, query = self._unsorted(workspace_id, kind)
         return int(await self.session.scalar(select(func.count()).select_from(query.subquery())) or 0)
@@ -1986,5 +2092,25 @@ class SmartListRepo:
 
     async def save(self, lst: SmartList) -> None:
         self.session.add(lst)
+        await self.session.commit()
+
+    async def assign_icp(self, workspace_id: UUID, icp_id: UUID, company_ids: list[UUID]) -> None:
+        """Put companies under an ICP, with their people and those people's leads, wherever none is set yet:
+        an ICP chosen earlier (by a search for it, or on import) is never replaced."""
+        if not company_ids:
+            return
+        await self.session.execute(
+            update(Company).where(Company.workspace_id == workspace_id, Company.id.in_(company_ids), Company.icp_id.is_(None))
+            .values(icp_id=icp_id)
+        )  # fmt: skip
+        people = select(Stakeholder.id).where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(company_ids))
+        await self.session.execute(
+            update(Stakeholder).where(Stakeholder.id.in_(people), Stakeholder.lead_intel_icp_id.is_(None)).values(lead_intel_icp_id=icp_id)
+        )
+        leads = select(Stakeholder.lead_id).where(Stakeholder.id.in_(people), Stakeholder.lead_id.is_not(None))
+        await self.session.execute(
+            update(Lead).where(Lead.workspace_id == workspace_id, Lead.id.in_(leads), Lead.lead_intel_icp_id.is_(None))
+            .values(lead_intel_icp_id=icp_id)
+        )  # fmt: skip
         await self.session.commit()
 

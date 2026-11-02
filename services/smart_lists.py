@@ -10,7 +10,9 @@ Google place, phone, then name and city; a person's email, LinkedIn profile, the
 whose key is already sorted joins that list for free.
 """
 
+import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,9 +20,11 @@ import anthropic
 from pydantic import BaseModel
 
 from services.claude import cost_usd, error_message
+from services.prompts import render
 
 BATCH = 25  # companies or people per Claude call
 SITE_CHARS = 700  # of a company's website text, enough to tell what it does
+SITE_READS = 5  # websites read at once
 
 
 def name_key(name: str) -> str:
@@ -61,6 +65,8 @@ def person_key(p: Any) -> str:
 
 
 class Pick(BaseModel):
+    """A person's list."""
+
     id: str
     list: str
     reason: str
@@ -70,30 +76,40 @@ class Sorted(BaseModel):
     items: list[Pick]
 
 
-SYSTEM = {
-    "company": """You sort businesses into smart lists for a sales team. Each list is one high-level industry, named in one to three plain words, like "Retail", "Manufacturing", "Healthcare", "Construction", "Food & Beverage", "Printing", "Professional Services", "Real Estate", "Automotive", "Education", "Nonprofit".
+class CompanyPick(BaseModel):
+    """A company's list, and the ICP it is ("" when none fits)."""
 
-Rules:
-- Always the broad industry, never a sub-category or a combination. "Retail", never "Retail - DTF", "Apparel Retail" or "Online T-shirt Store".
-- If an existing list is even remotely similar, use it, spelled exactly as given. Only start a new list when nothing existing fits at all.
-- Judge from what the business does and sells, from its own words first. When there's too little to tell, use "Uncategorized".
-- reason: a few words naming the evidence, e.g. "sells custom DTF transfers online".
-Return one item for every id you're given, with the same id.""",
-    "person": """You sort people into smart lists for a sales team. Each list is one high-level role, named in one to three plain words, like "Owners & Executives", "Sales", "Marketing", "Operations", "Finance", "Technology", "Human Resources", "Customer Service", "Production".
+    id: str
+    list: str
+    icp: str
+    reason: str
 
-Rules:
-- Always the broad role, never a specific title or seniority split. "Marketing", never "Senior Marketing Manager" or "Marketing - Social".
-- Owners, founders, presidents, CEOs and other top executives are "Owners & Executives".
-- If an existing list is even remotely similar, use it, spelled exactly as given. Only start a new list when nothing existing fits at all.
-- When there's too little to tell, use "Uncategorized".
-- reason: a few words naming the evidence, e.g. "title: Head of Growth".
-Return one item for every id you're given, with the same id.""",
-}
+
+class CompanySorted(BaseModel):
+    items: list[CompanyPick]
+
+
+@dataclass
+class SortSpec:
+    """The sorting prompt version in use: what Claude is told, and with which model."""
+
+    system: str
+    user: str
+    model: str
+    max_tokens: int
+    version_id: str | None = None
+
+
+@dataclass
+class Choice:
+    list: str
+    icp: str  # an existing ICP's name, or "" for none
+    reason: str
 
 
 @dataclass
 class SortResult:
-    picks: dict[str, Pick] = field(default_factory=dict)
+    picks: dict[str, Choice] = field(default_factory=dict)
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -101,26 +117,45 @@ class SortResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _user(kind: str, existing: list[str], entries: list[tuple[str, str]]) -> str:
-    lists = "\n".join(f"- {n}" for n in existing) or "(none yet)"
-    who = "businesses" if kind == "company" else "people"
-    body = "\n\n".join(f'<item id="{i}">\n{text}\n</item>' for i, text in entries)
-    return f"Existing lists:\n{lists}\n\nSort these {who}:\n\n{body}"
+def icp_text(icp: dict[str, Any]) -> str:
+    """One ICP as Claude sees it while sorting."""
+    parts = [f"- {icp['name']}"]
+    if icp.get("industry"):
+        parts.append(f"industry: {icp['industry']}")
+    if icp.get("description"):
+        parts.append(f"who they are: {icp['description']}")
+    words = list(dict.fromkeys([*(icp.get("search_terms") or []), *(icp.get("any_of") or [])]))
+    if words:
+        parts.append(f"identified by: {', '.join(words[:15])}")
+    return "; ".join(parts)
+
+
+def sort_variables(lists: list[str], icps: list[dict[str, Any]], entries: list[tuple[str, str]]) -> dict[str, str]:
+    """The placeholders a sorting prompt can use."""
+    return {
+        "sort.lists": "\n".join(f"- {n}" for n in lists) or "(none yet)",
+        "sort.icps": "\n".join(icp_text(i) for i in icps) or "(none yet)",
+        "sort.items": "\n\n".join(f'<item id="{i}">\n{text}\n</item>' for i, text in entries),
+    }
 
 
 async def sort(
-    client: anthropic.AsyncAnthropic, model: str, kind: str, existing: list[str], entries: list[tuple[str, str]]
-) -> SortResult:
-    """Sort (id, description) entries in batches. Lists started in one batch are offered to the next, so a
-    new list is reused, not started twice."""
+    client: anthropic.AsyncAnthropic, spec: SortSpec, kind: str, existing: list[str], icps: list[dict[str, Any]],
+    entries: list[tuple[str, str]], on_batch: Callable[[int], Awaitable[None]] | None = None,
+) -> SortResult:  # fmt: skip
+    """Sort (id, description) entries in batches. Lists started in one batch are offered to the next, so a new
+    list is reused, not started twice. An ICP name Claude returns that isn't one of ours counts as none."""
     out = SortResult()
     names = list(existing)
+    icp_names = {i["name"].strip().lower(): i["name"] for i in icps}
+    output = CompanySorted if kind == "company" else Sorted
     for start in range(0, len(entries), BATCH):
         batch = entries[start : start + BATCH]
+        user = render(spec.user, sort_variables(names, icps, batch))
         try:
             response = await client.messages.parse(
-                model=model, max_tokens=4096, system=SYSTEM[kind], output_format=Sorted,
-                messages=[{"role": "user", "content": _user(kind, names, batch)}],
+                model=spec.model, max_tokens=spec.max_tokens, system=spec.system, output_format=output,
+                messages=[{"role": "user", "content": user}],
             )  # fmt: skip
         except anthropic.APIError as exc:
             out.errors.append(error_message(exc))
@@ -128,7 +163,7 @@ async def sort(
         out.calls += 1
         out.input_tokens += response.usage.input_tokens
         out.output_tokens += response.usage.output_tokens
-        out.cost_usd += cost_usd(model, response.usage.input_tokens, response.usage.output_tokens)
+        out.cost_usd += cost_usd(spec.model, response.usage.input_tokens, response.usage.output_tokens)
         wanted = {i for i, _ in batch}
         for pick in (response.parsed_output.items if response.parsed_output else []):
             name = " ".join(pick.list.split())[:60]
@@ -138,7 +173,10 @@ async def sort(
             same = next((n for n in names if name_key(n) == name_key(name)), None)
             if same is None:
                 names.append(name)
-            out.picks[pick.id] = Pick(id=pick.id, list=same or name, reason=pick.reason.strip()[:200])
+            icp = icp_names.get((getattr(pick, "icp", "") or "").strip().lower(), "")
+            out.picks[pick.id] = Choice(list=same or name, icp=icp, reason=pick.reason.strip()[:200])
+        if on_batch:
+            await on_batch(min(start + BATCH, len(entries)))
     out.cost_usd = round(out.cost_usd, 6)
     return out
 
@@ -227,3 +265,137 @@ async def draft_icp(client: anthropic.AsyncAnthropic, model: str, list_name: str
     if response.parsed_output is None:
         return DraftResult(None, cost, usage.input_tokens, usage.output_tokens, "Claude didn't return a draft.")
     return DraftResult(response.parsed_output, cost, usage.input_tokens, usage.output_tokens)
+
+
+# ---------- The whole sort: dedupe, websites, Claude, lists, ICPs, drafts ----------
+
+Progress = Callable[[str, int | None, int | None], Awaitable[None]]
+MAX_DRAFTS = 10  # base ICPs drafted in one sort, for new lists no ICP fits
+
+
+@dataclass
+class SortOutcome:
+    sorted: int = 0
+    by_claude: int = 0
+    duplicates: int = 0
+    new_lists: list[str] = field(default_factory=list)
+    sites_read: int = 0
+    matched_icp: int = 0  # companies that fit an existing ICP
+    drafted: list[str] = field(default_factory=list)  # lists given a draft ICP
+    cost_usd: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+async def _nothing(step: str, done: int | None, total: int | None) -> None:
+    pass
+
+
+async def run_sort(
+    *, workspace_id: Any, kind: str, members: list[Any], repo: Any, claude: anthropic.AsyncAnthropic, spec: SortSpec,
+    icps: list[dict[str, Any]], reader: Any = None, record: Callable[..., Awaitable[None]] | None = None,
+    progress: Progress = _nothing,
+) -> SortOutcome:  # fmt: skip
+    """Sort these companies or people. A duplicate of one already sorted joins its list without asking Claude;
+    a company with no research yet has its homepage read first (plain HTTP, Jina when that fails). A company that
+    fits an existing ICP is put under it (with its people and leads, where they have none yet). A list that gets
+    companies no ICP fits is given a draft base ICP, to create from the Smart lists page."""
+    out = SortOutcome()
+    known = await repo.sorted_keys(workspace_id, kind)
+    key_of = company_key if kind == "company" else person_key
+    rows: list[tuple[Any, Any, str, str]] = []
+    ask: dict[str, list[Any]] = {}  # dedupe key -> the members sharing it; Claude sorts one of them
+    for member in members:
+        key = key_of(member)
+        if key in known:
+            rows.append((member.id, known[key], key, "Same as one already sorted"))
+            out.duplicates += 1
+        else:
+            out.duplicates += key in ask
+            ask.setdefault(key, []).append(member)
+
+    if kind == "company" and reader is not None:
+        unread = [g[0] for g in ask.values() if g[0].domain and not ((g[0].research or {}).get("website") or {}).get("text")]
+        await progress("Reading websites", 0, len(unread))
+        gate, done = asyncio.Semaphore(SITE_READS), 0
+
+        async def read(company: Any) -> None:
+            nonlocal done
+            async with gate:
+                site = await reader.read(company.domain, max_pages=1)
+            if site.reached:
+                company._site_text = site.text  # only for the description below; never saved
+                out.sites_read += 1
+            done += 1
+            if done % 10 == 0 or done == len(unread):
+                await progress("Reading websites", done, len(unread))
+
+        await asyncio.gather(*(read(c) for c in unread))
+
+    describe = describe_company if kind == "company" else describe_person
+    entries = [(key, describe(group[0])) for key, group in ask.items()]
+    existing = [lst.name for lst, _ in await repo.lists(workspace_id, kind)]
+    await progress("Sorting with Claude", 0, len(entries))
+
+    async def sorted_so_far(n: int) -> None:
+        await progress("Sorting with Claude", n, len(entries))
+
+    result = await sort(claude, spec, kind, existing, icps if kind == "company" else [], entries, sorted_so_far) if entries else SortResult()
+    out.errors += result.errors
+    out.cost_usd += result.cost_usd
+    if result.calls and record:
+        await record(spec.model, result.cost_usd, result.input_tokens, result.output_tokens, "Sort smart lists")
+
+    existing_keys = {name_key(n) for n in existing}
+    lists: dict[str, Any] = {}
+    icp_ids = {i["name"]: i["id"] for i in icps}
+    by_icp: dict[Any, list[Any]] = {}
+    unmatched_lists: set[str] = set()
+    for key, choice in result.picks.items():
+        nk = name_key(choice.list)
+        if nk not in lists:
+            lists[nk] = await repo.get_or_create(workspace_id, kind, choice.list, nk)
+            if nk not in existing_keys:
+                out.new_lists.append(lists[nk].name)
+        reason = choice.reason + (f" · ICP: {choice.icp}" if choice.icp else "")
+        for member in ask[key]:
+            rows.append((member.id, lists[nk].id, key, reason))
+        if kind == "company":
+            if choice.icp:
+                by_icp.setdefault(icp_ids[choice.icp], []).extend(m.id for m in ask[key])
+                out.matched_icp += len(ask[key])
+            else:
+                unmatched_lists.add(nk)
+    out.by_claude = len(result.picks)
+    await repo.add_members(workspace_id, kind, rows)
+    out.sorted = len(rows)
+    for icp_id, company_ids in by_icp.items():
+        await repo.assign_icp(workspace_id, icp_id, company_ids)
+
+    # New ICPs aren't created, only drafted: one per list that got companies no ICP fits.
+    to_draft = [lists[nk] for nk in unmatched_lists if not lists[nk].lead_intel_icp_id and not lists[nk].icp_draft][:MAX_DRAFTS]
+    for i, lst in enumerate(to_draft):
+        await progress("Drafting ICPs", i, len(to_draft))
+        drafted = await draft_for(workspace_id, lst, repo, claude, spec.model, record)
+        if drafted.error:
+            out.errors.append(f"{lst.name}: {drafted.error}")
+        else:
+            out.drafted.append(lst.name)
+        out.cost_usd += drafted.cost_usd
+    out.cost_usd = round(out.cost_usd, 6)
+    return out
+
+
+async def draft_for(workspace_id: Any, lst: Any, repo: Any, claude: anthropic.AsyncAnthropic, model: str,
+                    record: Callable[..., Awaitable[None]] | None = None) -> "DraftResult":  # fmt: skip
+    """Draft a base ICP from up to 30 of a list's companies and keep it on the list."""
+    sample = [m for m, _ in await repo.members(workspace_id, lst)][:30]
+    if not sample:
+        return DraftResult(None, error="This list has no companies yet.")
+    titles = sorted({p.title for p in await repo.people_at(workspace_id, [c.id for c in sample]) if p.title})[:40]
+    result = await draft_icp(claude, model, lst.name, [describe_company(c) for c in sample], titles)
+    if result.input_tokens and record:
+        await record(model, result.cost_usd, result.input_tokens, result.output_tokens, "Draft ICP")
+    if result.draft is not None:
+        lst.icp_draft = result.draft.model_dump()
+        await repo.save(lst)
+    return result

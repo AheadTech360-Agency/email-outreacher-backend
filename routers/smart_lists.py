@@ -4,7 +4,6 @@ company list with a draft base ICP to create in Lead Intel, and Apollo-format CS
 Sorting spends (Claude, and Jina for a site our own fetch can't read), so it and drafting are for Management
 and admins; anyone in the workspace can see the lists and download them."""
 
-import asyncio
 from typing import Any
 from uuid import UUID
 
@@ -12,11 +11,13 @@ import anthropic
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from config import get_settings
-from crud import IcpCampaignRepo, IcpProfileRepo, ProviderCallRepo, SmartListRepo
+from background import report
+from crud import IcpCampaignRepo, IcpProfileRepo, PromptRepo, ProviderCallRepo, SmartListRepo
 from dependencies import (
-    get_icp_campaign_repo, get_icp_profile_repo, get_lead_intel_icp_writer, get_optional_anthropic, get_optional_sequencer,
-    get_provider_call_repo, get_smart_list_repo, get_website_reader, require_manager, require_workspace_id,
+    get_icp_campaign_repo, get_icp_profile_repo, get_lead_intel_icp_writer, get_lead_intel_repo, get_optional_anthropic,
+    get_optional_sequencer, get_prompt_repo, get_provider_call_repo, get_smart_list_repo, get_website_reader, require_manager, require_workspace_id,
 )  # fmt: skip
+from lead_intel import LeadIntelRepo
 from lead_intel_writes import LeadIntelIcpWriter
 from routers.icps import create_icp
 from models import Company, SmartList, Stakeholder
@@ -27,13 +28,13 @@ from schemas import (
 from services import smart_lists
 from services.apify import search_name
 from services.people_csv import export_csv
+from services.prompts import DEFAULTS
 from services.sending import SequencerClient
 from services.website import WebsiteReader
 
 router = APIRouter(prefix="/smart-lists", tags=["smart lists"])
 
 NO_CLAUDE = "ANTHROPIC_API_KEY is not set"
-SITE_READS = 5  # websites read at once while sorting
 
 
 def _out(lst: SmartList, count: int) -> SmartListOut:
@@ -64,78 +65,68 @@ async def get_lists(
     return SmartListsSummary(lists=lists, unsorted=await repo.count_unsorted(workspace_id, kind))
 
 
+async def sort_context(
+    workspace_id: UUID, kind: str, prompts: PromptRepo, lead_intel: LeadIntelRepo, profiles: IcpProfileRepo
+) -> tuple[smart_lists.SortSpec, list[dict[str, Any]]]:
+    """The sorting prompt in use (the workspace's default of its kind, editable on Prompts) and, for companies,
+    the ICPs a company can be matched to: the enabled ones, with their descriptions."""
+    prompt_kind = "sort" if kind == "company" else "sort_people"
+    version = await prompts.for_icp(workspace_id, prompt_kind, None)
+    if version is None:
+        d = DEFAULTS[prompt_kind]
+        spec = smart_lists.SortSpec(d.system_prompt, d.user_prompt, d.model, d.max_tokens)
+    else:
+        spec = smart_lists.SortSpec(version.system_prompt, version.user_prompt, version.model, version.max_tokens, str(version.id))
+    if kind != "company":
+        return spec, []
+    icps = [i for i in await lead_intel.list_icps() if i.get("enabled", True)]
+    by_id = await profiles.get_many(workspace_id, [i["id"] for i in icps])
+    return spec, [{**i, "description": getattr(by_id.get(i["id"]), "description", "") or ""} for i in icps]
+
+
+def recorder(calls: ProviderCallRepo, workspace_id: UUID):
+    """Log a Claude call's cost to Usage."""
+
+    async def record(model: str, cost: float, input_tokens: int, output_tokens: int, action: str) -> None:
+        await calls.record(
+            workspace_id, "claude", "messages", "succeeded", model=model, cost_usd=cost, action=action,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+        )  # fmt: skip
+
+    return record
+
+
+def sort_out(outcome: smart_lists.SortOutcome, left: int) -> SortListsResult:
+    return SortListsResult(
+        sorted=outcome.sorted, by_claude=outcome.by_claude, duplicates=outcome.duplicates, new_lists=outcome.new_lists,
+        sites_read=outcome.sites_read, matched_icp=outcome.matched_icp, drafted=outcome.drafted, left=left,
+        cost_usd=outcome.cost_usd, errors=outcome.errors,
+    )  # fmt: skip
+
+
 @router.post("/sort", response_model=SortListsResult, dependencies=[Depends(require_manager)])
 async def sort_lists(
     body: SortListsIn,
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
     calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    prompts: PromptRepo = Depends(get_prompt_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
     claude: anthropic.AsyncAnthropic | None = Depends(get_optional_anthropic),
     reader: WebsiteReader = Depends(get_website_reader),
 ) -> SortListsResult:
-    """Sort companies or people not in a list yet. A duplicate of one already sorted joins its list without
-    asking Claude; a company with no research yet has its homepage read first (plain HTTP, Jina when that fails)."""
+    """Sort companies or people not in a list yet (services.smart_lists.run_sort): lists, and for companies the
+    ICP each one fits, or a draft ICP for a list none fits."""
     if claude is None:
         raise HTTPException(status_code=503, detail=NO_CLAUDE)
-    kind = body.kind
-    todo = await repo.unsorted(workspace_id, kind, body.limit)
-    known = await repo.sorted_keys(workspace_id, kind)
-    key_of = smart_lists.company_key if kind == "company" else smart_lists.person_key
-
-    rows: list[tuple[UUID, UUID, str, str]] = []
-    ask: dict[str, list[Any]] = {}  # dedupe key -> the members sharing it; Claude sorts one of them
-    duplicates = 0
-    for member in todo:
-        key = key_of(member)
-        if key in known:
-            rows.append((member.id, known[key], key, "Same as one already sorted"))
-            duplicates += 1
-        else:
-            duplicates += key in ask
-            ask.setdefault(key, []).append(member)
-
-    sites_read = 0
-    if kind == "company":
-        unread = [group[0] for group in ask.values() if group[0].domain and not ((group[0].research or {}).get("website") or {}).get("text")]
-        gate = asyncio.Semaphore(SITE_READS)
-
-        async def read(company: Company) -> None:
-            nonlocal sites_read
-            async with gate:
-                site = await reader.read(company.domain, max_pages=1)
-            if site.reached:
-                company._site_text = site.text  # only for the description below; never saved
-                sites_read += 1
-
-        await asyncio.gather(*(read(c) for c in unread))
-
-    describe = smart_lists.describe_company if kind == "company" else smart_lists.describe_person
-    entries = [(key, describe(group[0])) for key, group in ask.items()]
-    existing = [lst.name for lst, _ in await repo.lists(workspace_id, kind)]
-    model = get_settings().claude_scoring_model
-    result = await smart_lists.sort(claude, model, kind, existing, entries) if entries else smart_lists.SortResult()
-    if result.calls:
-        await calls.record(
-            workspace_id, "claude", "messages", "succeeded", model=model, cost_usd=result.cost_usd, action="Sort smart lists",
-            input_tokens=result.input_tokens, output_tokens=result.output_tokens,
-        )  # fmt: skip
-
-    existing_keys = {smart_lists.name_key(n) for n in existing}
-    new_lists: list[str] = []
-    by_name: dict[str, SmartList] = {}
-    for key, pick in result.picks.items():
-        name_key = smart_lists.name_key(pick.list)
-        if name_key not in by_name:
-            by_name[name_key] = await repo.get_or_create(workspace_id, kind, pick.list, name_key)
-            if name_key not in existing_keys:
-                new_lists.append(by_name[name_key].name)
-        for member in ask[key]:
-            rows.append((member.id, by_name[name_key].id, key, pick.reason))
-    await repo.add_members(workspace_id, kind, rows)
-    return SortListsResult(
-        sorted=len(rows), by_claude=len(result.picks), duplicates=duplicates, new_lists=new_lists, sites_read=sites_read,
-        left=await repo.count_unsorted(workspace_id, kind), cost_usd=result.cost_usd, errors=result.errors,
+    spec, icps = await sort_context(workspace_id, body.kind, prompts, lead_intel, profiles)
+    members = await repo.unsorted(workspace_id, body.kind, body.limit)
+    outcome = await smart_lists.run_sort(
+        workspace_id=workspace_id, kind=body.kind, members=members, repo=repo, claude=claude, spec=spec, icps=icps,
+        reader=reader, record=recorder(calls, workspace_id), progress=report,
     )  # fmt: skip
+    return sort_out(outcome, await repo.count_unsorted(workspace_id, body.kind))
 
 
 @router.get("/people.csv", response_class=Response)
@@ -197,23 +188,11 @@ async def draft_icp(
     lst = await _list(repo, workspace_id, list_id)
     if lst.kind != "company":
         raise HTTPException(status_code=422, detail="Base ICPs are drafted from company lists.")
-    members = [m for m, _ in await repo.members(workspace_id, lst)]
-    if not members:
-        raise HTTPException(status_code=422, detail="This list has no companies yet.")
-    sample = members[:30]
-    titles = sorted({p.title for p in await repo.people_at(workspace_id, [c.id for c in sample]) if p.title})[:40]
-    model = get_settings().claude_scoring_model
-    result = await smart_lists.draft_icp(claude, model, lst.name, [smart_lists.describe_company(c) for c in sample], titles)
-    if result.input_tokens:
-        await calls.record(
-            workspace_id, "claude", "messages", "succeeded" if result.draft else "failed", model=model, cost_usd=result.cost_usd,
-            action="Draft ICP", input_tokens=result.input_tokens, output_tokens=result.output_tokens,
-        )  # fmt: skip
+    result = await smart_lists.draft_for(workspace_id, lst, repo, claude, DEFAULTS["sort"].model, recorder(calls, workspace_id))
     if result.draft is None:
-        raise HTTPException(status_code=502, detail=result.error or "Claude didn't return a draft.")
-    lst.icp_draft = SmartListIcpDraft.model_validate(result.draft.model_dump()).model_dump()
-    await repo.save(lst)
-    return _out(lst, len(members))
+        raise HTTPException(status_code=422 if result.input_tokens == 0 else 502, detail=result.error or "Claude didn't return a draft.")
+    count = next((n for other, n in await repo.lists(workspace_id, lst.kind) if other.id == lst.id), 0)
+    return _out(lst, count)
 
 
 @router.post("/{list_id}/create-icp", response_model=SmartListOut, status_code=201)
@@ -229,7 +208,7 @@ async def create_icp_from_list(
     manager: object = Depends(require_manager),
 ) -> SmartListOut:
     """Create the (edited) draft as a Lead Intel ICP, the same way the ICPs page does, with its description
-    and titles on the ICP's profile. Empty fields stay empty."""
+    and titles on the ICP's profile. Empty fields stay empty. The list's companies without an ICP get this one."""
     lst = await _list(repo, workspace_id, list_id)
     if lst.lead_intel_icp_id:
         raise HTTPException(status_code=409, detail="This list's ICP was already created.")
@@ -241,6 +220,8 @@ async def create_icp_from_list(
     await profiles.upsert(workspace_id, icp.id, {"description": body.description.strip(), "titles": body.titles})
     lst.icp_draft, lst.lead_intel_icp_id = body.model_dump(), icp.id
     await repo.save(lst)
+    # The list's companies (with their people and leads) go under it, where they have no ICP yet.
+    await repo.assign_icp(workspace_id, icp.id, [c.id for c, _ in await repo.members(workspace_id, lst)])
     count = next((n for other, n in await repo.lists(workspace_id, lst.kind) if other.id == lst.id), 0)
     return _out(lst, count)
 
