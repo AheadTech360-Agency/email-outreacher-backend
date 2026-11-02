@@ -416,6 +416,8 @@ class SendingCampaignOut(ApiModel):
 
 class QueueIn(ApiModel):
     email_ids: list[UUID] = Field(min_length=1, max_length=500)
+    # Emails to risky addresses (catch-all domains) a person confirmed. Any other risky one is left out.
+    risky_ok: list[UUID] = Field(default=[], max_length=500)
 
 
 class QueueOutcomeOut(ApiModel):
@@ -1076,6 +1078,8 @@ class EmailLeadOut(ApiModel):
     title: str
     company: str
     email: str | None
+    # valid | risky | ... from the LinkedIn email search (or Apollo's status); risky addresses need their own approval.
+    email_status: str | None = None
     linkedin_url: str | None
 
 

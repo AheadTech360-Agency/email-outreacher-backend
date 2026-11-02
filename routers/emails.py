@@ -364,6 +364,8 @@ async def generate(
             flags.append("no_hook")
         if score_spec is not None and draft.score is None:
             flags.append("not_scored")
+        if lead.email_status == "risky":
+            flags.append("risky_email")  # a catch-all domain: it may bounce, so it needs its own approval to queue
         row = await emails.save_draft(
             workspace_id, lead, points=points,
             email={

@@ -102,7 +102,7 @@ async def queue(body: QueueIn, deps: outreach.Deps = Depends(_deps)) -> QueueOut
     """Put approved first emails into their ICP's campaign. The campaign isn't activated: nothing sends
     until a person activates it in CheapSequencer."""
     try:
-        outcomes = await outreach.queue(deps, list(dict.fromkeys(body.email_ids)))
+        outcomes = await outreach.queue(deps, list(dict.fromkeys(body.email_ids)), set(body.risky_ok))
     except SendingError as exc:
         raise HTTPException(status_code=409, detail=exc.message) from exc
     return QueueOut(

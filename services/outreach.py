@@ -256,8 +256,12 @@ class QueueOutcome:
     campaign: str | None = None
 
 
-async def queue(deps: Deps, email_ids: list[UUID]) -> list[QueueOutcome]:
-    """Put approved first emails into their ICP's campaign. The campaign isn't activated."""
+RISKY = "Risky email address (the domain accepts any address, so it may bounce). Confirm it separately to queue it."
+
+
+async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozenset()) -> list[QueueOutcome]:
+    """Put approved first emails into their ICP's campaign. The campaign isn't activated. An email to a risky
+    address is left out unless a person confirmed that one (`risky_ok`)."""
     settings = await deps.settings.sending(deps.workspace_id)
     if not settings["sender_company"].strip() or not settings["sender_address"].strip():
         raise SendingError("Add the sender's company and physical address in Settings, under Sending, before queueing emails.")
@@ -270,6 +274,8 @@ async def queue(deps: Deps, email_ids: list[UUID]) -> list[QueueOutcome]:
     for email, lead in pairs:
         if not lead.email:
             outcomes.append(QueueOutcome(email.id, "skipped", "The lead has no email address"))
+        elif lead.email_status == "risky" and email.id not in risky_ok:
+            outcomes.append(QueueOutcome(email.id, "skipped", RISKY))
         elif hit := is_excluded(person_keys(lead.email, lead.domain)):
             outcomes.append(QueueOutcome(email.id, "skipped", exclusion_note(hit)))
         elif not lead.lead_intel_icp_id:

@@ -86,9 +86,10 @@ def test_idempotency_keys_are_stable_and_valid() -> None:
 # ---------- Fakes ----------
 
 
-def lead(email="ana@shop.com", first="Ana", icp=ICP):
+def lead(email="ana@shop.com", first="Ana", icp=ICP, email_status="valid"):
     return SimpleNamespace(id=uuid4(), email=email, first_name=first, last_name="Ruiz", company="Shop", title="Owner",
-                           website="shop.com", linkedin_url="", domain="shop.com", lead_intel_icp_id=icp)  # fmt: skip
+                           website="shop.com", linkedin_url="", domain="shop.com", lead_intel_icp_id=icp,
+                           email_status=email_status)  # fmt: skip
 
 
 def email(status="approved", **extra):
@@ -236,6 +237,17 @@ def test_queue_imports_and_enrolls_without_activating() -> None:
         "email_2_body": "Hi Ana, bumping this.", "email_3_body": "Hi Ana, closing the loop.",
     }]  # fmt: skip
     assert ok[0].status == "queued" and ok[0].sequencer_campaign_id == "c1"
+
+
+def test_a_risky_address_needs_its_own_confirmation_to_queue() -> None:
+    """A catch-all domain accepts any address, so the email may bounce: it's queued only when a person confirmed it."""
+    valid, risky, confirmed = (email(), lead()), (email(), lead(email="cory@iodev.com", email_status="risky")),         (email(), lead(email="jo@iodev.com", email_status="risky"))  # fmt: skip
+    seq = Sequencer([CAMPAIGN])
+    out = run(outreach.queue(deps(Sending([valid, risky, confirmed]), seq), [p[0].id for p in (valid, risky, confirmed)], {confirmed[0].id}))
+    by_id = {o.email_id: o for o in out}
+    assert by_id[valid[0].id].status == "queued" and by_id[confirmed[0].id].status == "queued"
+    assert by_id[risky[0].id].status == "skipped" and by_id[risky[0].id].reason == outreach.RISKY
+    assert risky[0].status == "approved"  # still approved, waiting for its own confirmation
 
 
 def test_queue_needs_the_sender_address() -> None:
