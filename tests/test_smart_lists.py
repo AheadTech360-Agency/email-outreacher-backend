@@ -249,3 +249,35 @@ def test_drafts_go_to_the_biggest_lists_first_and_never_uncategorized(client) ->
     repo = FakeRepo(shops)
     out, _ = run_sort_endpoint(client, repo, FakeClaude(pick))
     assert out["drafted"] == ["Retail"]
+
+
+class MoveRepo:
+    def __init__(self) -> None:
+        self.retail = SimpleNamespace(id=uuid4(), kind="company", name="Retail", name_key="retail")
+        self.people_list = SimpleNamespace(id=uuid4(), kind="person", name="Sales", name_key="sales")
+        self.made, self.moved = {}, []
+
+    async def get(self, workspace_id, list_id):
+        return {self.retail.id: self.retail, self.people_list.id: self.people_list}.get(list_id)
+
+    async def get_or_create(self, workspace_id, kind, name, key):
+        return self.made.setdefault(key, SimpleNamespace(id=uuid4(), kind=kind, name=name, name_key=key))
+
+    async def move(self, workspace_id, kind, member_ids, list_id):
+        self.moved.append((kind, member_ids, list_id))
+        return len(member_ids)
+
+
+def test_companies_move_to_an_existing_list_or_a_new_one(client) -> None:
+    repo = MoveRepo()
+    app.dependency_overrides[get_smart_list_repo] = lambda: repo
+    ids = [str(uuid4()), str(uuid4())]
+    r = client.post("/api/v1/smart-lists/move", headers=H, json={"kind": "company", "memberIds": ids, "toListId": str(repo.retail.id)})
+    assert r.status_code == 200 and r.json()["moved"] == 2 and r.json()["toListName"] == "Retail"
+    r = client.post("/api/v1/smart-lists/move", headers=H, json={"kind": "company", "memberIds": ids, "newListName": "  DTF   Shops "})
+    assert r.json()["toListName"] == "DTF Shops" and repo.made["dtf shops"].kind == "company"
+    # A people list can't take companies; one target only.
+    bad = client.post("/api/v1/smart-lists/move", headers=H, json={"kind": "company", "memberIds": ids, "toListId": str(repo.people_list.id)})
+    assert bad.status_code == 422
+    both = client.post("/api/v1/smart-lists/move", headers=H, json={"kind": "company", "memberIds": ids, "toListId": str(repo.retail.id), "newListName": "X"})
+    assert both.status_code == 422

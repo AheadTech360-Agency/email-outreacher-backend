@@ -1483,6 +1483,25 @@ class SmartListPersonOut(ApiModel):
 class SmartListDetailOut(SmartListOut):
     companies: list[SmartListCompanyOut]
     people: list[SmartListPersonOut]
+    # This page of members: `matching` of them fit the search (all of them without one).
+    page: int = 1
+    page_size: int = 50
+    matching: int = 0
+
+
+class MoveMembersIn(ApiModel):
+    """Move companies or people to an existing list, or to a new one by name."""
+
+    kind: Literal["company", "person"]
+    member_ids: list[UUID] = Field(min_length=1, max_length=5000)
+    to_list_id: UUID | None = None
+    new_list_name: str | None = Field(default=None, min_length=1, max_length=60)
+
+
+class MoveMembersResult(ApiModel):
+    moved: int
+    to_list_id: UUID
+    to_list_name: str
 
 
 class SmartListsSummary(ApiModel):

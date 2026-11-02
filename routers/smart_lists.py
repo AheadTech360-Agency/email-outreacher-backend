@@ -22,7 +22,7 @@ from lead_intel_writes import LeadIntelIcpWriter
 from routers.icps import create_icp
 from models import Company, SmartList, Stakeholder
 from schemas import (
-    IcpCreateIn, SmartListCompanyOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
+    IcpCreateIn, MoveMembersIn, MoveMembersResult, SmartListCompanyOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
     SmartListUpdateIn, SortListsIn, SortListsResult,
 )  # fmt: skip
 from services import smart_lists
@@ -138,12 +138,43 @@ async def export_people(
     return _csv(await _rows(repo, workspace_id, people), "people.csv")
 
 
+@router.post("/move", response_model=MoveMembersResult, dependencies=[Depends(require_manager)])
+async def move_members(
+    body: MoveMembersIn, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+) -> MoveMembersResult:
+    """Move companies or people to another list, an existing one or a new one named here. A company moved to a list
+    whose ICP is created doesn't change ICP: that's set on the company."""
+    if bool(body.to_list_id) == bool(body.new_list_name and body.new_list_name.strip()):
+        raise HTTPException(status_code=422, detail="Pick a list to move them to, or name a new one.")
+    if body.to_list_id:
+        target = await _list(repo, workspace_id, body.to_list_id)
+        if target.kind != body.kind:
+            raise HTTPException(status_code=422, detail="That list is for the other kind (companies or people).")
+    else:
+        name = " ".join(body.new_list_name.split())
+        target = await repo.get_or_create(workspace_id, body.kind, name, smart_lists.name_key(name))
+    moved = await repo.move(workspace_id, body.kind, list(dict.fromkeys(body.member_ids)), target.id)
+    return MoveMembersResult(moved=moved, to_list_id=target.id, to_list_name=target.name)
+
+
+PAGE_SIZES = (25, 50, 100, 200)
+
+
 @router.get("/{list_id}", response_model=SmartListDetailOut)
 async def get_list(
-    list_id: UUID, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+    list_id: UUID,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, alias="pageSize"),
+    q: str = Query(default="", max_length=200),
+    workspace_id: UUID = Depends(require_workspace_id),
+    repo: SmartListRepo = Depends(get_smart_list_repo),
 ) -> SmartListDetailOut:
+    """A list with one page of its members (50 by default), optionally searched by name."""
+    if page_size not in PAGE_SIZES:
+        raise HTTPException(status_code=422, detail=f"pageSize is one of {', '.join(map(str, PAGE_SIZES))}")
     lst = await _list(repo, workspace_id, list_id)
-    members = await repo.members(workspace_id, lst)
+    members, matching = await repo.members_page(workspace_id, lst, (page - 1) * page_size, page_size, q)
+    count = next((n for other, n in await repo.lists(workspace_id, lst.kind) if other.id == lst.id), 0)
     companies, people = [], []
     for m, member in members:
         if lst.kind == "company":
@@ -152,7 +183,8 @@ async def get_list(
         else:
             people.append(SmartListPersonOut(id=m.id, name=_name(m), title=m.title, company=m.organization_name, email=m.email,
                                              email_status=m.email_status, linkedin_url=m.linkedin_url, reason=member.reason))  # fmt: skip
-    return SmartListDetailOut(**_out(lst, len(members)).model_dump(), companies=companies, people=people)
+    return SmartListDetailOut(**_out(lst, count).model_dump(), companies=companies, people=people, page=page, page_size=page_size,
+                              matching=matching)  # fmt: skip
 
 
 @router.patch("/{list_id}", response_model=SmartListOut, dependencies=[Depends(require_manager)])

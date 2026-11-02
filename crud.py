@@ -2077,6 +2077,41 @@ class SmartListRepo:
         )
         return [(row[0], row[1]) for row in rows]
 
+    async def members_page(
+        self, workspace_id: UUID, lst: SmartList, offset: int, limit: int, q: str = ""
+    ) -> tuple[list[tuple[Any, SmartListMember]], int]:
+        """One page of a list's members, optionally filtered by name (company name, or person's name, title, company,
+        email), and how many match in all."""
+        model = Company if lst.kind == "company" else Stakeholder
+        query = (
+            select(model, SmartListMember)
+            .join(SmartListMember, (SmartListMember.member_id == model.id) & (SmartListMember.kind == lst.kind))
+            .where(SmartListMember.workspace_id == workspace_id, SmartListMember.list_id == lst.id)
+        )
+        if q.strip():
+            like = f"%{q.strip()}%"
+            if lst.kind == "company":
+                query = query.where(or_(Company.name.ilike(like), Company.domain.ilike(like)))
+            else:
+                full = func.concat(Stakeholder.first_name, " ", Stakeholder.last_name)
+                query = query.where(or_(full.ilike(like), Stakeholder.title.ilike(like), Stakeholder.organization_name.ilike(like),
+                                        Stakeholder.email.ilike(like)))  # fmt: skip
+        total = int(await self.session.scalar(select(func.count()).select_from(query.subquery())) or 0)
+        order = (model.name,) if lst.kind == "company" else (model.first_name, model.last_name)
+        rows = await self.session.execute(query.order_by(*order, model.id).offset(offset).limit(limit))
+        return [(row[0], row[1]) for row in rows], total
+
+    async def move(self, workspace_id: UUID, kind: str, member_ids: list[UUID], list_id: UUID) -> int:
+        """Put these companies or people in another list (one they're already in is left alone). Returns how many moved."""
+        result = await self.session.execute(
+            update(SmartListMember)
+            .where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind,
+                   SmartListMember.member_id.in_(member_ids), SmartListMember.list_id != list_id)
+            .values(list_id=list_id, reason="Moved by hand")
+        )  # fmt: skip
+        await self.session.commit()
+        return result.rowcount or 0
+
     async def list_names(self, workspace_id: UUID, kind: str, member_ids: list[UUID]) -> dict[UUID, str]:
         if not member_ids:
             return {}
