@@ -113,6 +113,12 @@ def _person(lead: Lead, person: Stakeholder | None, company: Company | None, pos
         f"{j.get('title') or 'Role'} at {j.get('organization_name') or 'a company'}" + (" (current)" if j.get("current") else "")
         for j in jobs[:5]
     )
+    if not experience:  # a full LinkedIn profile (from the email search): position, company, how long
+        roles = [j for j in raw.get("experience") or [] if isinstance(j, dict)]
+        experience = "; ".join(
+            f"{j.get('position') or 'Role'} at {j.get('companyName') or 'a company'}" + (f" ({j['duration']})" if j.get("duration") else "")
+            for j in roles[:5]
+        )
     return {
         "first_name": lead.first_name, "last_name": lead.last_name, "title": lead.title,
         "seniority": (person.seniority if person else None) or raw.get("seniority") or "",
@@ -123,6 +129,7 @@ def _person(lead: Lead, person: Stakeholder | None, company: Company | None, pos
         "linkedin_url": lead.linkedin_url or (person.linkedin_url if person else None) or "",
         "instagram_url": lead.instagram_url or "",
         "experience": experience,
+        "about": _text(raw.get("about"))[:600],
         "extra": lead.extra,
     }  # fmt: skip
 

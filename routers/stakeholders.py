@@ -243,7 +243,7 @@ async def search_linkedin(
             results.append(CompanySearchResult(company_id=company_id, name=name, status="skipped", reason=reason))
             continue
         try:
-            people, run = await apify.company_employees(company["display_name"], titles, body.max_per_company)
+            people, run = await apify.company_employees(company["display_name"], titles, body.max_per_company, body.find_emails)
         except ApifyError as exc:
             await calls.record(workspace_id, "apify", EMPLOYEES_ACTOR, "failed", action="Find stakeholders")
             results.append(CompanySearchResult(company_id=company_id, name=name, status="failed", reason=exc.message))

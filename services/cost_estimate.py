@@ -87,8 +87,8 @@ DEFAULT_ESTIMATE: dict[str, Any] = {
         # Finding people
         _item("apollo-people", "Apollo people search", "Finding people", "per search", 0, 0, "month",
               "Enter your Apollo plan's cost per search in COST_PRICES."),
-        _item("apify-linkedin-people", "LinkedIn people search (Apify)", "Finding people", "per profile", 0.003, 0, "month",
-              "Apify's Bronze price on 31 Oct 2026, plus $0.02 each time a company is searched: enter profiles a month."),
+        _item("apify-linkedin-people", "LinkedIn people + work emails (Apify)", "Finding people", "per profile", 0.012, 0, "month",
+              "Apify's Bronze price with the email search, on 2 Nov 2026 ($0.003 without emails), plus $0.02 each time a company is searched: enter profiles a month."),
         _item("apollo-reveal", "Email reveal (Apollo)", "Finding people", "per email revealed", 0, 1, "lead",
               "One Apollo credit per revealed email: enter your plan's price per credit in COST_PRICES."),
         # Verification: the sources used to decide whether a business is worth contacting (per company verified)

@@ -411,7 +411,7 @@ async def find_stakeholders(
                 )
                 results.append(CompanySearchResult(company_id=cid, name=name, status="searched", found=len(people), new=new, total_at_apollo=total))
             else:
-                people, run = await apify.company_employees(c.linkedin_url or c.name, titles, body.max_per_company)  # type: ignore[union-attr]
+                people, run = await apify.company_employees(c.linkedin_url or c.name, titles, body.max_per_company, body.find_emails)  # type: ignore[union-attr]
                 cost += run.cost_usd or 0
                 await calls.record(
                     workspace_id, "apify", EMPLOYEES_ACTOR, "succeeded",

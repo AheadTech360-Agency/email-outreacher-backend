@@ -686,11 +686,13 @@ class StakeholderSearchResult(ApiModel):
 
 
 class LinkedInSearchIn(ApiModel):
-    """Find people at companies on LinkedIn (Apify). Paid per profile; no emails."""
+    """Find people at companies on LinkedIn (Apify). Paid per profile: $0.003, or $0.012 with their work email."""
 
     company_ids: list[UUID] = Field(min_length=1, max_length=10)
     titles: list[str] = Field(default=[], max_length=30)
     max_per_company: int = Field(default=10, ge=1, le=50)
+    # Search for each person's work email too (and get their full profile).
+    find_emails: bool = True
 
 
 class AddAsLeadsIn(ApiModel):
@@ -892,6 +894,8 @@ class PipelineStakeholdersIn(ApiModel):
     titles: list[str] = Field(default=[], max_length=30)
     seniorities: list[str] = Field(default=[], max_length=11)
     max_per_company: int = Field(default=10, ge=1, le=50)
+    # LinkedIn only: search for each person's work email too ($0.012 a person instead of $0.003).
+    find_emails: bool = True
 
 
 # ---------- Usage ----------

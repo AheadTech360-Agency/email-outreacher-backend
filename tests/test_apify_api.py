@@ -21,14 +21,15 @@ class FakeApify:
         self.linkedin_items: list[FetchedPost] = []
         self.instagram_items: list[FetchedPost] = []
 
-    async def company_employees(self, company, titles, max_items):
+    async def company_employees(self, company, titles, max_items, with_email=False):
         if self.error:
             raise self.error
-        self.calls.append(("employees", company, titles, max_items))
+        self.calls.append(("employees", company, titles, max_items, with_email))
         people = [
-            Employee("e1", "Ava", "Morgan", "Owner", "https://www.linkedin.com/in/ava-morgan", "Glow Med Spa", {}),
+            Employee("e1", "Ava", "Morgan", "Owner", "https://www.linkedin.com/in/ava-morgan", "Glow Med Spa", {},
+                     *(("ava@glowmedspa.com", "valid") if with_email else ())),
             Employee("e2", "Bo", "Chen", "Founder", None, "Glow Med Spa", {}),
-        ]
+        ]  # fmt: skip
         return people, RunResult([], 0.008, "run-e")
 
     async def linkedin_posts(self, urls, max_posts, since):
@@ -61,7 +62,7 @@ def test_linkedin_search_saves_full_names_by_company_name(client, apify, apollo_
     result = client.post("/api/v1/stakeholders/search-linkedin", json=body, headers=WS).json()
     assert result["error"] is None and result["costUsd"] == 0.008
     assert result["results"][0]["found"] == 2 and result["results"][0]["new"] == 2
-    assert apify.calls == [("employees", "Glow Med Spa", ["Owner"], 5)]
+    assert apify.calls == [("employees", "Glow Med Spa", ["Owner"], 5, True)]  # emails searched for by default
     people = client.get("/api/v1/stakeholders", headers=WS).json()
     assert {(p["firstName"], p["lastName"], p["source"]) for p in people} == {
         ("Ava", "Morgan", "apify_linkedin"), ("Bo", "Chen", "apify_linkedin"),
@@ -81,7 +82,7 @@ def test_add_as_leads_needs_linkedin_or_email(client, apify, apollo_env) -> None
     result = client.post("/api/v1/stakeholders/add-as-leads", json={"stakeholderIds": ids}, headers=WS).json()
     assert result == {"added": 1, "linkedExisting": 0, "skipped": 1}  # Bo has no LinkedIn URL and no email
     [lead] = apollo_env.leads
-    assert lead.linkedin_url == "https://www.linkedin.com/in/ava-morgan" and lead.email == ""
+    assert lead.linkedin_url == "https://www.linkedin.com/in/ava-morgan" and lead.email == "ava@glowmedspa.com"
     again = client.post("/api/v1/stakeholders/add-as-leads", json={"stakeholderIds": ids}, headers=WS).json()
     assert again["added"] == 0 and again["skipped"] == 2
 
@@ -215,3 +216,17 @@ def test_fetch_limits(client, posts_env) -> None:
 def test_workspace_header_required(client, posts_env) -> None:
     assert client.post("/api/v1/posts/fetch", json={"leadIds": [str(uuid4())]}).status_code == 400
     assert WORKSPACE_ID
+
+
+def test_people_found_with_an_email_become_leads_ready_to_send(client, apify, apollo_env) -> None:  # noqa: F811
+    client.post("/api/v1/stakeholders/search-linkedin", json={"companyIds": [str(COMPANY_ID)]}, headers=WS)
+    ava = next(r for r in apollo_env.rows.rows.values() if r.external_id == "e1")
+    assert (ava.email, ava.email_status) == ("ava@glowmedspa.com", "valid")
+    client.post("/api/v1/stakeholders/add-as-leads", json={"stakeholderIds": [str(ava.id)]}, headers=WS)
+    [lead] = apollo_env.leads
+    assert lead.email == "ava@glowmedspa.com"
+
+
+def test_emails_can_be_left_out_to_pay_less(client, apify, apollo_env) -> None:  # noqa: F811
+    client.post("/api/v1/stakeholders/search-linkedin", json={"companyIds": [str(COMPANY_ID)], "findEmails": False}, headers=WS)
+    assert apify.calls[-1][-1] is False

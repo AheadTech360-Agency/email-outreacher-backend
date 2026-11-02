@@ -55,6 +55,26 @@ class Employee:
     linkedin_url: str | None
     company_name: str | None
     raw: dict[str, Any]
+    # With the email search: their best work email and how sure Apify is (valid | risky | ...), else None.
+    email: str | None = None
+    email_status: str | None = None
+
+
+# The LinkedIn people actor's modes (its input's profileScraperMode). Email search costs $0.012 a person (Bronze) and
+# returns the full profile too; the short one $0.003, no email.
+SHORT_PROFILES = "Short ($4 per 1k)"
+PROFILES_WITH_EMAIL = "Full + email search ($12 per 1k)"
+
+
+def best_email(item: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The email to use from an email search: valid and deliverable first, then the highest quality score. Free
+    addresses (gmail and the like) only when there's nothing else."""
+    found = [e for e in item.get("emails") or [] if isinstance(e, dict) and "@" in str(e.get("email") or "")]
+    if not found:
+        return None, None
+    rank = lambda e: (not e.get("free"), e.get("status") == "valid", bool(e.get("deliverable")), e.get("qualityScore") or 0)  # noqa: E731
+    best = max(found, key=rank)
+    return str(best["email"]).strip().lower(), str(best.get("status") or "unknown")
 
 
 @dataclass
@@ -237,12 +257,13 @@ class ApifyClient:
     # ---- Actors ----
 
     async def company_employees(
-        self, company: str, job_titles: list[str], max_items: int
+        self, company: str, job_titles: list[str], max_items: int, with_email: bool = False
     ) -> tuple[list[Employee], RunResult]:
-        """People at one company on LinkedIn. `company` is a LinkedIn company URL or the company's name."""
+        """People at one company on LinkedIn. `company` is a LinkedIn company URL or the company's name. With
+        `with_email`, each person's work email is searched for too (and their full profile comes back)."""
         actor_input: dict[str, Any] = {
             "companies": [company],
-            "profileScraperMode": "Short ($4 per 1k)",
+            "profileScraperMode": PROFILES_WITH_EMAIL if with_email else SHORT_PROFILES,
             "maxItems": max_items,
             "companyBatchMode": "all_at_once",
         }
@@ -258,6 +279,7 @@ class ApifyClient:
             # The actor's current output has `currentPositions` ({title, companyName, company}); older runs had
             # `currentPosition` ({position, companyName}).
             position = (item.get("currentPositions") or item.get("currentPosition") or [{}])[0] or {}
+            email, email_status = best_email(item)
             people.append(
                 Employee(
                     external_id=str(key),
@@ -267,6 +289,8 @@ class ApifyClient:
                     linkedin_url=url,
                     company_name=position.get("companyName") or (position.get("company") or {}).get("name"),
                     raw=item,
+                    email=email,
+                    email_status=email_status,
                 )
             )
         return people, result

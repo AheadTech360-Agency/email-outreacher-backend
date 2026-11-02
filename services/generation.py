@@ -296,6 +296,7 @@ def variables(
         "lead.linkedinUrl": lead.get("linkedin_url") or "",
         "lead.instagramUrl": lead.get("instagram_url") or "",
         "lead.experience": lead.get("experience") or "",
+        "lead.about": lead.get("about") or "",
         "items": format_items(items),
         "hooks": format_hooks(hooks or []),
         "hook.text": top.hook if top else "",

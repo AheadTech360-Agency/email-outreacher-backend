@@ -77,7 +77,8 @@ class FakeStakeholders:
                     id=uuid4(), workspace_id=ws, lead_intel_business_id=company_id, lead_intel_icp_id=icp_id,
                     company_id=pipeline_company_id, organization_name=p.company_name, source="apify_linkedin", external_id=p.external_id,
                     first_name=p.first_name, last_name=p.last_name, title=p.title, seniority=None,
-                    linkedin_url=p.linkedin_url, has_email=None, email=None, email_status=None, revealed_at=None,
+                    linkedin_url=p.linkedin_url, has_email=True if p.email else None, email=p.email, email_status=p.email_status,
+                    revealed_at=None,
                     lead_id=None, found_at=datetime.now(UTC),
                 )  # fmt: skip
                 self.rows[row.id] = row

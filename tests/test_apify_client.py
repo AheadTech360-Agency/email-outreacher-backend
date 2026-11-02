@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from services.apify import ApifyClient, ApifyError, instagram_handle, linkedin_slug
+from services.apify import ApifyClient, ApifyError, best_email, instagram_handle, linkedin_slug
 
 
 def sync(fn):
@@ -198,3 +198,26 @@ async def test_instagram_profiles_keep_raw_data_and_latest_posts() -> None:
     assert ink.raw["biography"] == "Custom tees" and "latestPosts" not in ink.raw
     [post] = ink.posts
     assert (post.url, post.media_type, post.text, post.owner_key) == ("https://www.instagram.com/p/X1/", "video", "Fresh drop", "inkco")
+
+
+def test_the_best_email_is_valid_deliverable_work_email() -> None:
+    """The shape the actor's email search returned on 2026-11-02."""
+    item = {"emails": [
+        {"email": "Cory@iodev.com", "catchAllDomain": True, "free": False, "status": "risky", "qualityScore": 60},
+        {"email": "cory.keane@gmail.com", "free": True, "status": "valid", "deliverable": True, "qualityScore": 95},
+        {"email": "ck@iodev.com", "free": False, "status": "valid", "deliverable": True, "qualityScore": 90}]}  # fmt: skip
+    assert best_email(item) == ("ck@iodev.com", "valid")
+    assert best_email({"emails": [item["emails"][0]]}) == ("cory@iodev.com", "risky")  # risky is kept, and says so
+    assert best_email({"emails": []}) == (None, None) and best_email({}) == (None, None)
+
+
+@sync
+async def test_employees_with_email_use_the_email_mode() -> None:
+    items = [{"id": "k1", "firstName": "Kevin", "currentPosition": [{"position": "Founder, CEO", "companyName": "UpMerch"}],
+              "emails": [{"email": "kevin@upmerch.com", "status": "valid", "deliverable": True, "qualityScore": 100}]}]  # fmt: skip
+    transport, seen = fake_apify(items)
+    c = client(transport)
+    [kevin], _ = await c.company_employees("UpMerch", [], 1, with_email=True)
+    await c.aclose()
+    assert seen["input"]["profileScraperMode"] == "Full + email search ($12 per 1k)"
+    assert (kevin.title, kevin.email, kevin.email_status) == ("Founder, CEO", "kevin@upmerch.com", "valid")

@@ -266,6 +266,7 @@ Headline: {{lead.headline}}
 Location: {{lead.location}}
 Company: {{lead.company}} ({{lead.website}})
 Work history: {{lead.experience}}
+About them, in their own words: {{lead.about}}
 
 ## What to open with
 

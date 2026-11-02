@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import case, delete, func, or_, select, tuple_, update
+from sqlalchemy import case, delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
@@ -787,7 +788,9 @@ class StakeholderRepo:
     ) -> int:
         """Add people found on LinkedIn (via Apify) and refresh known ones; returns how many were new.
 
-        Unlike an Apollo search these come with full names and a LinkedIn URL, but no email.
+        Unlike an Apollo search these come with full names and a LinkedIn URL, and, from an email search, a work
+        email. An email already known (revealed through Apollo, say) is kept; a lead made from the person that has
+        no email yet gets the new one.
         """
         if not people:
             return 0
@@ -814,6 +817,9 @@ class StakeholderRepo:
                 linkedin_url=p.linkedin_url,
                 organization_name=p.company_name,
                 raw=p.raw,
+                email=p.email,
+                email_status=p.email_status,
+                has_email=True if p.email else None,
             )
             statement = statement.on_conflict_do_update(
                 index_elements=[Stakeholder.workspace_id, Stakeholder.source, Stakeholder.external_id],
@@ -826,9 +832,35 @@ class StakeholderRepo:
                     ),
                     "company_id": func.coalesce(statement.excluded.company_id, Stakeholder.company_id),
                     "lead_intel_icp_id": func.coalesce(statement.excluded.lead_intel_icp_id, Stakeholder.lead_intel_icp_id),
+                    # An email found now fills a gap, never replaces one already known (possibly paid for).
+                    "email_status": case((Stakeholder.email.is_(None), statement.excluded.email_status), else_=Stakeholder.email_status),
+                    "email": func.coalesce(Stakeholder.email, statement.excluded.email),
+                    "has_email": func.coalesce(Stakeholder.has_email, statement.excluded.has_email),
+                    # The full profile from an email search replaces a short one, never the other way round.
+                    "raw": case((statement.excluded.raw.has_key("emails"), statement.excluded.raw), else_=Stakeholder.raw),
                 },
             )
             await self.session.execute(statement)
+        # People who are already leads, still without an email, get the one just found.
+        found = [p.external_id for p in people if p.email]
+        other_lead = aliased(Lead)
+        if found:
+            await self.session.execute(
+                update(Lead)
+                .where(
+                    Lead.email.is_(None),
+                    Lead.id == Stakeholder.lead_id,
+                    Stakeholder.workspace_id == workspace_id,
+                    Stakeholder.source == "apify_linkedin",
+                    Stakeholder.external_id.in_(found),
+                    Stakeholder.email.is_not(None),
+                    # Never an email another lead in the workspace already has (one lead per address).
+                    ~exists().where(
+                        other_lead.workspace_id == Lead.workspace_id, func.lower(other_lead.email) == func.lower(Stakeholder.email)
+                    ),
+                )
+                .values(email=Stakeholder.email, email_status=Stakeholder.email_status)
+            )
         await self.session.commit()
         return sum(p.external_id not in known for p in people)
 
