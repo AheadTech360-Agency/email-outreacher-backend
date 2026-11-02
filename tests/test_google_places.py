@@ -19,6 +19,7 @@ from services.google_places import (
     initial_grid,
     shared_domain,
     split,
+    split_box,
 )
 from tests.conftest import ICP_ID
 from tests.test_pipeline_api import WS, env  # noqa: F401  (the pipeline fixture, reused)
@@ -107,7 +108,7 @@ class FakeGoogle:
         self.requests.append({"body": body, "mask": request.headers["X-Goog-FieldMask"], "key": request.headers["X-Goog-Api-Key"]})
         if self.status != 200:
             return httpx.Response(self.status, json={"error": {"message": "API key not valid."}})
-        if "locationBias" not in body:
+        if "locationBias" not in body and "locationRestriction" not in body:
             return httpx.Response(200, json=self.center)
         return httpx.Response(200, json=self.pages.pop(0) if self.pages else {"places": []})
 
@@ -175,6 +176,52 @@ async def test_full_circle_splits_until_the_request_limit() -> None:
     assert child_radius < google.requests[1]["body"]["locationBias"]["circle"]["radius"]
 
 
+TEXAS = {
+    "places": [{
+        "displayName": {"text": "Texas"}, "formattedAddress": "Texas, USA", "location": {"latitude": 31.0, "longitude": -100.0},
+        "types": ["administrative_area_level_1", "political"], "addressComponents": [{"shortText": "US", "types": ["country"]}],
+        "viewport": {"low": {"latitude": 25.8, "longitude": -106.6}, "high": {"latitude": 36.5, "longitude": -93.5}},
+    }]
+}  # fmt: skip
+
+
+@sync
+async def test_a_state_is_searched_across_its_box_not_around_its_centre() -> None:
+    """2026-11-02: "United States" with a 10 mile radius searched one circle in Kansas and found 2."""
+    full = [{"places": [place(n) for n in range(k * 20, k * 20 + 20)], "nextPageToken": f"t{k}"} for k in range(3)]
+    full[2].pop("nextPageToken")
+    google = FakeGoogle(center=TEXAS, pages=full)  # the whole state is full (60): it splits into quarters
+    area = await client_for(google).search_area("dtf transfers", "Texas", 10, max_searches=20)
+    assert "viewport" in google.requests[0]["mask"]
+    first = google.requests[1]["body"]
+    assert "locationBias" not in first
+    assert first["locationRestriction"]["rectangle"] == {"low": {"latitude": 25.8, "longitude": -106.6},
+                                                          "high": {"latitude": 36.5, "longitude": -93.5}}  # fmt: skip
+    # 3 pages of the state, then one request for each of its 4 quarters (empty here).
+    assert (area.center_lookups, area.searches, area.stopped_at_limit, len(area.places)) == (1, 7, False, 60)
+    quarters = [r["body"]["locationRestriction"]["rectangle"] for r in google.requests[4:]]
+    assert {(round(q["low"]["latitude"], 4), round(q["low"]["longitude"], 4)) for q in quarters} == {(25.8, -106.6), (25.8, -100.05), (31.15, -106.6), (31.15, -100.05)}
+    assert "all of it was searched" in area.notes[0]
+
+
+def test_a_box_across_the_180th_meridian_splits_correctly() -> None:
+    from services.google_places import Box
+
+    alaska = Box(51.0, 172.0, 71.0, -130.0, 0)  # west of the meridian to east of it
+    west, east = sorted({(q.west, q.east) for q in split_box(alaska)})
+    assert west == (-159.0, -130.0) and east == (172.0, -159.0)
+
+
+@sync
+async def test_each_place_is_looked_up_once_however_many_terms() -> None:
+    google = FakeGoogle()
+    places = client_for(google)
+    a = await places.search_area("dtf transfers", "Chicago, IL", 10, max_searches=5)
+    b = await places.search_area("gang sheets", "chicago, il", 10, max_searches=5)
+    assert (a.center_lookups, b.center_lookups) == (1, 0)
+    assert sum("locationBias" not in r["body"] for r in google.requests) == 1
+
+
 # ---------- Find endpoint ----------
 
 
@@ -235,3 +282,13 @@ def test_find_on_google_maps_problems(client, env) -> None:  # noqa: F811
     r = find_maps(client, locations=["Springfield"]).json()["googleMaps"]
     assert r["error"] is None and r["notes"] == ['med spa around Springfield: "Springfield" resolved to X in PK, not US.']
     assert find_maps(client, radiusMiles=80).status_code == 422
+
+
+def test_the_request_limit_is_shared_by_every_term_and_place(client, env) -> None:  # noqa: F811
+    """2026-11-02: the first term used the whole limit and the others never ran."""
+    fake = FakePlaces(maps_places())
+    app.dependency_overrides[get_optional_places] = lambda: fake
+    r = find_maps(client, searchTerms=["dtf transfers", "gang sheets", "dtf gang sheets"], locations=["Texas"], maxSearches=30).json()
+    # 30 between 3 terms: 10 each (each fake search uses 4 of its share, so the rest passes on).
+    assert [a[3] for a in fake.asked] == [10, 13, 22]
+    assert r["googleMaps"]["searches"] == 12

@@ -183,31 +183,32 @@ async def _find_on_google_maps(
     searches = lookups = capped = 0
     notes: list[str] = []
     fatal: str | None = None
-    for term in terms:
-        for location in locations:
-            left = gm.max_searches - searches - lookups
-            if left <= 0:
-                notes.append(f"Stopped at the limit of {gm.max_searches} Google requests.")
-                break
-            try:
-                area = await places.search_area(term, location, gm.radius_miles, left)
-            except PlacesError as exc:
-                lookups += 1  # the centre lookup that failed is still billed
-                if exc.status in (401, 403, 429):
-                    fatal = exc.message
-                    break
-                notes.append(f"{term} around {location}: {exc.message}")
-                continue
-            searches += area.searches
-            lookups += area.center_lookups
-            capped += area.capped_cells
-            for pid, place in area.places.items():
-                found.setdefault(pid, place)
-            if area.stopped_at_limit:
-                notes.append(f"Stopped at the limit of {gm.max_searches} Google requests.")
-                break
-        if fatal or searches + lookups >= gm.max_searches:
+    pairs = [(term, location) for term in terms for location in locations]
+    for i, (term, location) in enumerate(pairs):
+        left = gm.max_searches - searches - lookups
+        if left < 2:  # a lookup and at least one search
+            skipped = len(pairs) - i
+            notes.append(f"Stopped at the limit of {gm.max_searches} Google requests; {skipped} search{'es' if skipped != 1 else ''} not run.")
             break
+        # An even share of what's left, so the first term can't use it all; a share it doesn't need passes on.
+        share = max(2, left // (len(pairs) - i))
+        try:
+            area = await places.search_area(term, location, gm.radius_miles, share)
+        except PlacesError as exc:
+            lookups += 1  # the centre lookup that failed is still billed
+            if exc.status in (401, 403, 429):
+                fatal = exc.message
+                break
+            notes.append(f"{term} around {location}: {exc.message}")
+            continue
+        searches += area.searches
+        lookups += area.center_lookups
+        capped += area.capped_cells
+        for pid, place in area.places.items():
+            found.setdefault(pid, place)
+        notes.extend(n for n in area.notes if n not in notes)
+        if area.stopped_at_limit:
+            notes.append(f"{term} in {location}: found {len(area.places)}, then used its share of {share} requests. Google has more; raise the request limit to see them.")
     if capped:
         notes.append(f"{capped} area{'s were' if capped != 1 else ' was'} still full after the finest split, so Google may have more there.")
 

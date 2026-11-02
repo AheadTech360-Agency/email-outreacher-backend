@@ -1356,7 +1356,7 @@ class QuickstartIn(ApiModel):
     places: list[str] = Field(min_length=1, max_length=10)
     radius_miles: float = Field(default=10, ge=1, le=50)
     # Google charges per request; each returns up to 20 businesses (plus one lookup per place).
-    google_requests: int = Field(default=4, ge=2, le=100)
+    google_requests: int = Field(default=20, ge=2, le=100)
     companies: int = Field(default=10, ge=1, le=100)  # how many of those to verify
     people_per_company: int = Field(default=2, ge=1, le=10)
     titles: list[str] = Field(default=[], max_length=30)

@@ -10,6 +10,11 @@ points around a place. The same here:
 3. A circle that comes back full may hold more than Google showed, so it splits into smaller
    circles, at most 3 levels deep.
 
+A whole state or country is different: a radius around its centre point would search one small
+patch in the middle of it ("United States", 10 miles, is a field in Kansas). So a state or country
+is searched inside its own boundary box instead, and a box that comes back full splits into
+quarters, as deep as the request budget allows. The radius doesn't apply there.
+
 Google charges per request, not per result, so every request counts against `max_searches` and
 the run stops cleanly when it's reached. Prices are Lead Intel's, verified against Google's
 pricing pages when it was built (packages/shared/src/pricing.ts):
@@ -36,7 +41,7 @@ SEARCH_FIELDS = ",".join([
     "places.userRatingCount", "places.businessStatus", "places.primaryType", "nextPageToken",
 ])  # fmt: skip
 # Pro-tier only: the centre needs no phone or website, and asking would cost more for nothing.
-CENTER_FIELDS = "places.displayName,places.formattedAddress,places.addressComponents,places.location,places.types"
+CENTER_FIELDS = "places.displayName,places.formattedAddress,places.addressComponents,places.location,places.types,places.viewport"
 
 # Google types that describe an area. A centre must be one, and must not be a business.
 AREA_TYPES = {
@@ -55,6 +60,10 @@ MAX_DEPTH = 3
 SPLIT_RATIO = math.sqrt(math.pi / 8)
 PAGE_SIZE = 20
 MAX_PAGES = 3
+# A state or country is searched by its boundary box, not a radius.
+WIDE_TYPES = {"country", "administrative_area_level_1"}
+# A full box splits into 4; 6 levels is 4,096 boxes, far past any budget, so the budget is the real limit.
+MAX_BOX_DEPTH = 6
 
 
 class PlacesError(Exception):
@@ -70,6 +79,25 @@ class Cell:
     lng: float
     radius_m: float
     depth: int
+
+
+@dataclass
+class Box:
+    """A boundary box. `east` may be less than `west` when it crosses the 180th meridian (Alaska)."""
+
+    south: float
+    west: float
+    north: float
+    east: float
+    depth: int
+
+
+@dataclass
+class Area:
+    lat: float
+    lng: float
+    label: str
+    box: Box | None  # set for a state or country: searched by box instead of by radius
 
 
 @dataclass
@@ -154,6 +182,30 @@ def split(cell: Cell) -> list[Cell]:
     return _tile(cell.lat, cell.lng, cell.radius_m, cell.radius_m * SPLIT_RATIO, cell.depth + 1)
 
 
+def _lng(x: float) -> float:
+    return (x + 540) % 360 - 180
+
+
+def split_box(box: Box) -> list[Box]:
+    """Quarters of a full box."""
+    if box.depth >= MAX_BOX_DEPTH:
+        return []
+    east = box.east + 360 if box.east < box.west else box.east
+    mid_lat, mid_lng = (box.south + box.north) / 2, _lng((box.west + east) / 2)
+    return [
+        Box(s, w, n, e, box.depth + 1)
+        for s, n in ((box.south, mid_lat), (mid_lat, box.north))
+        for w, e in ((box.west, mid_lng), (mid_lng, box.east))
+    ]
+
+
+def _box(raw: dict[str, Any] | None) -> Box | None:
+    low, high = (raw or {}).get("low"), (raw or {}).get("high")
+    if not low or not high:
+        return None
+    return Box(low["latitude"], low["longitude"], high["latitude"], high["longitude"], 0)
+
+
 # ---------- Client ----------
 
 
@@ -202,6 +254,7 @@ class PlacesClient:
     def __init__(self, api_key: str, transport: httpx.AsyncBaseTransport | None = None, endpoint: str = ENDPOINT) -> None:
         self._endpoint = endpoint
         self._client = httpx.AsyncClient(timeout=20, transport=transport, headers={"X-Goog-Api-Key": api_key})
+        self._areas: dict[tuple[str, str], Area] = {}  # one lookup per place, however many terms search it
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -216,8 +269,13 @@ class PlacesClient:
         return response.json()
 
     async def center(self, location: str, country: str = "US") -> tuple[float, float, str]:
-        """The centre point of a city, state or postcode. Raises PlacesError when it resolves to a
-        business or to somewhere outside `country`, rather than searching the wrong place."""
+        area = await self.area(location, country)
+        return area.lat, area.lng, area.label
+
+    async def area(self, location: str, country: str = "US") -> Area:
+        """The centre point of a city, state or postcode, and for a state or country its boundary box.
+        Raises PlacesError when it resolves to a business or to somewhere outside `country`, rather
+        than searching the wrong place."""
         data = await self._post(CENTER_FIELDS, {"textQuery": location, "pageSize": 1, "regionCode": country})
         found = (data.get("places") or [None])[0]
         if not found or not found.get("location"):
@@ -230,14 +288,18 @@ class PlacesClient:
         if "establishment" in types or not types & AREA_TYPES:
             raise PlacesError(f'"{location}" resolved to a business ({name}), not a city or area. Try a city, state or postcode.')
         loc = found["location"]
-        return loc["latitude"], loc["longitude"], found.get("formattedAddress") or name
+        box = _box(found.get("viewport")) if types & WIDE_TYPES else None
+        return Area(loc["latitude"], loc["longitude"], found.get("formattedAddress") or name, box)
 
-    async def search_page(self, term: str, cell: Cell, page_token: str | None = None) -> tuple[list[Place], str | None]:
-        body: dict[str, Any] = {
-            "textQuery": term,
-            "pageSize": PAGE_SIZE,
-            "locationBias": {"circle": {"center": {"latitude": cell.lat, "longitude": cell.lng}, "radius": cell.radius_m}},
-        }
+    async def search_page(self, term: str, cell: Cell | Box, page_token: str | None = None) -> tuple[list[Place], str | None]:
+        body: dict[str, Any] = {"textQuery": term, "pageSize": PAGE_SIZE}
+        if isinstance(cell, Box):
+            # A restriction, not a bias: a box search must not drift outside the state.
+            body["locationRestriction"] = {"rectangle": {
+                "low": {"latitude": cell.south, "longitude": cell.west}, "high": {"latitude": cell.north, "longitude": cell.east},
+            }}  # fmt: skip
+        else:
+            body["locationBias"] = {"circle": {"center": {"latitude": cell.lat, "longitude": cell.lng}, "radius": cell.radius_m}}
         if page_token:
             body["pageToken"] = page_token
         data = await self._post(SEARCH_FIELDS, body)
@@ -247,12 +309,18 @@ class PlacesClient:
     async def search_area(
         self, term: str, location: str, radius_miles: float, max_searches: int, country: str = "US"
     ) -> AreaSearch:
-        """Search `term` across a grid around `location`. Stops at `max_searches` requests (the centre
-        lookup included), keeping everything found so far. Permanently closed places are dropped."""
+        """Search `term` across a grid around `location`, or across its box for a state or country. Stops
+        at `max_searches` requests (the centre lookup included), keeping everything found so far.
+        Permanently closed places are dropped."""
         out = AreaSearch()
-        out.center_lookups = 1
-        lat, lng, _ = await self.center(location, country)
-        queue = initial_grid(lat, lng, radius_miles)
+        key = (location.strip().lower(), country)
+        if key not in self._areas:
+            out.center_lookups = 1
+            self._areas[key] = await self.area(location, country)
+        area = self._areas[key]
+        queue: list[Cell | Box] = [area.box] if area.box else list(initial_grid(area.lat, area.lng, radius_miles))
+        if area.box:
+            out.notes.append(f"{location} is a whole state or country, so all of it was searched (the radius doesn't apply).")
         while queue:
             cell = queue.pop(0)
             found = 0
@@ -272,7 +340,7 @@ class PlacesClient:
                 if not token:
                     break
             if found >= PAGE_SIZE * MAX_PAGES:
-                children = split(cell)
+                children = split_box(cell) if isinstance(cell, Box) else split(cell)
                 if children:
                     queue.extend(children)
                 else:
