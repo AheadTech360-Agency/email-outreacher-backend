@@ -2057,12 +2057,14 @@ class SmartListRepo:
         )
 
     async def add_members(self, workspace_id: UUID, kind: str, rows: list[tuple[UUID, UUID, str, str]]) -> None:
-        """(member_id, list_id, dedupe_key, reason); a member already sorted keeps its list."""
-        for member_id, list_id, key, reason in rows:
-            statement = insert(SmartListMember).values(
-                workspace_id=workspace_id, kind=kind, member_id=member_id, list_id=list_id, dedupe_key=key, reason=reason
-            )
-            await self.session.execute(statement.on_conflict_do_nothing())
+        """(member_id, list_id, dedupe_key, reason); a member already sorted keeps its list. Written 500 to a
+        statement: one at a time, 1,614 companies took minutes."""
+        values = [
+            {"workspace_id": workspace_id, "kind": kind, "member_id": member_id, "list_id": list_id, "dedupe_key": key, "reason": reason}
+            for member_id, list_id, key, reason in rows
+        ]
+        for start in range(0, len(values), 500):
+            await self.session.execute(insert(SmartListMember).values(values[start : start + 500]).on_conflict_do_nothing())
         await self.session.commit()
 
     async def members(self, workspace_id: UUID, lst: SmartList) -> list[tuple[Any, SmartListMember]]:
