@@ -531,6 +531,38 @@ class Job(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class QuickstartRun(Base):
+    """One Quick Start: an ICP taken from a Google Maps search to drafts waiting for review, step by step in the
+    background (services/quickstart.py). Each step's batches run as ordinary jobs, so spend is counted by job."""
+
+    __tablename__ = "eo_quickstart_runs"
+    __table_args__ = (
+        CheckConstraint(_in("status", ("queued", "running", "done", "stopped", "failed", "cancelled")), name="status"),
+        Index("eo_quickstart_runs_workspace_idx", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    icp_id: Mapped[UUID] = mapped_column()  # Lead Intel's ICP (no foreign key into Lead Intel)
+    status: Mapped[str] = mapped_column(Text, server_default="queued")
+    step: Mapped[str] = mapped_column(Text, server_default="find")  # find | research | people | leads | posts | write | done
+    # What the person asked for (schemas.QuickstartIn) and how each step went: {step: {state, done, total, note}}.
+    settings: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}")
+    progress: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}")
+    company_ids: Mapped[list[UUID]] = mapped_column(ARRAY(Uuid), server_default="{}")
+    lead_ids: Mapped[list[UUID]] = mapped_column(ARRAY(Uuid), server_default="{}")
+    job_ids: Mapped[list[UUID]] = mapped_column(ARRAY(Uuid), server_default="{}")
+    spend_limit_usd: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    spent_usd: Mapped[Decimal] = mapped_column(Numeric(12, 4), server_default="0")
+    detail: Mapped[str | None] = mapped_column(Text, default=None)
+    # Set while a worker is on a step, so two workers never run the same run at once.
+    busy_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_by: Mapped[UUID | None] = _user_ref()
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
 class ProviderCall(Base):
     """Every paid call: the spend ledger, and the check that stops a retry paying twice."""
 

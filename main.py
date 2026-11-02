@@ -8,7 +8,7 @@ from response_cache import ResponseCache
 from dependencies import get_current_user, refuse_inline, require_api_secret
 from routers import (
     companies, emails, examples, exclusions, health, icps, improve, jobs, leads, mailboxes, pipeline, posts, products, prompts,
-    sending, settings, sources, stakeholders, usage, users, webhooks, workspaces,
+    quickstart, sending, settings, sources, stakeholders, usage, users, webhooks, workspaces,
 )  # fmt: skip
 
 
@@ -41,6 +41,7 @@ protected.include_router(mailboxes.router)
 protected.include_router(sending.router)
 protected.include_router(sources.router)
 protected.include_router(jobs.router)
+protected.include_router(quickstart.router)
 api_router.include_router(protected)
 
 

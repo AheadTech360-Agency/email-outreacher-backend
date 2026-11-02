@@ -1,6 +1,6 @@
 """Reads and writes for our own `outreach.eo_` tables. Lead Intel is read in lead_intel.py, never here."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -11,7 +11,7 @@ from sqlalchemy.orm import aliased
 
 from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
-    Exclusion, Job, SendEvent, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
+    Exclusion, Job, QuickstartRun, SendEvent, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
 )  # fmt: skip
 from services.apify import Employee, FetchedPost
 from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
@@ -978,11 +978,16 @@ class ProviderCallRepo:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
     ) -> None:
+        from background import current_job  # here: background imports this module
+
+        job = current_job.get()
         await self.session.execute(
             insert(ProviderCall)
             .values(
                 idempotency_key=key or f"{provider}:{endpoint}:{uuid4()}",
                 workspace_id=workspace_id,
+                # Made inside a background job: counted against it (a Quick Start adds up its jobs' spend).
+                job_id=job.job_id if job else None,
                 lead_id=lead_id,
                 provider=provider,
                 endpoint=endpoint,
@@ -997,6 +1002,13 @@ class ProviderCallRepo:
             .on_conflict_do_nothing()
         )
         await self.session.commit()
+
+    async def spent_by_jobs(self, job_ids: list[UUID]) -> float:
+        """What these jobs' paid calls cost, as logged (Apify's figures are corrected as they settle)."""
+        if not job_ids:
+            return 0.0
+        total = await self.session.scalar(select(func.coalesce(func.sum(ProviderCall.cost_usd), 0)).where(ProviderCall.job_id.in_(job_ids)))
+        return float(total or 0)
 
     async def apify_runs_since(self, since: datetime) -> list[ProviderCall]:
         """Apify runs logged since `since`, every workspace, whose cost may still be settling at Apify."""
@@ -1747,3 +1759,82 @@ class JobRepo:
             .values(status=status, result=result, detail=detail, finished_at=func.now(), updated_at=func.now())
         )  # fmt: skip
         await self.session.commit()
+
+
+class QuickstartRepo:
+    """Quick Start runs (`outreach.eo_quickstart_runs`) and what they made: companies, people, leads and drafts.
+    Reads come fresh from the database: the run's jobs change these rows between them."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def create(self, workspace_id: UUID, user_id: UUID, icp_id: UUID, settings: dict[str, Any], limit: float) -> QuickstartRun:
+        run = QuickstartRun(workspace_id=workspace_id, created_by=user_id, icp_id=icp_id, settings=settings, spend_limit_usd=limit)
+        self.session.add(run)
+        await self.session.commit()
+        await self.session.refresh(run)
+        return run
+
+    async def get(self, workspace_id: UUID, run_id: UUID) -> QuickstartRun | None:
+        return await self.session.scalar(
+            select(QuickstartRun).where(QuickstartRun.workspace_id == workspace_id, QuickstartRun.id == run_id)
+        )
+
+    async def recent(self, workspace_id: UUID, limit: int = 20) -> list[QuickstartRun]:
+        query = select(QuickstartRun).where(QuickstartRun.workspace_id == workspace_id).order_by(QuickstartRun.created_at.desc())
+        return list(await self.session.scalars(query.limit(limit)))
+
+    async def claim(self, run_id: UUID, minutes: int) -> QuickstartRun | None:
+        """Take the run for one step, unless it's finished or another worker has it."""
+        now = datetime.now(UTC)
+        claimed = await self.session.scalar(
+            update(QuickstartRun)
+            .where(
+                QuickstartRun.id == run_id, QuickstartRun.status.in_(("queued", "running")),
+                or_(QuickstartRun.busy_until.is_(None), QuickstartRun.busy_until < now),
+            )
+            .values(status="running", busy_until=now + timedelta(minutes=minutes))
+            .returning(QuickstartRun.id)
+        )  # fmt: skip
+        await self.session.commit()
+        return await self.session.get(QuickstartRun, run_id, populate_existing=True) if claimed else None
+
+    async def save(self, run: QuickstartRun) -> None:
+        await self.session.commit()
+
+    async def companies(self, ids: list[UUID]) -> list[Company]:
+        fresh = select(Company).where(Company.id.in_(ids)).execution_options(populate_existing=True)
+        return list(await self.session.scalars(fresh)) if ids else []
+
+    async def new_companies(self, workspace_id: UUID, icp_id: UUID, since: datetime, limit: int) -> list[UUID]:
+        """Google Maps companies for the ICP not researched yet, newest first: what this run will verify."""
+        query = (
+            select(Company.id)
+            .where(Company.workspace_id == workspace_id, Company.icp_id == icp_id, Company.source == "google_maps",
+                   Company.researched_at.is_(None), Company.status == "found")
+            .order_by(Company.created_at.desc())
+            .limit(limit)
+        )  # fmt: skip
+        return list(await self.session.scalars(query))
+
+    async def people_at(self, workspace_id: UUID, company_ids: list[UUID]) -> list[Stakeholder]:
+        if not company_ids:
+            return []
+        query = select(Stakeholder).where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(company_ids))
+        return list(await self.session.scalars(query.order_by(Stakeholder.found_at).execution_options(populate_existing=True)))
+
+    async def leads(self, ids: list[UUID]) -> list[Lead]:
+        fresh = select(Lead).where(Lead.id.in_(ids)).execution_options(populate_existing=True)
+        return list(await self.session.scalars(fresh)) if ids else []
+
+    async def first_emails(self, lead_ids: list[UUID]) -> list[Email]:
+        if not lead_ids:
+            return []
+        query = select(Email).where(Email.lead_id.in_(lead_ids), Email.step == 1).order_by(Email.created_at)
+        return list(await self.session.scalars(query.execution_options(populate_existing=True)))
+
+    async def post_counts(self, lead_ids: list[UUID]) -> dict[UUID, int]:
+        if not lead_ids:
+            return {}
+        rows = await self.session.execute(select(Post.lead_id, func.count()).where(Post.lead_id.in_(lead_ids)).group_by(Post.lead_id))
+        return {lead_id: n for lead_id, n in rows}

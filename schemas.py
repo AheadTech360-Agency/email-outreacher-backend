@@ -1343,3 +1343,88 @@ class JobOut(ApiModel):
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+# ---------- Quick Start ----------
+
+
+class QuickstartIn(ApiModel):
+    """An ICP, start to drafts in review: what to search, how much of each step, and the most it may spend."""
+
+    icp_id: UUID
+    search_terms: list[str] = Field(min_length=1, max_length=10)
+    places: list[str] = Field(min_length=1, max_length=10)
+    radius_miles: float = Field(default=10, ge=1, le=50)
+    # Google charges per request; each returns up to 20 businesses (plus one lookup per place).
+    google_requests: int = Field(default=4, ge=2, le=100)
+    companies: int = Field(default=10, ge=1, le=100)  # how many of those to verify
+    people_per_company: int = Field(default=2, ge=1, le=10)
+    titles: list[str] = Field(default=[], max_length=30)
+    find_emails: bool = True
+    leads: int = Field(default=20, ge=1, le=300)  # the most people made leads
+    only_with_email: bool = True
+    posts_per_lead: int = Field(default=5, ge=0, le=20)  # 0: write without their posts
+    max_post_age_days: int = Field(default=60, ge=1, le=365)
+    spend_limit_usd: float = Field(gt=0, le=500)
+
+
+class QuickstartStep(ApiModel):
+    state: Literal["waiting", "running", "done", "skipped", "failed"] = "waiting"
+    done: int = 0
+    total: int | None = None
+    note: str = ""
+
+
+class QuickstartRunOut(ApiModel):
+    id: UUID
+    icp_id: UUID
+    icp_name: str
+    status: str
+    step: str
+    settings: dict[str, Any]
+    steps: dict[str, QuickstartStep]
+    spent_usd: float
+    spend_limit_usd: float
+    detail: str | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class QuickstartCompanyOut(ApiModel):
+    id: UUID
+    name: str
+    domain: str | None
+    status: str  # found | qualified | not_fit | error
+    reason: str | None
+    score: int | None
+
+
+class QuickstartLeadOut(ApiModel):
+    id: UUID
+    name: str
+    title: str
+    company: str
+    email: str | None
+    email_status: str | None
+    posts: int
+    status: str
+
+
+class QuickstartDraftOut(ApiModel):
+    id: UUID
+    lead_id: UUID
+    lead_name: str
+    company: str
+    email: str | None
+    email_status: str | None
+    subject: str
+    body: str
+    status: str
+    score: int | None
+    flags: list[str]
+
+
+class QuickstartDetailOut(QuickstartRunOut):
+    companies: list[QuickstartCompanyOut]
+    leads: list[QuickstartLeadOut]
+    drafts: list[QuickstartDraftOut]

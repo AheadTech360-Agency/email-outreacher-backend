@@ -24,7 +24,8 @@ from dependencies import secret_refusal
 
 PREFIX = "/api/v1/"
 # Live by nature: a job being waited on, and the liveness check.
-NEVER = ("/api/v1/jobs/", "/api/v1/health")
+# Live progress, written by the worker in another process: always read fresh.
+NEVER = ("/api/v1/jobs/", "/api/v1/health", "/api/v1/quickstart/")
 MAX_ENTRIES = 500
 MAX_BODY = 2_000_000
 

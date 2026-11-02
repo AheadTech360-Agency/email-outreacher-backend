@@ -7,6 +7,7 @@ from uuid import UUID
 
 import background
 import jobs
+from services import quickstart
 from celery_app import app
 from config import get_settings
 
@@ -64,3 +65,10 @@ _limit = get_settings().job_time_limit_seconds
 def run_job(job_id: str) -> None:
     """One background job: a long-running endpoint, run as the person who started it (background.py)."""
     asyncio.run(background.run_job(UUID(job_id)))
+
+
+# One batch of a Quick Start, then the next is queued behind whatever else is waiting (services/quickstart.py).
+@app.task(name="coldbrew.quickstart_step", acks_late=False, soft_time_limit=_limit + 600, time_limit=_limit + 660)
+def quickstart_step(run_id: str) -> None:
+    if asyncio.run(quickstart.advance(UUID(run_id))):
+        quickstart_step.apply_async(args=[run_id], retry=False)

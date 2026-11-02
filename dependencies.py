@@ -19,6 +19,7 @@ from crud import (
     FeedbackRepo,
     IcpProfileRepo,
     JobRepo,
+    QuickstartRepo,
     LeadRepo,
     PostRepo,
     ProductRepo,
@@ -150,6 +151,17 @@ def get_job_queue() -> Callable[[UUID], None]:
     from tasks import run_job
 
     return lambda job_id: run_job.apply_async(args=[str(job_id)], retry=False)
+
+
+def get_quickstart_queue() -> Callable[[UUID], None]:
+    """Hands a Quick Start's next step to the Celery worker. Raises when the broker (Redis) can't be reached."""
+    from tasks import quickstart_step
+
+    return lambda run_id: quickstart_step.apply_async(args=[str(run_id)], retry=False)
+
+
+def get_quickstart_repo(session: AsyncSession = Depends(get_session)) -> QuickstartRepo:
+    return QuickstartRepo(session)
 
 
 def get_job_repo(session: AsyncSession = Depends(get_session)) -> JobRepo:
