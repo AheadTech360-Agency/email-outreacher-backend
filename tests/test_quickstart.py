@@ -23,6 +23,7 @@ class World:
         self.posts = {}
         self.calls = []
         self.spent = 0.0
+        self.finished = {}  # path -> the answer of a job this run already finished
         for name in ("Ink Co", "Tee Shop", "Big Box"):
             c = SimpleNamespace(id=uuid4(), name=name, domain=None, status="found", status_reason=None, score=None, researched_at=None)
             self.companies[c.id] = c
@@ -103,6 +104,11 @@ def world(monkeypatch):
     w = World()
     monkeypatch.setattr(quickstart, "_job", w.job)
 
+    async def none_finished(session, run, path):
+        return w.finished.get(path)
+
+    monkeypatch.setattr(quickstart, "_finished_job", none_finished)
+
     class Calls:
         def __init__(self, session) -> None:
             pass
@@ -181,3 +187,33 @@ def test_a_failed_step_fails_the_run_with_the_reason(world, monkeypatch) -> None
     run = new_run()
     assert asyncio.run(quickstart._step(Session(), Repo(world), run)) is False
     assert run.status == "failed" and run.detail == "Find companies failed: GOOGLE_PLACES_API_KEY is not set"
+
+
+def test_the_fake_repo_matches_the_real_one() -> None:
+    """The steps run against the real QuickstartRepo in production: a fake that takes other arguments would hide a crash
+    (as it did on 2026-11-02, when new_companies took one argument more than the steps passed)."""
+    import inspect
+
+    from crud import QuickstartRepo
+
+    for name, fake in inspect.getmembers(Repo, inspect.isfunction):
+        if name == "__init__":
+            continue
+        real = getattr(QuickstartRepo, name)
+        assert list(inspect.signature(fake).parameters) == list(inspect.signature(real).parameters), name
+
+
+def test_the_api_speaks_camel_case_settings() -> None:
+    from routers.quickstart import _out
+
+    run = new_run()
+    run.created_at, run.finished_at = "2026-11-02T12:00:00Z", None
+    assert _out(run, "DTF Transfers")["settings"]["searchTerms"] == ["screen printing"]
+
+
+def test_a_search_the_run_already_finished_is_not_paid_for_again(world) -> None:
+    """Tried again after failing just after its Google search (2026-11-02): the search's answer is reused."""
+    world.finished["/pipeline/find"] = {"googleMaps": {"found": 2, "added": 2, "error": None}}
+    run = new_run()
+    asyncio.run(quickstart._step(Session(), Repo(world), run))
+    assert "/pipeline/find" not in world.calls and run.step == "research" and len(run.company_ids) == 3

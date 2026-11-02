@@ -27,9 +27,16 @@ router = APIRouter(prefix="/quickstart", tags=["quickstart"])
 NO_QUEUE = "The background worker's queue (Redis) can't be reached, so the run didn't start."
 
 
+def _camel(key: str) -> str:
+    head, *rest = key.split("_")
+    return head + "".join(w.title() for w in rest)
+
+
 def _out(run: QuickstartRun, icp_name: str) -> dict:
+    # Settings are stored as the engine reads them (search_terms); the page reads them as the API speaks (searchTerms).
+    settings = {_camel(k): v for k, v in run.settings.items()}
     return {
-        "id": run.id, "icp_id": run.icp_id, "icp_name": icp_name, "status": run.status, "step": run.step, "settings": run.settings,
+        "id": run.id, "icp_id": run.icp_id, "icp_name": icp_name, "status": run.status, "step": run.step, "settings": settings,
         "steps": {s: QuickstartStep(**(run.progress.get(s) or {})) for s in STEPS},
         "spent_usd": float(run.spent_usd), "spend_limit_usd": float(run.spend_limit_usd), "detail": run.detail,
         "created_at": run.created_at, "finished_at": run.finished_at,
@@ -162,12 +169,18 @@ async def resume_run(
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     queue: Callable[[UUID], None] = Depends(get_quickstart_queue),
 ) -> QuickstartRunOut:
-    """Pick a run up again after the worker restarted mid-step. Nothing is redone: each step carries on."""
+    """Pick a run up again: after the worker restarted mid-step, or after a step failed (it's tried again, and
+    nothing before it is redone or paid for twice)."""
     run = await _run(runs, workspace_id, run_id)
-    if run.status not in ("queued", "running"):
+    if run.status not in ("queued", "running", "failed"):
         raise HTTPException(status_code=409, detail="This run has finished.")
     if run.busy_until and run.busy_until > datetime.now(UTC):
         raise HTTPException(status_code=409, detail="It's still working on a step.")
+    if run.status == "failed":
+        progress = dict(run.progress)
+        progress[run.step] = {**progress.get(run.step, {}), "state": "waiting", "note": "Trying again"}
+        run.progress, run.status, run.detail, run.finished_at = progress, "running", None, None
+        await runs.save(run)
     try:
         queue(run.id)
     except Exception as exc:  # noqa: BLE001

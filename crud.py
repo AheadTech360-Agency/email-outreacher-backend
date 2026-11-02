@@ -1806,7 +1806,7 @@ class QuickstartRepo:
         fresh = select(Company).where(Company.id.in_(ids)).execution_options(populate_existing=True)
         return list(await self.session.scalars(fresh)) if ids else []
 
-    async def new_companies(self, workspace_id: UUID, icp_id: UUID, since: datetime, limit: int) -> list[UUID]:
+    async def new_companies(self, workspace_id: UUID, icp_id: UUID, limit: int) -> list[UUID]:
         """Google Maps companies for the ICP not researched yet, newest first: what this run will verify."""
         query = (
             select(Company.id)

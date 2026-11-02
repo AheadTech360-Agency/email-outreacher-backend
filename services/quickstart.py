@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
+
 import background
 from config import get_settings
 from crud import IcpProfileRepo, JobRepo, ProviderCallRepo, QuickstartRepo
@@ -84,7 +86,9 @@ async def _find(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
     s = run.settings
     body = {"icpId": str(run.icp_id), "sources": ["google_maps"], "googleMaps": {
         "searchTerms": s["search_terms"], "locations": s["places"], "radiusMiles": s["radius_miles"], "maxSearches": s["google_requests"]}}  # fmt: skip
-    ok, out, detail = await _job(session, run, "/pipeline/find", body, "Quick Start: finding companies")
+    # A search this run already finished (it failed just after, say) isn't paid for again.
+    done = await _finished_job(session, run, "/pipeline/find")
+    ok, out, detail = (True, done, None) if done is not None else await _job(session, run, "/pipeline/find", body, "Quick Start: finding companies")
     maps = (out or {}).get("googleMaps") or {}
     if not ok or maps.get("error"):
         return _fail(run, "find", detail or maps.get("error"))
@@ -231,6 +235,16 @@ async def _job(session: Any, run: QuickstartRun, path: str, body: dict[str, Any]
     job = await session.get(Job, job.id, populate_existing=True)  # the worker's answer, not the copy from before
     result = (job.result or {}) if job else {}
     return bool(job and job.status == "done"), result.get("body"), job.detail if job else "The job disappeared."
+
+
+async def _finished_job(session: Any, run: QuickstartRun, path: str) -> Any | None:
+    """The answer of a job of this kind this run already finished, or None."""
+    if not run.job_ids:
+        return None
+    job = await session.scalar(
+        select(Job).where(Job.id.in_(list(run.job_ids)), Job.kind == path, Job.status == "done").order_by(Job.finished_at.desc()).limit(1)
+    )
+    return ((job.result or {}).get("body") or {}) if job else None
 
 
 async def _icp_titles(session: Any, run: QuickstartRun) -> list[str]:
