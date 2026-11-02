@@ -81,6 +81,11 @@ class Repo:
     async def companies(self, ids):
         return [self.w.companies[i] for i in ids]
 
+    async def add_website_contacts(self, workspace_id, contacts):
+        for company, email in contacts:
+            p = SimpleNamespace(id=uuid4(), company_id=company.id, lead_id=None, linkedin_url=None, email=email, email_status="website")
+            self.w.people[p.id] = p
+
     async def people_at(self, workspace_id, company_ids):
         return [p for p in self.w.people.values() if p.company_id in company_ids]
 
@@ -217,3 +222,23 @@ def test_a_search_the_run_already_finished_is_not_paid_for_again(world) -> None:
     run = new_run()
     asyncio.run(quickstart._step(Session(), Repo(world), run))
     assert "/pipeline/find" not in world.calls and run.step == "research" and len(run.company_ids) == 3
+
+
+def test_a_company_not_on_linkedin_is_reached_by_the_email_on_its_website(world, monkeypatch) -> None:
+    """2026-11-02: DTF shops had no one on LinkedIn but listed orders@ on their sites; the run made no leads."""
+    real_job = world.job
+
+    async def nobody_on_linkedin(session, run, path, body, label):
+        if path == "/pipeline/stakeholders":
+            run.job_ids = [*run.job_ids, uuid4()]
+            return True, {"results": [], "error": None}, None
+        return await real_job(session, run, path, body, label)
+
+    monkeypatch.setattr(quickstart, "_job", nobody_on_linkedin)
+    for c in world.companies.values():
+        c.research = {"contacts": {"email": f"orders@{c.name.split()[0].lower()}.com"}}
+    run = new_run()
+    run_all(run, world)
+    assert run.progress["people"]["note"] == "0 found on LinkedIn, 0 with an email; 2 companies reached by the email on their website"
+    assert run.progress["leads"]["note"] == "2 leads: 2 valid emails, 0 risky"
+    assert run.detail.startswith("Done: 2 drafts")

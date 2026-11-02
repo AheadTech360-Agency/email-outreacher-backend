@@ -89,7 +89,34 @@ async def test_employees_reads_the_actors_current_output() -> None:
     c = client(transport)
     people, _ = await c.company_employees("Chicago Shirt Prints", [], 2)
     await c.aclose()
-    assert [(p.title, p.company_name) for p in people] == [("Owner", "Chicago Shirt Prints"), ("Manager", "Ink Co")]
+    # Jo works at Ink Co, not Chicago Shirt Prints: LinkedIn's name search can return them, they aren't kept.
+    assert [(p.title, p.company_name) for p in people] == [("Owner", "Chicago Shirt Prints")]
+
+
+@sync
+async def test_a_listing_name_is_searched_without_its_seo_tail_and_lookalikes_are_dropped() -> None:
+    """2026-11-02: "Quick Transfers - Same Day Custom DTF Transfers" found a freelancer at "Quick Airport Transfers"."""
+    items = [
+        {"id": "a", "firstName": "Hammad", "currentPositions": [{"position": "SEO Specialist", "companyName": "Quick Airport Transfers"}]},
+        {"id": "b", "firstName": "Dana", "currentPositions": [{"position": "Owner", "companyName": "QuickTransfers, LLC"}]},
+    ]  # fmt: skip
+    transport, seen = fake_apify(items)
+    c = client(transport)
+    people, run = await c.company_employees("Quick Transfers - Same Day Custom DTF Transfers", ["Owner"], 5, domain="quicktransfers.com")
+    await c.aclose()
+    assert seen["input"]["companies"] == ["Quick Transfers"]
+    assert [p.first_name for p in people] == ["Dana"] and run.skipped_elsewhere == 1
+
+
+@sync
+async def test_the_linkedin_page_is_searched_when_known_and_matches_by_url() -> None:
+    page = "https://www.linkedin.com/company/qt-dtf/"
+    items = [{"id": "a", "firstName": "Sam", "currentPositions": [{"position": "CEO", "companyName": "QT", "companyLinkedinUrl": "https://linkedin.com/company/qt-dtf"}]}]
+    transport, seen = fake_apify(items)
+    c = client(transport)
+    people, _ = await c.company_employees("Quick Transfers", [], 5, linkedin_url=page)
+    await c.aclose()
+    assert seen["input"]["companies"] == [page] and [p.first_name for p in people] == ["Sam"]
 
 
 @sync

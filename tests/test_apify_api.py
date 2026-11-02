@@ -21,7 +21,7 @@ class FakeApify:
         self.linkedin_items: list[FetchedPost] = []
         self.instagram_items: list[FetchedPost] = []
 
-    async def company_employees(self, company, titles, max_items, with_email=False):
+    async def company_employees(self, company, titles, max_items, with_email=False, linkedin_url=None, domain=None):
         if self.error:
             raise self.error
         self.calls.append(("employees", company, titles, max_items, with_email))

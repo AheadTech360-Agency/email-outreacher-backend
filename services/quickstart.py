@@ -137,15 +137,32 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
             return _fail(run, "people", detail or (out or {}).get("error"))
         run.progress = {**run.progress, "_searched": sorted(searched | {str(i) for i in batch})}
     people = await repo.people_at(run.workspace_id, list(run.company_ids))
-    with_email = sum(1 for p in people if p.email)
     left = len([i for i in qualified if str(i) not in set(run.progress.get("_searched", []))])
-    note = f"{len(people)} people found" + (f", {with_email} with an email" if s["find_emails"] else "")
+    if not left:
+        # Small shops are often not on LinkedIn but publish an address on their site (orders@, info@), which
+        # research already read: that's the contact for a qualified company where no one with an email was found.
+        emailed = {p.company_id for p in people if p.email}
+        fallback = [(c, email) for c in companies
+                    if c.status == "qualified" and c.id not in emailed and (email := _site_email(c))]  # fmt: skip
+        if fallback:
+            await repo.add_website_contacts(run.workspace_id, fallback)
+            people = await repo.people_at(run.workspace_id, list(run.company_ids))
+    on_linkedin = [p for p in people if p.email_status != "website"]
+    from_site = len(people) - len(on_linkedin)
+    note = f"{len(on_linkedin)} found on LinkedIn" + (f", {sum(1 for p in on_linkedin if p.email)} with an email" if s["find_emails"] else "")
+    if from_site:
+        note += f"; {from_site} compan{'ies' if from_site != 1 else 'y'} reached by the email on {'their' if from_site != 1 else 'its'} website"
     _set(run, "people", state="running" if left else "done", done=len(qualified) - left, total=len(qualified), note=note)
     if left:
         return True
     if not people:
-        return _finish(run, "No one was found on LinkedIn at the qualified companies.")
+        return _finish(run, "No one was found on LinkedIn at the qualified companies, and none of their websites lists an email.")
     return _next(run, "leads")
+
+
+def _site_email(company: Any) -> str | None:
+    research = getattr(company, "research", None) or {}
+    return (research.get("contacts") or {}).get("email")
 
 
 async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
@@ -163,7 +180,7 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     lead_ids = list(dict.fromkeys([*run.lead_ids, *(p.lead_id for p in people if p.id in chosen and p.lead_id)]))[: s["leads"]]
     run.lead_ids = lead_ids
     leads = await repo.leads(lead_ids)
-    valid = sum(1 for lead in leads if lead.email and lead.email_status == "valid")
+    valid = sum(1 for lead in leads if lead.email and lead.email_status in ("valid", "website"))
     risky = sum(1 for lead in leads if lead.email and lead.email_status == "risky")
     no_email = sum(1 for lead in leads if not lead.email)
     note = f"{len(leads)} leads: {valid} valid email{'s' if valid != 1 else ''}, {risky} risky" + (f", {no_email} without one" if no_email else "")

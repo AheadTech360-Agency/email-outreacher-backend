@@ -44,6 +44,8 @@ class RunResult:
     items: list[dict[str, Any]]
     cost_usd: float | None
     run_id: str | None
+    # People LinkedIn's name search returned who work at another company, dropped.
+    skipped_elsewhere: int = 0
 
 
 @dataclass
@@ -64,6 +66,58 @@ class Employee:
 # returns the full profile too; the short one $0.003, no email.
 SHORT_PROFILES = "Short ($4 per 1k)"
 PROFILES_WITH_EMAIL = "Full + email search ($12 per 1k)"
+
+
+# A Google Maps listing name carries SEO text after a separator ("Quick Transfers - Same Day Custom DTF
+# Transfers"); LinkedIn knows the company by the part before it.
+_SEPARATORS = re.compile(r"\s+[-|–—:]\s+|\s*\|\s*")
+_LEGAL = re.compile(r"\b(llc|inc|incorporated|co|corp|corporation|company|ltd|limited|pllc|lp)\b")
+
+
+def search_name(name: str) -> str:
+    """The company name to search LinkedIn for: the listing name without its SEO tail."""
+    head = _SEPARATORS.split(name.strip(), maxsplit=1)[0].strip()
+    return head or name.strip()
+
+
+def _key(name: str | None) -> str:
+    """Letters and digits only, legal suffixes dropped: "Quick Transfers, LLC" and "QuickTransfers" match."""
+    return re.sub(r"[^a-z0-9]", "", _LEGAL.sub("", (name or "").lower()))
+
+
+def company_keys(name: str, domain: str | None = None) -> set[str]:
+    """What a person's current employer may be called and still be this company: the listing name, its
+    searchable part, and the website's name (quicktransfers.com -> quicktransfers)."""
+    keys = {_key(name), _key(search_name(name))}
+    if domain:
+        keys.add(_key(domain.lower().removeprefix("www.").split(".")[0]))
+    return {k for k in keys if len(k) >= 3}
+
+
+def _same_page(a: str | None, b: str | None) -> bool:
+    def slug(u: str | None) -> str:
+        return (urlsplit(u or "").path or "").rstrip("/").lower().removeprefix("/company/")
+
+    return bool(a and b and slug(a) and slug(a) == slug(b))
+
+
+def current_job_at(item: dict[str, Any], keys: set[str], linkedin_url: str | None) -> dict[str, Any] | None:
+    """The person's current position at this company, or None when LinkedIn's name search matched someone
+    who works somewhere else (searching "Quick Transfers" found a freelancer at "Quick Airport Transfers")."""
+    for position in item.get("currentPositions") or item.get("currentPosition") or []:
+        position = position or {}
+        company = position.get("company") or {}
+        url = position.get("companyLinkedinUrl") or company.get("linkedinUrl")
+        if _same_page(url, linkedin_url) or _key(position.get("companyName") or company.get("name")) in keys:
+            return position
+    return None
+
+
+def elsewhere(n: int) -> str | None:
+    """The note for people a name search found at other companies."""
+    if not n:
+        return None
+    return f"{n} {'person' if n == 1 else 'people'} at a company with a similar name left out"
 
 
 def best_email(item: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -257,12 +311,15 @@ class ApifyClient:
     # ---- Actors ----
 
     async def company_employees(
-        self, company: str, job_titles: list[str], max_items: int, with_email: bool = False
+        self, company: str, job_titles: list[str], max_items: int, with_email: bool = False,
+        linkedin_url: str | None = None, domain: str | None = None,
     ) -> tuple[list[Employee], RunResult]:
-        """People at one company on LinkedIn. `company` is a LinkedIn company URL or the company's name. With
-        `with_email`, each person's work email is searched for too (and their full profile comes back)."""
+        """People at one company on LinkedIn: by its LinkedIn page when known, otherwise by its name. Only people
+        whose current job is at this company are kept. With `with_email`, each person's work email is searched
+        for too (and their full profile comes back)."""
+        keys = company_keys(company, domain)
         actor_input: dict[str, Any] = {
-            "companies": [company],
+            "companies": [linkedin_url or search_name(company)],
             "profileScraperMode": PROFILES_WITH_EMAIL if with_email else SHORT_PROFILES,
             "maxItems": max_items,
             "companyBatchMode": "all_at_once",
@@ -278,7 +335,13 @@ class ApifyClient:
                 continue
             # The actor's current output has `currentPositions` ({title, companyName, company}); older runs had
             # `currentPosition` ({position, companyName}).
-            position = (item.get("currentPositions") or item.get("currentPosition") or [{}])[0] or {}
+            # Someone whose current jobs are all at another company is dropped; with none listed, the actor's own
+            # company filter is all there is to go on, so they're kept.
+            listed = item.get("currentPositions") or item.get("currentPosition") or []
+            position = current_job_at(item, keys, linkedin_url) if listed else {}
+            if position is None:
+                result.skipped_elsewhere += 1
+                continue
             email, email_status = best_email(item)
             people.append(
                 Employee(

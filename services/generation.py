@@ -28,6 +28,7 @@ from uuid import UUID
 import anthropic
 from pydantic import BaseModel, Field
 
+from services.apify import search_name
 from services.claude import error_message
 from services.prompts import product_variables, render
 
@@ -269,6 +270,8 @@ def variables(
     them, numbered the same."""
     icp, profile, lead = ctx.icp, ctx.profile or {}, ctx.lead
     first, last = lead.get("first_name") or "", lead.get("last_name") or ""
+    if not first and not last and lead.get("company"):
+        first = f"{search_name(lead['company'])} team"  # a company's website address: "Hi Quick Transfers team,"
     out = {
         "icp.name": icp.get("name") or "",
         "icp.industry": icp.get("industry") or "",

@@ -45,7 +45,7 @@ from schemas import (
     StakeholderSearchIn,
     StakeholderSearchResult,
 )
-from services.apify import EMPLOYEES_ACTOR, ApifyClient, ApifyError
+from services.apify import EMPLOYEES_ACTOR, ApifyClient, ApifyError, elsewhere
 from services.apollo import SENIORITIES, ApolloClient, ApolloError
 from services.leads import CsvError, clean_lead
 from services.people_csv import (
@@ -243,7 +243,9 @@ async def search_linkedin(
             results.append(CompanySearchResult(company_id=company_id, name=name, status="skipped", reason=reason))
             continue
         try:
-            people, run = await apify.company_employees(company["display_name"], titles, body.max_per_company, body.find_emails)
+            people, run = await apify.company_employees(
+                company["display_name"], titles, body.max_per_company, body.find_emails, domain=company.get("domain")
+            )
         except ApifyError as exc:
             await calls.record(workspace_id, "apify", EMPLOYEES_ACTOR, "failed", action="Find stakeholders")
             results.append(CompanySearchResult(company_id=company_id, name=name, status="failed", reason=exc.message))
@@ -256,7 +258,8 @@ async def search_linkedin(
             key=f"apify:run:{run.run_id}" if run.run_id else None, cost_usd=run.cost_usd, action="Find stakeholders",
         )  # fmt: skip
         new = await stakeholders.save_employees(workspace_id, company_id, people)
-        results.append(CompanySearchResult(company_id=company_id, name=name, status="searched", found=len(people), new=new))
+        results.append(CompanySearchResult(company_id=company_id, name=name, status="searched", found=len(people), new=new,
+                                           reason=elsewhere(run.skipped_elsewhere)))  # fmt: skip
     return StakeholderSearchResult(results=results, error=error, cost_usd=round(total_cost, 4))
 
 

@@ -563,13 +563,26 @@ def verify_variables(
         "icp.name": icp.get("name") or "",
         "icp.industry": icp.get("industry") or "",
         "icp.places": _lines(icp.get("places")),
-        "icp.description": profile.get("description") or "",
+        "icp.description": profile.get("description") or _implied_description(icp),
         "icp.pains": profile.get("pains") or "",
         "icp.offer": profile.get("offer") or "",
         "icp.rules": "\n".join(rules),
         **company_variables(evidence),
         **product_variables(profile.get("product")),
     }
+
+
+def _implied_description(icp: dict[str, Any]) -> str:
+    """For an ICP with no description. Named for what they sell ("DTF Transfers"), the name alone read as the
+    buyers of it, and businesses that make and sell DTF transfers were scored as suppliers to the ICP
+    (2026-11-02). So say it plainly: the ICP is the businesses that do this."""
+    terms = [t for t in dict.fromkeys([icp.get("name") or "", *(icp.get("search_terms") or []), *(icp.get("any_of") or [])]) if t]
+    if not terms:
+        return ""
+    return (
+        f"Businesses that make, sell or offer {', '.join(terms)} themselves (what you'd find searching Google Maps for "
+        "those words), not their customers. A business selling these to others is one of them, not a supplier to them."
+    )
 
 
 def _website(evidence: dict[str, Any]) -> str:

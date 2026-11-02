@@ -52,7 +52,7 @@ from schemas import (
     SourceFindResult,
     StakeholderSearchResult,
 )
-from services.apify import EMPLOYEES_ACTOR, INSTAGRAM_PROFILE_ACTOR, ApifyClient, ApifyError
+from services.apify import EMPLOYEES_ACTOR, INSTAGRAM_PROFILE_ACTOR, ApifyClient, ApifyError, elsewhere
 from services.apollo import SENIORITIES, ApolloClient, ApolloError
 from services.claude import cost_usd
 from services.google_places import CENTER_COST_USD, SEARCH_COST_USD, PlacesClient, PlacesError, shared_domain
@@ -412,7 +412,9 @@ async def find_stakeholders(
                 )
                 results.append(CompanySearchResult(company_id=cid, name=name, status="searched", found=len(people), new=new, total_at_apollo=total))
             else:
-                people, run = await apify.company_employees(c.linkedin_url or c.name, titles, body.max_per_company, body.find_emails)  # type: ignore[union-attr]
+                people, run = await apify.company_employees(  # type: ignore[union-attr]
+                    c.name, titles, body.max_per_company, body.find_emails, linkedin_url=c.linkedin_url, domain=c.domain
+                )
                 cost += run.cost_usd or 0
                 await calls.record(
                     workspace_id, "apify", EMPLOYEES_ACTOR, "succeeded",
@@ -423,7 +425,8 @@ async def find_stakeholders(
                 new = await stakeholders.save_employees(
                     workspace_id, c.lead_intel_business_id, people, pipeline_company_id=c.id, icp_id=c.icp_id
                 )
-                results.append(CompanySearchResult(company_id=cid, name=name, status="searched", found=len(people), new=new))
+                results.append(CompanySearchResult(company_id=cid, name=name, status="searched", found=len(people), new=new,
+                                                   reason=elsewhere(run.skipped_elsewhere)))  # fmt: skip
         except (ApolloError, ApifyError) as exc:
             provider = "apollo" if body.source == "apollo" else "apify"
             await calls.record(workspace_id, provider, "people search", "failed", action="Find stakeholders")

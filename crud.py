@@ -13,7 +13,7 @@ from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
     Exclusion, Job, QuickstartRun, SendEvent, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
 )  # fmt: skip
-from services.apify import Employee, FetchedPost
+from services.apify import Employee, FetchedPost, search_name
 from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
 from services.apollo import ApolloOrganization, FoundPerson, RevealedPerson
 from services.google_places import Place
@@ -1816,6 +1816,19 @@ class QuickstartRepo:
             .limit(limit)
         )  # fmt: skip
         return list(await self.session.scalars(query))
+
+    async def add_website_contacts(self, workspace_id: UUID, contacts: list[tuple[Company, str]]) -> None:
+        """A company's published address as its contact, for companies where LinkedIn found no one with an email.
+        Stored as a manual contact (the sources the table allows) marked by its email status, "website". Adding
+        the same one again does nothing."""
+        for company, email in contacts:
+            statement = insert(Stakeholder).values(
+                workspace_id=workspace_id, company_id=company.id, lead_intel_icp_id=company.icp_id, source="manual",
+                external_id=f"website:{company.id}:{email.lower()}", title="Website contact",
+                organization_name=search_name(company.name), email=email, email_status="website", has_email=True,
+            )  # fmt: skip
+            await self.session.execute(statement.on_conflict_do_nothing(index_elements=[Stakeholder.workspace_id, Stakeholder.source, Stakeholder.external_id]))
+        await self.session.commit()
 
     async def people_at(self, workspace_id: UUID, company_ids: list[UUID]) -> list[Stakeholder]:
         if not company_ids:
