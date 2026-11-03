@@ -118,22 +118,44 @@ def test_linkedin_people_are_revealed_in_apollo_by_linkedin_url(client, apify, a
     assert apollo_env.apollo.revealed_by == "https://www.linkedin.com/in/ava-morgan"
 
 
-# ---------- Posts ----------
+# ---------- Posts: company LinkedIn, their LinkedIn, company Instagram, until there's enough ----------
 
 
 class FakePosts:
-    def __init__(self, leads) -> None:
+    """Leads, their companies and stored posts. A stored post is a SimpleNamespace like an eo_posts row."""
+
+    def __init__(self, leads, companies) -> None:
         self.rows = {lead.id: lead for lead in leads}
-        self.saved: dict = {}
+        self.companies = companies  # lead id -> company
+        self.posts: list = []
 
     async def leads(self, ws, ids):
         return [self.rows[i] for i in ids if i in self.rows]
 
-    async def save(self, ws, lead_id, posts):
-        have = self.saved.setdefault(lead_id, {})
-        new = [p for p in posts if p.url not in have]
-        for p in new:
-            have[p.url] = p
+    async def company_for(self, ws, lead):
+        return self.companies.get(lead.id)
+
+    def _owner(self, owner):
+        kind, _, raw = owner.partition(":")
+        return ("lead_id" if kind == "lead" else "company_id"), raw
+
+    async def stored(self, ws, lead_id, company_id, limit=20):
+        return [x for x in self.posts if x.lead_id == lead_id or (company_id and x.company_id == company_id)]
+
+    async def count_source(self, ws, owner, network):
+        col, raw = self._owner(owner)
+        return sum(1 for x in self.posts if str(getattr(x, col)) == raw and x.source == network)
+
+    async def save_for(self, ws, owner, found):
+        col, raw = self._owner(owner)
+        known = {x.url for x in self.posts}
+        new = [f for f in found if f.url not in known]
+        for f in new:
+            self.posts.append(SimpleNamespace(
+                lead_id=next((i for i in self.rows if str(i) == raw), None) if col == "lead_id" else None,
+                company_id=next((c.id for c in self.companies.values() if str(c.id) == raw), None) if col == "company_id" else None,
+                source=f.source, url=f.url, text=f.text, posted_at=f.posted_at, is_repost=f.is_repost,
+            ))  # fmt: skip
         return len(new)
 
     async def set_status(self, lead, status):
@@ -143,68 +165,119 @@ class FakePosts:
         return []
 
 
+class FakeJudge:
+    """Claude: enough once a post mentions a launch. Records how many times it was asked."""
+
+    def __init__(self) -> None:
+        self.asked = 0
+        self.messages = self
+
+    async def parse(self, *, model, max_tokens, system, output_format, messages):
+        from services.smart_posts import Enough
+
+        self.asked += 1
+        enough = "launch" in messages[0]["content"].lower()
+        return SimpleNamespace(parsed_output=Enough(enough=enough, reason="a launch" if enough else "only promos"),
+                               usage=SimpleNamespace(input_tokens=500, output_tokens=20))  # fmt: skip
+
+
 def lead(**kw):
-    defaults = dict(id=uuid4(), linkedin_url=None, instagram_url=None, lead_intel_business_id=None, status="imported")
+    defaults = dict(id=uuid4(), first_name="Ava", last_name="Morgan", title="Owner", company="", linkedin_url=None,
+                    instagram_url=None, lead_intel_business_id=None, status="imported")  # fmt: skip
     return SimpleNamespace(**(defaults | kw))
+
+
+def company(name, linkedin=None, instagram=None):
+    return SimpleNamespace(id=uuid4(), name=name, linkedin_url=linkedin, instagram_url=instagram, research=None)
 
 
 @pytest.fixture
 def posts_env(client, apify, apollo_env):  # noqa: F811
+    from dependencies import get_optional_anthropic
+
+    ink = company("Ink Co", "https://www.linkedin.com/company/inkco/", "https://instagram.com/inkco")
+    tee = company("Tee Shop", "https://www.linkedin.com/company/teeshop/", "https://instagram.com/teeshop")
     ava = lead(linkedin_url="https://www.linkedin.com/in/ava-morgan")
-    bo = lead(linkedin_url="https://linkedin.com/in/bo-chen/", lead_intel_business_id=COMPANY_ID)
-    cy = lead(instagram_url="https://instagram.com/cyshop")
-    nobody = lead(status="approved")
-    repo = FakePosts([ava, bo, cy, nobody])
+    bo = lead(first_name="Bo", linkedin_url="https://linkedin.com/in/bo-chen/")
+    nobody = lead(first_name="No", status="approved")
+    repo = FakePosts([ava, bo, nobody], {ava.id: ink, bo.id: tee})
+    judge = FakeJudge()
     app.dependency_overrides[get_post_repo] = lambda: repo
-    return SimpleNamespace(repo=repo, ava=ava, bo=bo, cy=cy, nobody=nobody, apify=apify)
+    app.dependency_overrides[get_optional_anthropic] = lambda: judge
+    return SimpleNamespace(repo=repo, ava=ava, bo=bo, nobody=nobody, ink=ink, tee=tee, apify=apify, judge=judge)
 
 
 def fetch(client, *leads, **body):
     return client.post("/api/v1/posts/fetch", json={"leadIds": [str(x.id) for x in leads], **body}, headers=WS).json()
 
 
-def test_fetch_posts_one_run_per_source_matched_back_to_each_lead(client, posts_env) -> None:
+def test_company_linkedin_first_and_only_those_still_short_go_on(client, posts_env) -> None:
+    """Ink Co's page has a launch: Ava is done. Tee Shop's page is only promos: Bo's own LinkedIn is read, and has one."""
     e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/1", "ava-morgan"), post("linkedin", "https://li/2", "bo-chen")]
-    e.apify.instagram_items = [post("instagram", "https://ig/1", "glowmedspa"), post("instagram", "https://ig/2", "cyshop")]
-    result = fetch(client, e.ava, e.bo, e.cy, e.nobody, maxPosts=3)
+    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco"), post("linkedin", "https://li/2", "teeshop")]
+    e.apify.linkedin_items[0].text = "We launch our spring collection Friday"
+    e.apify.linkedin_items[1].text = "Sale ends Sunday"
+    calls = []
+    original = e.apify.linkedin_posts
+
+    async def linkedin_posts(urls, max_posts, since):
+        calls.append(tuple(urls))
+        if len(calls) == 2:
+            e.apify.linkedin_items = [post("linkedin", "https://li/3", "bo-chen")]
+            e.apify.linkedin_items[0].text = "Big launch: we opened a second shop"
+        return await original(urls, max_posts, since)
+
+    e.apify.linkedin_posts = linkedin_posts
+    result = fetch(client, e.ava, e.bo, e.nobody, maxPosts=3)
     by = {r["leadId"]: r for r in result["results"]}
-
-    assert [c[0] for c in e.apify.calls] == ["linkedin", "instagram"]
-    # Bo has no Instagram of his own, so his company's account (from Lead Intel) is used.
-    assert set(e.apify.calls[1][1]) == {"https://www.instagram.com/glowmedspa/", "https://www.instagram.com/cyshop/"}
-    assert (by[str(e.ava.id)]["linkedin"], by[str(e.ava.id)]["instagram"]) == (1, None)
-    assert (by[str(e.bo.id)]["linkedin"], by[str(e.bo.id)]["instagram"]) == (1, 1)
-    assert (by[str(e.cy.id)]["linkedin"], by[str(e.cy.id)]["instagram"]) == (None, 1)
-    assert (by[str(e.nobody.id)]["linkedin"], by[str(e.nobody.id)]["instagram"]) == (None, None)
-    assert result["costUsd"] == 0.007 and result["error"] is None
-    assert (e.ava.status, e.cy.status, e.nobody.status) == ("enriched", "enriched", "approved")
+    # Stage 1 reads both company pages in one run; stage 2 only Bo's profile; Instagram is never needed.
+    assert calls == [("https://www.linkedin.com/company/inkco/", "https://www.linkedin.com/company/teeshop/"), ("https://linkedin.com/in/bo-chen/",)]
+    assert not any(c[0] == "instagram" for c in e.apify.calls)
+    assert (by[str(e.ava.id)]["enough"], by[str(e.ava.id)]["stoppedAt"]) == (True, "company_linkedin")
+    assert (by[str(e.bo.id)]["enough"], by[str(e.bo.id)]["stoppedAt"], by[str(e.bo.id)]["linkedin"]) == (True, "person_linkedin", 1)
+    assert by[str(e.nobody.id)]["companyLinkedin"] is None and e.nobody.status == "approved"
+    assert e.ava.status == "enriched" and result["claudeCostUsd"] > 0 and result["error"] is None
 
 
-def test_refetching_stores_only_new_posts(client, posts_env) -> None:
+def test_stored_posts_are_read_and_not_bought_again(client, posts_env) -> None:
     e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/1", "ava-morgan")]
-    assert fetch(client, e.ava)["results"][0]["new"] == 1
-    assert fetch(client, e.ava)["results"][0]["new"] == 0
+    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
+    e.apify.linkedin_items[0].text = "Happy holidays"
+    # Research already stored Ink Co's Instagram posts: they're read, not scraped again.
+    e.repo.posts.append(SimpleNamespace(lead_id=None, company_id=e.ink.id, source="instagram", url="https://ig/0",
+                                        text="New launch drop today", posted_at=None, is_repost=False))  # fmt: skip
+    result = fetch(client, e.ava)
+    r = result["results"][0]
+    # Claude reads every stored post at each check, so the stored Instagram post already gives enough.
+    assert (r["enough"], r["stoppedAt"]) == (True, "company_linkedin")
+    assert not any(c[0] == "instagram" for c in e.apify.calls)
 
 
-def test_a_single_profile_gets_all_its_posts_even_if_authors_differ(client, posts_env) -> None:
+def test_company_instagram_is_scraped_when_nothing_else_is_enough(client, posts_env) -> None:
     e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/9", "someone-else-reposted")]
-    assert fetch(client, e.ava)["results"][0]["linkedin"] == 1
+    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
+    e.apify.linkedin_items[0].text = "Happy holidays"
+    e.apify.instagram_items = [post("instagram", "https://ig/1", "inkco")]
+    e.apify.instagram_items[0].text = "Launch day for our new tees"
+    r = fetch(client, e.ava)["results"][0]
+    assert (r["enough"], r["stoppedAt"], r["instagram"]) == (True, "company_instagram", 1)
+    assert [c[1] for c in e.apify.calls if c[0] == "instagram"] == [("https://instagram.com/inkco",)]
 
 
-def test_no_posts_marks_no_content(client, posts_env) -> None:
-    fetch(client, posts_env.ava)
-    assert posts_env.ava.status == "no_content"
+def test_nothing_anywhere_marks_no_content(client, posts_env) -> None:
+    result = fetch(client, posts_env.ava)
+    assert result["results"][0]["enough"] is False and posts_env.ava.status == "no_content"
 
 
 def test_apify_failure_is_reported_and_statuses_untouched(client, posts_env) -> None:
     e = posts_env
+    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
+    e.apify.linkedin_items[0].text = "promo"
     e.apify.error = ApifyError("Apify says the account is out of credit", 402)
-    result = fetch(client, e.cy)
-    assert result["error"] == "Apify says the account is out of credit"
-    assert e.cy.status == "imported"
+    e.bo.linkedin_url = None
+    e.repo.companies.pop(e.bo.id)
+    result = fetch(client, e.ava)
+    assert result["error"] == "Apify says the account is out of credit" and e.ava.status == "imported"
 
 
 def test_fetch_limits(client, posts_env) -> None:

@@ -1293,6 +1293,29 @@ class PostRepo:
         await self.session.commit()
         return new
 
+    async def company_for(self, workspace_id: UUID, lead: Lead) -> Company | None:
+        """The company the lead was found at (as email writing finds it)."""
+        return await EmailRepo(self.session).company_for(workspace_id, lead)
+
+    async def stored(self, workspace_id: UUID, lead_id: UUID, company_id: UUID | None, limit: int = 20) -> list[Post]:
+        """The lead's own posts and their company's, newest first."""
+        owners = [Post.lead_id == lead_id] + ([Post.company_id == company_id] if company_id else [])
+        query = select(Post).where(Post.workspace_id == workspace_id, or_(*owners))
+        return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id).limit(limit)))
+
+    async def count_source(self, workspace_id: UUID, owner: str, network: str) -> int:
+        """Posts of this network already stored for an owner ("lead:<id>" or "company:<id>")."""
+        kind, _, raw_id = owner.partition(":")
+        column = Post.lead_id if kind == "lead" else Post.company_id
+        query = select(func.count()).where(Post.workspace_id == workspace_id, column == UUID(raw_id), Post.source == network)
+        return int(await self.session.scalar(query) or 0)
+
+    async def save_for(self, workspace_id: UUID, owner: str, posts: list[FetchedPost]) -> int:
+        kind, _, raw_id = owner.partition(":")
+        if kind == "lead":
+            return await self.save(workspace_id, UUID(raw_id), posts)
+        return await self.save_company(workspace_id, UUID(raw_id), posts)
+
     async def for_company(self, workspace_id: UUID, company_id: UUID) -> list[Post]:
         query = select(Post).where(Post.workspace_id == workspace_id, Post.company_id == company_id)
         return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id)))

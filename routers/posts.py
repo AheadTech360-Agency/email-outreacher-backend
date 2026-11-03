@@ -1,30 +1,19 @@
-"""Leads' recent LinkedIn and Instagram posts, fetched through Apify.
-
-LinkedIn: the lead's own profile posts, when the lead has a LinkedIn URL.
-Instagram: the lead's Instagram, or else the company's account that Lead Intel already found.
-One Apify run per source covers all the leads asked for, and posts are matched back to each lead.
+"""Leads' recent posts, fetched through Apify only until there's enough to write with (services/smart_posts.py):
+the company's LinkedIn page, the person's LinkedIn, the company's Instagram. One Apify run per source per batch.
 """
 
-from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import anthropic
 from fastapi import APIRouter, Depends, Query
 
+from background import report
 from crud import PostRepo, ProviderCallRepo
-from dependencies import get_apify, get_lead_intel_repo, get_post_repo, get_provider_call_repo, require_manager, require_workspace_id
-from lead_intel import LeadIntelRepo
+from dependencies import get_apify, get_optional_anthropic, get_post_repo, get_provider_call_repo, require_manager, require_workspace_id
 from schemas import LeadPostsResult, PostFetchIn, PostFetchResult, PostOut
-from services.apify import (
-    INSTAGRAM_ACTOR,
-    LINKEDIN_POSTS_ACTOR,
-    ApifyClient,
-    ApifyError,
-    FetchedPost,
-    RunResult,
-    instagram_handle,
-    linkedin_slug,
-)
+from services.apify import ApifyClient, RunResult
+from services.smart_posts import JUDGE_MODEL, STAGES, Target, gather
 
 router = APIRouter(prefix="/posts", tags=["posts"])
 
@@ -41,94 +30,48 @@ async def list_posts(
     return [PostOut.model_validate(p) for p in await posts.list(workspace_id, lead_id)]
 
 
-def _group(found: list[FetchedPost], keys: dict[UUID, str]) -> dict[UUID, list[FetchedPost]]:
-    """Match posts to leads by profile slug or Instagram username. With a single input, every post is its."""
-    by_lead: dict[UUID, list[FetchedPost]] = defaultdict(list)
-    distinct = set(keys.values())
-    for post in found:
-        for lead_id, key in keys.items():
-            if len(distinct) == 1 or post.owner_key == key:
-                by_lead[lead_id].append(post)
-    return by_lead
-
-
 @router.post("/fetch", response_model=PostFetchResult, dependencies=[Depends(require_manager)])
 async def fetch_posts(
     body: PostFetchIn,
     workspace_id: UUID = Depends(require_workspace_id),
-    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     posts: PostRepo = Depends(get_post_repo),
     calls: ProviderCallRepo = Depends(get_provider_call_repo),
     apify: ApifyClient = Depends(get_apify),
+    claude: anthropic.AsyncAnthropic | None = Depends(get_optional_anthropic),
 ) -> PostFetchResult:
-    """Fetch recent posts for these leads. Paid per post (about $0.002 each on Apify)."""
+    """Posts for these leads, only as many as it takes (services/smart_posts.py): the company's LinkedIn, then
+    their own LinkedIn, then the company's Instagram, each read only for the leads Claude still finds short of
+    material. Apify is paid per post (about $0.002), Claude's check is a fraction of a cent a lead."""
     leads = await posts.leads(workspace_id, list(dict.fromkeys(body.lead_ids)))
     since = datetime.now(UTC) - timedelta(days=body.max_age_days)
+    targets = [Target(lead, await posts.company_for(workspace_id, lead)) for lead in leads]
+    stages = [stage for stage, network, _ in STAGES if network in body.sources]
 
-    # Company Instagram accounts from Lead Intel (read-only), for leads without their own.
-    company_ids = list({lead.lead_intel_business_id for lead in leads if lead.lead_intel_business_id and not lead.instagram_url})
-    companies, _ = await lead_intel.list_companies(None, None, max(len(company_ids), 1), 0, only_ids=company_ids)
-    company_ig = {c["id"]: c["fields"].get("instagram_url") for c in companies}
+    async def stored(t: Target) -> list:
+        return await posts.stored(workspace_id, t.lead.id, t.company.id if t.company else None)
 
-    linkedin = {lead.id: slug for lead in leads if (slug := linkedin_slug(lead.linkedin_url))}
-    linkedin_urls = {lead.id: lead.linkedin_url for lead in leads if lead.id in linkedin}
-    instagram: dict[UUID, str] = {}
-    instagram_urls: dict[str, str] = {}
-    for lead in leads:
-        url = lead.instagram_url or company_ig.get(lead.lead_intel_business_id)
-        if handle := instagram_handle(url):
-            instagram[lead.id] = handle
-            instagram_urls[handle] = f"https://www.instagram.com/{handle}/"
+    async def record_apify(actor: str, run: RunResult | None, status: str) -> None:
+        key = f"apify:run:{run.run_id}" if run and run.run_id else None
+        await calls.record(workspace_id, "apify", actor, status, key=key, cost_usd=run.cost_usd if run else None, action="Fetch posts")
 
-    found: dict[str, dict[UUID, list[FetchedPost]]] = {"linkedin": {}, "instagram": {}}
-    cost = 0.0
-    error: str | None = None
+    async def record_claude(cost: float) -> None:
+        await calls.record(workspace_id, "claude", "messages", "succeeded", model=JUDGE_MODEL, cost_usd=cost, action="Fetch posts")
 
-    async def run(source: str, actor: str, call) -> None:
-        nonlocal cost, error
-        try:
-            fetched, result = await call()
-        except ApifyError as exc:
-            await calls.record(workspace_id, "apify", actor, "failed", action="Fetch posts")
-            error = exc.message
-            return
-        cost += _cost(result)
-        await calls.record(
-            workspace_id, "apify", actor, "succeeded",
-            key=f"apify:run:{result.run_id}" if result.run_id else None, cost_usd=result.cost_usd, action="Fetch posts",
-        )  # fmt: skip
-        found[source] = _group(fetched, linkedin if source == "linkedin" else instagram)
-
-    # Only the networks asked for; the others count as "no URL" in the results.
-    if "linkedin" not in body.sources:
-        linkedin, linkedin_urls = {}, {}
-    if "instagram" not in body.sources:
-        instagram, instagram_urls = {}, {}
-
-    if linkedin:
-        urls = list(dict.fromkeys(linkedin_urls.values()))
-        await run("linkedin", LINKEDIN_POSTS_ACTOR, lambda: apify.linkedin_posts(urls, body.max_posts, since))
-    if instagram and not error:
-        urls = list(instagram_urls.values())
-        await run("instagram", INSTAGRAM_ACTOR, lambda: apify.instagram_posts(urls, body.max_posts, since))
+    outcome = await gather(
+        targets=targets, stages=stages, max_posts=body.max_posts, since=since, apify=apify, claude=claude, stored=stored,
+        stored_count=lambda owner, network: posts.count_source(workspace_id, owner, network),
+        save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
+        record_claude=record_claude, progress=report,
+    )  # fmt: skip
 
     results = []
-    for lead in leads:
-        li = found["linkedin"].get(lead.id, [])
-        ig = found["instagram"].get(lead.id, [])
-        new = await posts.save(workspace_id, lead.id, li + ig) if li or ig else 0
-        if not error and lead.status in REFRESHABLE:
-            await posts.set_status(lead, "enriched" if li or ig else "no_content")
-        results.append(
-            LeadPostsResult(
-                lead_id=lead.id,
-                linkedin=len(li) if lead.id in linkedin else None,
-                instagram=len(ig) if lead.id in instagram else None,
-                new=new,
-            )
-        )
-    return PostFetchResult(results=results, cost_usd=round(cost, 4), error=error)
-
-
-def _cost(result: RunResult) -> float:
-    return result.cost_usd or 0.0
+    by_lead = {o.lead_id: o for o in outcome.leads}
+    for t in targets:
+        o = by_lead[t.lead.id]
+        if not outcome.error and t.lead.status in REFRESHABLE:
+            await posts.set_status(t.lead, "enriched" if await stored(t) else "no_content")
+        results.append(LeadPostsResult(
+            lead_id=t.lead.id, company_linkedin=o.counts.get("company_linkedin"), linkedin=o.counts.get("person_linkedin"),
+            instagram=o.counts.get("company_instagram"), new=o.new, enough=o.enough, stopped_at=o.stopped_at, reason=o.reason,
+        ))  # fmt: skip
+    return PostFetchResult(results=results, cost_usd=outcome.apify_cost_usd, claude_cost_usd=outcome.claude_cost_usd, error=outcome.error)

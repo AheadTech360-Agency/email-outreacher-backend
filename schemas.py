@@ -760,7 +760,8 @@ class StakeholderRevealResult(ApiModel):
 
 class PostFetchIn(ApiModel):
     lead_ids: list[UUID] = Field(min_length=1, max_length=25)
-    max_posts: int = Field(default=5, ge=1, le=20)
+    # Posts fetched per source (company LinkedIn, their LinkedIn, company Instagram) when a source is read.
+    max_posts: int = Field(default=3, ge=1, le=20)
     max_age_days: int = Field(default=60, ge=1, le=365)
     # Which networks to fetch; both unless an ICP turned one off.
     sources: list[Literal["linkedin", "instagram"]] = Field(default=["linkedin", "instagram"], min_length=1)
@@ -768,16 +769,22 @@ class PostFetchIn(ApiModel):
 
 class LeadPostsResult(ApiModel):
     lead_id: UUID
-    # Posts found per source; null when the lead has no URL for it.
+    # Posts found per source; null when there's no URL for it or it wasn't needed.
+    company_linkedin: int | None = None
     linkedin: int | None
-    instagram: int | None
+    instagram: int | None  # the company's Instagram
     new: int
+    # Whether Claude found enough to open an email with, at which source it stopped, and why.
+    enough: bool = False
+    stopped_at: str | None = None
+    reason: str = ""
 
 
 class PostFetchResult(ApiModel):
     results: list[LeadPostsResult]
-    cost_usd: float | None
+    cost_usd: float | None  # Apify
     error: str | None = None
+    claude_cost_usd: float = 0.0  # deciding, after each source, whether there's enough
 
 
 class PostOut(ApiModel):

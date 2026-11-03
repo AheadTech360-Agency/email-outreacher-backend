@@ -207,8 +207,8 @@ async def _posts(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     tried = set(run.progress.get("_fetched", []))
     sources = await _post_sources(session, run)
     leads = await repo.leads(list(run.lead_ids))
-    todo = [lead.id for lead in leads if str(lead.id) not in tried and lead.status in ("imported", "failed")
-            and (lead.linkedin_url or lead.instagram_url)][:POSTS_BATCH]  # fmt: skip
+    # Every lead: their company's LinkedIn and Instagram are read too, not only their own (services/smart_posts.py).
+    todo = [lead.id for lead in leads if str(lead.id) not in tried and lead.status in ("imported", "failed")][:POSTS_BATCH]
     if todo and sources:
         body = {"leadIds": [str(i) for i in todo], "maxPosts": s["posts_per_lead"], "maxAgeDays": s["max_post_age_days"], "sources": sources}
         ok, out, detail = await _job(session, run, "/posts/fetch", body, "Quick Start: reading posts")
@@ -219,8 +219,7 @@ async def _posts(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
             _set(run, "posts", note=f"Apify: {(out or {})['error']}")
     counts = await repo.post_counts(list(run.lead_ids))
     tried = set(run.progress.get("_fetched", []))
-    left = [lead.id for lead in leads if str(lead.id) not in tried and lead.status in ("imported", "failed")
-            and (lead.linkedin_url or lead.instagram_url)]  # fmt: skip
+    left = [lead.id for lead in leads if str(lead.id) not in tried and lead.status in ("imported", "failed")]
     note = f"{sum(counts.values())} posts from {sum(1 for n in counts.values() if n)} of {len(leads)} leads"
     if not sources:
         note = "LinkedIn and Instagram are both off for this ICP"
