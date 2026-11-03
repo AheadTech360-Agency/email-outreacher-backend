@@ -2038,6 +2038,25 @@ class QuickstartRepo:
         )  # fmt: skip
         return list(await self.session.scalars(query))
 
+    async def existing_companies(self, workspace_id: UUID, icp_id: UUID, smart_list_id: UUID | None, limit: int) -> list[UUID]:
+        """Companies already here for the ICP (imported, say) that aren't rejected and where no one has a lead yet:
+        what a run on existing companies works through. Best score first, then newest. Only those in the smart
+        list, when one is given."""
+        worked = select(Stakeholder.company_id).where(
+            Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.is_not(None), Stakeholder.lead_id.is_not(None)
+        )
+        query = select(Company.id).where(
+            Company.workspace_id == workspace_id, Company.icp_id == icp_id, Company.status.not_in(("not_fit", "error")),
+            Company.id.not_in(worked),
+        )  # fmt: skip
+        if smart_list_id is not None:
+            members = select(SmartListMember.member_id).where(
+                SmartListMember.workspace_id == workspace_id, SmartListMember.kind == "company", SmartListMember.list_id == smart_list_id
+            )
+            query = query.where(Company.id.in_(members))
+        query = query.order_by(Company.score.desc().nulls_last(), Company.created_at.desc()).limit(limit)
+        return list(await self.session.scalars(query))
+
     async def add_website_contacts(self, workspace_id: UUID, contacts: list[tuple[Company, str]]) -> None:
         """A company's published address as its contact, for companies where LinkedIn found no one with an email.
         Stored as a manual contact (the sources the table allows) marked by its email status, "website". Adding

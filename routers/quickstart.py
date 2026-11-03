@@ -77,8 +77,13 @@ async def start_run(
     settings = body.model_dump(mode="json", exclude={"icp_id", "spend_limit_usd"})
     settings["search_terms"] = [t.strip() for t in body.search_terms if t.strip()]
     settings["places"] = [p.strip() for p in body.places if p.strip()]
-    if not settings["search_terms"] or not settings["places"]:
-        raise HTTPException(status_code=422, detail="Add at least one search term and one place.")
+    if body.source == "google_maps":
+        if not settings["search_terms"] or not settings["places"]:
+            raise HTTPException(status_code=422, detail="Add at least one search term and one place.")
+        if body.companies > 100:
+            raise HTTPException(status_code=422, detail="From Google Maps, verify up to 100 companies a run.")
+    elif not await runs.existing_companies(workspace_id, body.icp_id, body.smart_list_id, 1):
+        raise HTTPException(status_code=422, detail="No companies for this ICP are waiting: each one already has someone written to.")
     run = await runs.create(workspace_id, user.id, body.icp_id, settings, body.spend_limit_usd)
     try:
         queue(run.id)

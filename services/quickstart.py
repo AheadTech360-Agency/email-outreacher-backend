@@ -7,6 +7,10 @@ get their turn in between. Spend is the total of the run's jobs' paid calls; the
 
 Nothing is queued for sending: the run ends with drafts in review, approved by a person.
 
+A run on existing companies (source "existing": imported ones, say) skips the search: `find` picks the ICP's
+companies no one has written to yet, `research` verifies only those never verified, and `people` only looks on
+LinkedIn at companies where no one with an email is known yet.
+
   find      Google Maps search for the ICP's terms around the places; the newest unresearched companies are kept
   research  verify them (website, Instagram, the ICP's rule, Claude's score), 10 at a time
   people    the qualified ones on LinkedIn, with their work emails, 10 companies at a time
@@ -84,6 +88,14 @@ async def _step(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
 
 async def _find(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
     s = run.settings
+    if s.get("source") == "existing":
+        list_id = UUID(s["smart_list_id"]) if s.get("smart_list_id") else None
+        run.company_ids = await repo.existing_companies(run.workspace_id, run.icp_id, list_id, s["companies"])
+        _set(run, "find", state="done", done=len(run.company_ids), total=s["companies"],
+             note=f"{len(run.company_ids)} of your companies no one has written to yet")  # fmt: skip
+        if not run.company_ids:
+            return _finish(run, "Every company for this ICP already has someone written to.")
+        return _next(run, "research")
     body = {"icpId": str(run.icp_id), "sources": ["google_maps"], "googleMaps": {
         "searchTerms": s["search_terms"], "locations": s["places"], "radiusMiles": s["radius_miles"], "maxSearches": s["google_requests"]}}  # fmt: skip
     # A search this run already finished (it failed just after, say) isn't paid for again.
@@ -102,13 +114,14 @@ async def _find(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
 
 async def _research(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
     companies = await repo.companies(list(run.company_ids))
-    todo = [c.id for c in companies if c.researched_at is None][:RESEARCH_BATCH]
+    # Only new ones: imported companies count as verified already, and a decided company isn't paid for again.
+    todo = [c.id for c in companies if c.researched_at is None and c.status == "found"][:RESEARCH_BATCH]
     if todo:
         ok, _, detail = await _job(session, run, "/pipeline/research", {"companyIds": [str(i) for i in todo]}, "Quick Start: verifying companies")
         if not ok:
             return _fail(run, "research", detail)
         companies = await repo.companies(list(run.company_ids))
-    done = [c for c in companies if c.researched_at is not None]
+    done = [c for c in companies if c.researched_at is not None or c.status != "found"]
     qualified = sum(c.status == "qualified" for c in companies)
     not_fit = sum(c.status == "not_fit" for c in companies)
     waiting = sum(c.status == "review" for c in companies)
@@ -136,6 +149,13 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
     searched = set(run.progress.get("_searched", []))
     companies = await repo.companies(list(run.company_ids))
     qualified = [c.id for c in companies if c.status == "qualified"]
+    if s.get("source") == "existing":
+        # Their people are usually here already (imported with them): LinkedIn only where no one has an email,
+        # and only when asked.
+        emailed = {p.company_id for p in await repo.people_at(run.workspace_id, qualified) if p.email}
+        lookup = [i for i in qualified if i not in emailed] if s.get("find_people", True) else []
+        searched |= {str(i) for i in qualified if i not in lookup}
+        run.progress = {**run.progress, "_searched": sorted(searched)}
     batch = [i for i in qualified if str(i) not in searched][:PEOPLE_BATCH]
     if batch:
         titles = s.get("titles") or await _icp_titles(session, run)
@@ -178,7 +198,15 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     s = run.settings
     people = await repo.people_at(run.workspace_id, list(run.company_ids))
     room = s["leads"] - len(run.lead_ids)
-    picked = [p for p in people if p.lead_id is None and (p.email or not s["only_with_email"]) and (p.email or p.linkedin_url)][:max(room, 0)]
+    eligible = [p for p in people if p.lead_id is None and (p.email or not s["only_with_email"]) and (p.email or p.linkedin_url)]
+    # No more than the people per company asked for (imported companies can hold many), those with an email first.
+    per: dict[Any, int] = {}
+    picked = []
+    for p in sorted(eligible, key=lambda p: not p.email):
+        if per.get(p.company_id, 0) < s["people_per_company"]:
+            per[p.company_id] = per.get(p.company_id, 0) + 1
+            picked.append(p)
+    picked = picked[: max(room, 0)]
     if picked:
         ok, _, detail = await _job(session, run, "/stakeholders/add-as-leads", {"stakeholderIds": [str(p.id) for p in picked]},
                                    "Quick Start: making leads")  # fmt: skip

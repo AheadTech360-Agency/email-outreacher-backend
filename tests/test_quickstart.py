@@ -78,6 +78,9 @@ class Repo:
     async def new_companies(self, workspace_id, icp_id, limit):
         return [c.id for c in self.w.companies.values() if c.researched_at is None][:limit]
 
+    async def existing_companies(self, workspace_id, icp_id, smart_list_id, limit):
+        return [c.id for c in self.w.companies.values()][:limit]
+
     async def companies(self, ids):
         return [self.w.companies[i] for i in ids]
 
@@ -266,3 +269,22 @@ def test_it_waits_for_companies_to_be_approved_then_continues(world, monkeypatch
     run.status = "running"
     run_all(run, world)
     assert "/pipeline/stakeholders" in world.calls and run.detail.startswith("Done: 2 drafts")
+
+
+def test_a_run_on_imported_companies_skips_the_search_and_verifying(world) -> None:
+    """Imported companies are verified already and their people came with them: the run goes straight to leads,
+    posts and emails, looks on LinkedIn only where no one has an email, and keeps to the people per company."""
+    ink, tee, big = world.companies.values()
+    for c in (ink, tee, big):
+        c.status = "qualified"
+    for c, emails in ((ink, ["a@ink.com", "b@ink.com"]), (tee, []), (big, ["c@big.com"])):
+        for email in emails:
+            p = SimpleNamespace(id=uuid4(), company_id=c.id, lead_id=None, linkedin_url=None, email=email, email_status="valid")
+            world.people[p.id] = p
+    run = new_run(source="existing", smart_list_id=None, search_terms=[], places=[])
+    run_all(run, world)
+    assert "/pipeline/find" not in world.calls and "/pipeline/research" not in world.calls
+    assert world.calls.count("/pipeline/stakeholders") == 1  # only Tee Shop, which had no one with an email
+    assert run.progress["find"]["note"] == "3 of your companies no one has written to yet"
+    assert len(run.lead_ids) == 3  # one per company: Ink Co's second person waits
+    assert run.detail.startswith("Done: 3 drafts")
