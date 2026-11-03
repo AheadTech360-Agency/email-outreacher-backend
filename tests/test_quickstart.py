@@ -288,3 +288,27 @@ def test_a_run_on_imported_companies_skips_the_search_and_verifying(world) -> No
     assert run.progress["find"]["note"] == "3 of your companies no one has written to yet"
     assert len(run.lead_ids) == 3  # one per company: Ink Co's second person waits
     assert run.detail.startswith("Done: 3 drafts")
+
+
+def test_people_already_worked_on_are_reused_and_those_written_to_are_not(world) -> None:
+    """Someone whose posts were read on People has a working record: the run writes to them without making another
+    or reading their posts again. Someone already written to is left alone."""
+    ink, tee, big = world.companies.values()
+    for c in (ink, tee, big):
+        c.status = "qualified"
+    done_before = SimpleNamespace(id=uuid4(), first_name="Ann", last_name="", title="Owner", company="", email="ann@ink.com",
+                                  email_status="valid", status="enriched", linkedin_url=None, instagram_url=None, score=None)  # fmt: skip
+    written = SimpleNamespace(id=uuid4(), first_name="Bo", last_name="", title="Owner", company="", email="bo@tee.com",
+                              email_status="valid", status="generated", linkedin_url=None, instagram_url=None, score=None)  # fmt: skip
+    world.leads[done_before.id], world.leads[written.id] = done_before, written
+    world.emails.append(SimpleNamespace(id=uuid4(), lead_id=written.id))
+    for c, lead in ((ink, done_before), (tee, written)):
+        p = SimpleNamespace(id=uuid4(), company_id=c.id, lead_id=lead.id, linkedin_url=None, email=lead.email, email_status="valid")
+        world.people[p.id] = p
+    p = SimpleNamespace(id=uuid4(), company_id=big.id, lead_id=None, linkedin_url=None, email="cy@big.com", email_status="valid")
+    world.people[p.id] = p
+    run = new_run(source="existing", smart_list_id=None, search_terms=[], places=[], find_people=False)
+    run_all(run, world)
+    assert done_before.id in run.lead_ids and written.id not in run.lead_ids and len(run.lead_ids) == 2
+    assert world.calls.count("/stakeholders/add-as-leads") == 1  # only for Big Box's person
+    assert world.calls.count("/posts/fetch") == 1 and run.detail.startswith("Done: 2 drafts")

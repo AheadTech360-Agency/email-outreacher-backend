@@ -198,7 +198,12 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     s = run.settings
     people = await repo.people_at(run.workspace_id, list(run.company_ids))
     room = s["leads"] - len(run.lead_ids)
-    eligible = [p for p in people if p.lead_id is None and (p.email or not s["only_with_email"]) and (p.email or p.linkedin_url)]
+    # Someone with a working record already (their posts read, or got ready on People) is reused, unless an email
+    # was already written for them; only the others need one made.
+    drafted = {e.lead_id for e in await repo.first_emails([p.lead_id for p in people if p.lead_id])}
+    taken = set(run.lead_ids)
+    eligible = [p for p in people if p.lead_id not in drafted and p.lead_id not in taken
+                and (p.email or not s["only_with_email"]) and (p.email or p.linkedin_url)]  # fmt: skip
     # No more than the people per company asked for (imported companies can hold many), those with an email first.
     per: dict[Any, int] = {}
     picked = []
@@ -207,8 +212,9 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
             per[p.company_id] = per.get(p.company_id, 0) + 1
             picked.append(p)
     picked = picked[: max(room, 0)]
-    if picked:
-        ok, _, detail = await _job(session, run, "/stakeholders/add-as-leads", {"stakeholderIds": [str(p.id) for p in picked]},
+    new = [p for p in picked if p.lead_id is None]
+    if new:
+        ok, _, detail = await _job(session, run, "/stakeholders/add-as-leads", {"stakeholderIds": [str(p.id) for p in new]},
                                    "Quick Start: making leads")  # fmt: skip
         if not ok:
             return _fail(run, "leads", detail)

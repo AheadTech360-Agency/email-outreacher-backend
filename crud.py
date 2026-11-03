@@ -2039,11 +2039,14 @@ class QuickstartRepo:
         return list(await self.session.scalars(query))
 
     async def existing_companies(self, workspace_id: UUID, icp_id: UUID, smart_list_id: UUID | None, limit: int) -> list[UUID]:
-        """Companies already here for the ICP (imported, say) that aren't rejected and where no one has a lead yet:
-        what a run on existing companies works through. Best score first, then newest. Only those in the smart
-        list, when one is given."""
-        worked = select(Stakeholder.company_id).where(
-            Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.is_not(None), Stakeholder.lead_id.is_not(None)
+        """Companies already here for the ICP (imported, say) that aren't rejected and where no one has an email
+        written yet: what a run on existing companies works through. A working record alone (posts read, an email
+        revealed) doesn't count: that work is reused. Best score first, then newest. Only those in the smart list,
+        when one is given."""
+        worked = (
+            select(Stakeholder.company_id)
+            .join(Email, Email.lead_id == Stakeholder.lead_id)
+            .where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.is_not(None))
         )
         query = select(Company.id).where(
             Company.workspace_id == workspace_id, Company.icp_id == icp_id, Company.status.not_in(("not_fit", "error")),
