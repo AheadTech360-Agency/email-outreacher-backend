@@ -220,6 +220,10 @@ class SequencerClient(_Client):
         """Rename a draft or paused campaign."""
         return await self._write("PATCH", f"/campaigns/{campaign_id}", key, {"name": name[:200]}, etag)
 
+    async def set_daily_cap(self, campaign_id: str, cap: int, etag: str, key: str) -> dict[str, Any]:
+        """The most a draft or paused campaign sends a day, across its mailboxes."""
+        return await self._write("PATCH", f"/campaigns/{campaign_id}", key, {"daily_send_cap": cap}, etag)
+
     async def archive(self, campaign_id: str, etag: str, key: str) -> None:
         """Archive a campaign (CheapSequencer keeps its history). Only called once no lead is left in it."""
         await self._write("DELETE", f"/campaigns/{campaign_id}", key, None, etag)

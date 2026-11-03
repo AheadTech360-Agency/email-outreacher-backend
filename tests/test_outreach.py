@@ -173,6 +173,9 @@ class Sequencer:
         next(c for c in self.list_campaigns if c["id"] == campaign_id)["name"] = name
         self.renamed.append((campaign_id, name))
 
+    async def set_daily_cap(self, campaign_id, cap, etag, key):
+        next(c for c in self.list_campaigns if c["id"] == campaign_id)["daily_send_cap"] = cap
+
     async def inboxes(self):
         return [{"id": "in1", "email": "emily@meetaheadtech360.com"}]
 
@@ -503,6 +506,8 @@ def test_a_new_icp_gets_a_draft_copy_of_a_coldbrew_campaign() -> None:
     assert (out.status, out.campaign) == ("created", "Coldbrew: Embroidery")
     assert [c for c, _ in seq.copied] == ["c1"] and seq.renamed == [("copy-of-c1", "Coldbrew: Embroidery")]
     assert links.rows == {icp: "copy-of-c1"}
+    # Its mailboxes' own daily limits hold sending back, not the campaign.
+    assert next(c for c in seq.list_campaigns if c["id"] == "copy-of-c1")["daily_send_cap"] == outreach.CAMPAIGN_DAILY_CAP == 300
     # Saving it again changes nothing, and never makes a second copy.
     assert run(outreach.ensure_campaign(seq, links, icp, "Embroidery")).status == "unchanged" and len(seq.copied) == 1
 

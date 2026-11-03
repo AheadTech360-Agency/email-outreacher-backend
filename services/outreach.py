@@ -193,6 +193,11 @@ class CampaignOutcome:
         return said.get(self.status) or f"Campaign not set up: {self.reason}"
 
 
+# Above what the mailboxes can send together (16 x 18 a day = 288), so each mailbox's own daily limit is what
+# holds sending back, not the campaign.
+CAMPAIGN_DAILY_CAP = 300
+
+
 async def ensure_campaign(sequencer: Any, links: Any, icp_id: UUID, icp_name: str) -> CampaignOutcome:
     """Give an ICP its "Coldbrew: <ICP>" campaign: rename the linked one if the ICP was renamed, link one
     that already has the name, or make a draft copy of another Coldbrew campaign (steps, mailboxes,
@@ -220,6 +225,8 @@ async def ensure_campaign(sequencer: Any, links: Any, icp_id: UUID, icp_name: st
     await links.link(icp_id, copy["id"])  # linked first, so a failed rename is finished by the next save, not copied again
     _, etag = await sequencer.campaign(copy["id"])
     await sequencer.rename(copy["id"], wanted, etag, key_for("rename", copy["id"], wanted))
+    _, etag = await sequencer.campaign(copy["id"])
+    await sequencer.set_daily_cap(copy["id"], CAMPAIGN_DAILY_CAP, etag, key_for("cap", copy["id"], str(CAMPAIGN_DAILY_CAP)))
     return CampaignOutcome("created", wanted)
 
 

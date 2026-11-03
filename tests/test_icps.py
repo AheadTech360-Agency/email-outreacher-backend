@@ -182,6 +182,9 @@ class Campaigns:
     async def rename(self, campaign_id, name, etag, key):
         next(c for c in self.list if c["id"] == campaign_id)["name"] = name
 
+    async def set_daily_cap(self, campaign_id, cap, etag, key):
+        next(c for c in self.list if c["id"] == campaign_id)["daily_send_cap"] = cap
+
 
 @pytest.fixture
 def sequencer(no_real_sending):
