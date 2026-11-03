@@ -267,6 +267,10 @@ async def research(
     rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
     todo = [c for c in rows if c.source != "lead_intel" and (body.force or c.researched_at is None)]
     skipped = len(body.company_ids) - len(todo)
+    if body.force:
+        # Verifying again, asked for by a person: the new verdict replaces an approval or rejection made by hand.
+        for c in todo:
+            c.overridden = False
     if not todo:
         return ResearchResult(researched=0, skipped=skipped, qualified=0, not_fit=0, errors=0, cost_usd=0, notes=[])
 

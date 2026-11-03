@@ -872,7 +872,7 @@ class PipelineCompanyOut(ApiModel):
 
 class ResearchIn(ApiModel):
     company_ids: list[UUID] = Field(min_length=1, max_length=10)
-    # Research again even if done before.
+    # Research again even if done before; the new verdict replaces one set by hand.
     force: bool = False
 
 
