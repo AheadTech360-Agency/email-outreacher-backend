@@ -385,9 +385,9 @@ class MailboxesOut(ApiModel):
 
 
 class SendingSettingsIn(ApiModel):
-    # Who the emails are from. US law asks commercial email to carry a physical postal address.
+    # Who the emails are from: the company and its website, under the sender's name.
     sender_company: str = Field(default="", max_length=200)
-    sender_address: str = Field(default="", max_length=500)
+    sender_website: str = Field(default="", max_length=300)
     # What email 2 and 3 say until Coldbrew writes the personal one ({{first_name}} is filled in).
     followup_fallback_2: str = Field(min_length=1, max_length=2000)
     followup_fallback_3: str = Field(min_length=1, max_length=2000)

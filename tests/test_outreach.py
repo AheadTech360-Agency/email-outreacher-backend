@@ -21,7 +21,7 @@ NOW = datetime(2026, 11, 10, 15, tzinfo=UTC)
 WS = uuid4()
 ICP = uuid4()
 SETTINGS = {
-    "sender_company": "PrintCoPilot", "sender_address": "1 Main St\nAustin, TX 78701",
+    "sender_company": "PrintCoPilot", "sender_website": "printcopilot.co",
     "followup_fallback_2": "Hi {{first_name}}, bumping this.", "followup_fallback_3": "Hi {{first_name}}, closing the loop.",
     "followup_lead_hours": 24,
 }  # fmt: skip
@@ -40,9 +40,10 @@ def test_first_name_is_filled_in_or_falls_back() -> None:
 
 
 def test_step_text_carries_the_signature() -> None:
-    assert outreach.step_body(2, "PrintCoPilot", " 1 Main St \n\n Austin, TX ") == (
-        "{{email_2_body}}\n\n{{sender_name}}\nPrintCoPilot\n1 Main St\nAustin, TX"
-    )
+    assert outreach.step_body(2, "PrintCoPilot", " printcopilot.co ") == "{{email_2_body}}\n\n{{sender_name}}\nPrintCoPilot\nprintcopilot.co"
+    assert outreach.clean_website(" https://aheadtech360.com/ ") == "https://aheadtech360.com"
+    assert outreach.looks_like_website("aheadtech360.com") and outreach.looks_like_website("https://www.printcopilot.co")
+    assert not outreach.looks_like_website("Test address, not for real sending")
     assert outreach.signature("", "") == "{{sender_name}}"
 
 
@@ -259,9 +260,9 @@ def test_a_website_address_needs_its_own_confirmation_to_queue() -> None:
     assert by_id[confirmed[0].id].status == "queued"
 
 
-def test_queue_needs_the_sender_address() -> None:
-    with pytest.raises(SendingError, match="physical address"):
-        run(outreach.queue(deps(Sending([]), Sequencer([]), settings=SETTINGS | {"sender_address": " "}), [uuid4()]))
+def test_queue_needs_the_sender_website() -> None:
+    with pytest.raises(SendingError, match="website"):
+        run(outreach.queue(deps(Sending([]), Sequencer([]), settings=SETTINGS | {"sender_website": " "}), [uuid4()]))
 
 
 def test_queue_without_a_campaign_leaves_the_email_approved() -> None:
@@ -286,12 +287,12 @@ def test_templates_write_the_signature_into_draft_campaigns_only() -> None:
     [(campaign_id, steps, etag)] = sending.patched
     assert (campaign_id, etag) == ("c1", "etag-1")
     assert [s["id"] for s in steps] == ["s1", "s2", "s3"] and steps[0]["subject"] == "{{email_1_subject}}"
-    assert steps[2]["body_text"] == "{{email_3_body}}\n\n{{sender_name}}\nPrintCoPilot\n1 Main St\nAustin, TX 78701"
+    assert steps[2]["body_text"] == "{{email_3_body}}\n\n{{sender_name}}\nPrintCoPilot\nprintcopilot.co"
     assert "subject" not in steps[1]
 
 
 def test_templates_already_in_place_are_left_alone() -> None:
-    steps = [s | {"body_text": outreach.step_body(i, "PrintCoPilot", "1 Main St\nAustin, TX 78701")} for i, s in enumerate(CAMPAIGN["steps"], 1)]
+    steps = [s | {"body_text": outreach.step_body(i, "PrintCoPilot", "printcopilot.co")} for i, s in enumerate(CAMPAIGN["steps"], 1)]
     seq = Sequencer([CAMPAIGN | {"steps": steps}])
     assert [o.status for o in run(outreach.sync_templates(deps(Sending([]), seq)))] == ["unchanged"] and seq.patched == []
 

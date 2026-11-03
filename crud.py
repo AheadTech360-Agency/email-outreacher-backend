@@ -1687,7 +1687,7 @@ GENERAL_DEFAULTS: dict[str, Any] = {
     "company_threshold": 60, "company_auto_approve": True,
 }  # fmt: skip
 SENDING_DEFAULTS: dict[str, Any] = {
-    "sender_company": "", "sender_address": "", "followup_fallback_2": FALLBACK_2, "followup_fallback_3": FALLBACK_3,
+    "sender_company": "", "sender_website": "", "followup_fallback_2": FALLBACK_2, "followup_fallback_3": FALLBACK_3,
     "followup_lead_hours": 24,
 }  # fmt: skip
 

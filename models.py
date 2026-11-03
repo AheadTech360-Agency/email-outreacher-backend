@@ -293,11 +293,12 @@ class Settings(Base):
     # page, and the most time spent on one company.
     research_max_pages: Mapped[int] = mapped_column(SmallInteger, server_default="6")
     research_max_seconds: Mapped[int] = mapped_column(SmallInteger, server_default="120")
-    # Sending: who the emails are from (US law asks for a physical address), the generic follow-ups
+    # Sending: who the emails are from (company and website; sender_address is no longer used), the generic follow-ups
     # a lead holds until the personal one is written, and how many hours before a follow-up is due
     # it gets written.
     sender_company: Mapped[str] = mapped_column(Text, server_default="")
     sender_address: Mapped[str] = mapped_column(Text, server_default="")
+    sender_website: Mapped[str] = mapped_column(Text, server_default="")
     followup_fallback_2: Mapped[str] = mapped_column(Text, server_default=FALLBACK_2)
     followup_fallback_3: Mapped[str] = mapped_column(Text, server_default=FALLBACK_3)
     followup_lead_hours: Mapped[int] = mapped_column(SmallInteger, server_default="24")

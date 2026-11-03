@@ -10,7 +10,7 @@ sends: a campaign only sends once a person activates it in CheapSequencer.
               unsubscribed, Claude writes it with the follow-up prompt and it replaces the generic
               text. Nobody who already replied costs a follow-up.
   templates   The campaigns' step text: each lead's email, then the sender's name, company and
-              physical address from Settings (US law asks for an address in commercial email).
+              website from Settings.
 """
 
 import hashlib
@@ -42,14 +42,24 @@ def first_name_in(text: str, first_name: str) -> str:
     return re.sub(r"\{\{\s*first_name\s*\}\}", first_name.strip() or "there", text)
 
 
-def signature(company: str, address: str) -> str:
-    """What follows every email: the sender's name, then the company and its address."""
-    lines = ["{{sender_name}}", company.strip(), *[ln.strip() for ln in address.strip().splitlines() if ln.strip()]]
+def clean_website(value: str) -> str:
+    """A website as people write it: no spaces, no trailing slash. The scheme is kept if given."""
+    return "".join(value.split()).rstrip("/")
+
+
+def looks_like_website(value: str) -> bool:
+    host = re.sub(r"^https?://", "", value, flags=re.I).split("/", 1)[0]
+    return bool(re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}", host, flags=re.I))
+
+
+def signature(company: str, website: str) -> str:
+    """What follows every email: the sender's name, then the company and its website."""
+    lines = ["{{sender_name}}", company.strip(), website.strip()]
     return "\n".join(ln for ln in lines if ln)
 
 
-def step_body(step: int, company: str, address: str) -> str:
-    return f"{{{{email_{step}_body}}}}\n\n{signature(company, address)}"
+def step_body(step: int, company: str, website: str) -> str:
+    return f"{{{{email_{step}_body}}}}\n\n{signature(company, website)}"
 
 
 def lead_row(lead: Lead, subject: str, body: str, fallback_2: str, fallback_3: str) -> dict[str, str]:
@@ -266,8 +276,8 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
     """Put approved first emails into their ICP's campaign. The campaign isn't activated. An email to a risky
     address is left out unless a person confirmed that one (`risky_ok`)."""
     settings = await deps.settings.sending(deps.workspace_id)
-    if not settings["sender_company"].strip() or not settings["sender_address"].strip():
-        raise SendingError("Add the sender's company and physical address in Settings, under Sending, before queueing emails.")
+    if not settings["sender_company"].strip() or not settings["sender_website"].strip():
+        raise SendingError("Add the sender's company and website in Settings, under Sending, before queueing emails.")
     pairs = await deps.sending.to_queue(deps.workspace_id, email_ids)
     found = {e.id for e, _ in pairs}
     outcomes = [QueueOutcome(i, "skipped", "Not an approved first email, or already queued") for i in email_ids if i not in found]
@@ -322,10 +332,10 @@ class TemplateOutcome:
 
 
 async def sync_templates(deps: Deps) -> list[TemplateOutcome]:
-    """Write the signature (sender name, company, address) into every Coldbrew campaign's steps.
+    """Write the signature (sender name, company, website) into every Coldbrew campaign's steps.
     Only draft or paused campaigns can be changed; an active one is reported, not touched."""
     settings = await deps.settings.sending(deps.workspace_id)
-    company, address = settings["sender_company"], settings["sender_address"]
+    company, website = settings["sender_company"], settings["sender_website"]
     out: list[TemplateOutcome] = []
     for summary in await deps.sequencer.campaigns():
         name = summary.get("name") or ""
@@ -336,7 +346,7 @@ async def sync_templates(deps: Deps) -> list[TemplateOutcome]:
             out.append(TemplateOutcome(name, "skipped", "It's sending. Pause it in CheapSequencer to change its text."))
             continue
         steps = campaign.get("steps") or []
-        wanted = [step_body(i, company, address) for i in range(1, len(steps) + 1)]
+        wanted = [step_body(i, company, website) for i in range(1, len(steps) + 1)]
         if [s.get("body_text") for s in steps] == wanted:
             out.append(TemplateOutcome(name, "unchanged"))
             continue

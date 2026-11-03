@@ -72,7 +72,9 @@ async def save_settings(
     """Save, then write the signature into every Coldbrew campaign that can still be changed."""
     values = body.model_dump()
     values["sender_company"] = values["sender_company"].strip()
-    values["sender_address"] = "\n".join(ln.strip() for ln in values["sender_address"].strip().splitlines() if ln.strip())
+    values["sender_website"] = outreach.clean_website(values["sender_website"])
+    if values["sender_website"] and not outreach.looks_like_website(values["sender_website"]):
+        raise HTTPException(status_code=422, detail="The website should look like aheadtech360.com or https://aheadtech360.com.")
     saved = await settings.save_sending(workspace_id, values)
     try:
         templates = await outreach.sync_templates(deps)
