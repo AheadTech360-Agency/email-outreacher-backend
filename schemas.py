@@ -786,6 +786,36 @@ class LeadPostsResult(ApiModel):
     reason: str = ""
 
 
+class PostGatherIn(ApiModel):
+    """Read posts for people and/or companies: any of the three sources, up to `max_posts` from each, stopping for
+    each one as soon as Claude finds enough to write with."""
+
+    stakeholder_ids: list[UUID] = Field(default=[], max_length=25)
+    company_ids: list[UUID] = Field(default=[], max_length=25)
+    sources: list[Literal["company_linkedin", "person_linkedin", "company_instagram"]] = Field(min_length=1)
+    max_posts: int = Field(default=3, ge=1, le=20)
+    max_age_days: int = Field(default=60, ge=1, le=365)
+
+
+class GatheredFor(ApiModel):
+    kind: Literal["person", "company"]
+    id: UUID
+    company_linkedin: int | None = None
+    linkedin: int | None = None
+    instagram: int | None = None
+    new: int = 0
+    enough: bool = False
+    stopped_at: str | None = None
+    reason: str = ""
+
+
+class PostGatherResult(ApiModel):
+    results: list[GatheredFor]
+    cost_usd: float = 0.0  # Apify
+    claude_cost_usd: float = 0.0
+    error: str | None = None
+
+
 class PostFetchResult(ApiModel):
     results: list[LeadPostsResult]
     cost_usd: float | None  # Apify

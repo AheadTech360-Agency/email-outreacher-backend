@@ -38,6 +38,7 @@ MANAGEMENT_ONLY = [
     ("post", "/leads/delete", {}), ("post", "/leads/move", {}),
     ("post", "/sending/follow-ups/run", {}),
     ("put", "/settings/feedback", {}), ("put", "/settings/research", {}),
+    ("post", "/posts/gather", {"companyIds": [str(uuid4())], "sources": ["company_linkedin"]}),
     ("post", "/pipeline/enrich", {"companyIds": [str(uuid4())]}), ("post", "/stakeholders/enrich", {"stakeholderIds": [str(uuid4())]}),
     ("post", "/smart-lists/sort", {"kind": "company"}), ("post", "/smart-lists/move", {"kind": "company", "memberIds": [str(uuid4())]}), ("patch", f"/smart-lists/{uuid4()}", {}),
     ("post", f"/smart-lists/{uuid4()}/draft-icp", {}), ("post", f"/smart-lists/{uuid4()}/create-icp", {}),

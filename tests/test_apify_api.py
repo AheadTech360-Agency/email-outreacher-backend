@@ -303,3 +303,37 @@ def test_people_found_with_an_email_become_leads_ready_to_send(client, apify, ap
 def test_emails_can_be_left_out_to_pay_less(client, apify, apollo_env) -> None:  # noqa: F811
     client.post("/api/v1/stakeholders/search-linkedin", json={"companyIds": [str(COMPANY_ID)], "findEmails": False}, headers=WS)
     assert apify.calls[-1][-1] is False
+
+
+def test_a_company_on_its_own_reads_its_linkedin_then_its_instagram() -> None:
+    """From the Companies page: no person, so their LinkedIn is skipped; Claude stops as soon as there's enough."""
+    from services.smart_posts import Target, gather
+
+    ink = company("Ink Co", "https://www.linkedin.com/company/inkco/", "https://instagram.com/inkco")
+    stored_posts: list = []
+    apify = FakeApify()
+    apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
+    apify.linkedin_items[0].text = "Happy holidays"
+    apify.instagram_items = [post("instagram", "https://ig/1", "inkco")]
+    apify.instagram_items[0].text = "Launch of our new tees"
+
+    async def stored(t):
+        return list(stored_posts)
+
+    async def count(owner, network):
+        return 0
+
+    async def save(owner, found):
+        stored_posts.extend(SimpleNamespace(company_id=ink.id, lead_id=None, source=f.source, url=f.url, text=f.text, posted_at=None,
+                                            is_repost=False) for f in found)  # fmt: skip
+        return len(found)
+
+    async def nothing(*args):
+        pass
+
+    out = asyncio.run(gather(targets=[Target(None, ink)], stages=["company_linkedin", "person_linkedin", "company_instagram"], max_posts=2,
+                             since=datetime(2026, 1, 1, tzinfo=UTC), apify=apify, claude=FakeJudge(), stored=stored, stored_count=count,
+                             save=save, record_apify=nothing, record_claude=nothing))  # fmt: skip
+    [o] = out.leads
+    assert (o.enough, o.stopped_at, o.counts.get("person_linkedin", "skipped")) == (True, "company_instagram", None)
+    assert [c[0] for c in apify.calls] == ["linkedin", "instagram"] and apify.calls[0][2] == 2

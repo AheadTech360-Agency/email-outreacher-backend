@@ -48,6 +48,7 @@ LONG_RUNNING: dict[str, str] = {
     "/stakeholders/import-run": "Importing people",
     "/pipeline/companies/{id}/reread": "Reading the website again",
     "/pipeline/enrich": "Filling in companies",
+    "/posts/gather": "Reading posts",
     "/stakeholders/enrich": "Reading LinkedIn profiles",
 }
 

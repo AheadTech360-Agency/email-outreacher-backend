@@ -1297,9 +1297,11 @@ class PostRepo:
         """The company the lead was found at (as email writing finds it)."""
         return await EmailRepo(self.session).company_for(workspace_id, lead)
 
-    async def stored(self, workspace_id: UUID, lead_id: UUID, company_id: UUID | None, limit: int = 20) -> list[Post]:
-        """The lead's own posts and their company's, newest first."""
-        owners = [Post.lead_id == lead_id] + ([Post.company_id == company_id] if company_id else [])
+    async def stored(self, workspace_id: UUID, lead_id: UUID | None, company_id: UUID | None, limit: int = 20) -> list[Post]:
+        """The lead's own posts and their company's, newest first (a company on its own: lead_id None)."""
+        owners = ([Post.lead_id == lead_id] if lead_id else []) + ([Post.company_id == company_id] if company_id else [])
+        if not owners:
+            return []
         query = select(Post).where(Post.workspace_id == workspace_id, or_(*owners))
         return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id).limit(limit)))
 

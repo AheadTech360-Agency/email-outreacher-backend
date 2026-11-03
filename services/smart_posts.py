@@ -54,10 +54,14 @@ reason: a few words, e.g. "post 2: launched a spring collection" or "only sale a
 
 @dataclass
 class Target:
-    """A lead, with the company it was found at (None when it has none)."""
+    """A lead with the company it was found at (None when it has none), or a company on its own (lead None)."""
 
-    lead: Any
+    lead: Any | None
     company: Any | None
+
+    @property
+    def key(self) -> Any:
+        return self.lead.id if self.lead is not None else self.company.id
 
 
 @dataclass
@@ -98,8 +102,10 @@ def _source(stage: str, target: Target) -> tuple[str, str] | None:
         url = company_linkedin(target.company)
         return (f"company:{target.company.id}", url) if url else None
     if stage == "person_linkedin":
+        if target.lead is None:
+            return None
         url = target.lead.linkedin_url
-        return (f"lead:{target.lead.id}", url) if linkedin_slug(url) else None
+        return (f"lead:{target.key}", url) if linkedin_slug(url) else None
     url = company_instagram(target.company)
     return (f"company:{target.company.id}", url) if url else None
 
@@ -123,10 +129,13 @@ async def judge(client: anthropic.AsyncAnthropic, lead: Any, company: Any | None
     """(Claude's verdict, its cost, an error). Nothing to read is never enough, and costs nothing."""
     if not posts:
         return Enough(enough=False, reason="no posts"), 0.0, None
-    who = " ".join(x for x in (lead.first_name, lead.last_name) if x) or "this person"
-    at = f", {lead.title}" if getattr(lead, "title", "") else ""
-    biz = f" at {company.name}" if company is not None else (f" at {lead.company}" if getattr(lead, "company", "") else "")
-    user = f"Person: {who}{at}{biz}\n\nTheir posts so far, newest first:\n\n{format_posts(posts)}"
+    if lead is None:  # a company on its own
+        user = f"Company: {company.name}\n\nIts posts so far, newest first:\n\n{format_posts(posts)}"
+    else:
+        who = " ".join(x for x in (lead.first_name, lead.last_name) if x) or "this person"
+        at = f", {lead.title}" if getattr(lead, "title", "") else ""
+        biz = f" at {company.name}" if company is not None else (f" at {lead.company}" if getattr(lead, "company", "") else "")
+        user = f"Person: {who}{at}{biz}\n\nTheir posts so far, newest first:\n\n{format_posts(posts)}"
     try:
         response = await client.messages.parse(
             model=JUDGE_MODEL, max_tokens=512, system=JUDGE_SYSTEM, output_format=Enough, messages=[{"role": "user", "content": user}]
@@ -155,7 +164,7 @@ async def gather(
     """Run the stages for these leads. `stored(target)`: the lead's and its company's posts, newest first.
     `stored_count(owner, network)`: how many posts of that network are already stored for that owner. `save(owner, posts)`:
     store them, returns how many were new. Without Claude every stage runs (no judging)."""
-    out = {t.lead.id: LeadOutcome(t.lead.id) for t in targets}
+    out = {t.key: LeadOutcome(t.key) for t in targets}
     result = FetchOutcome(list(out.values()))
     pending = list(targets)
     for stage, network, _whose in STAGES:
@@ -170,7 +179,7 @@ async def gather(
         for t in pending:
             src = _source(stage, t)
             if src is None:
-                out[t.lead.id].counts[stage] = None
+                out[t.key].counts[stage] = None
                 continue
             owner, url = src
             readers.append(t)
@@ -201,14 +210,14 @@ async def gather(
             found_by_owner = {owner: len(posts) for owner, posts in grouped.items()}
         else:
             new_by_owner, found_by_owner = {}, {}
-        reading = {t.lead.id for t in readers}
-        still: list[Target] = [t for t in pending if t.lead.id not in reading]  # nothing new to judge at this stage
+        reading = {t.key for t in readers}
+        still: list[Target] = [t for t in pending if t.key not in reading]  # nothing new to judge at this stage
         for t in readers:
             owner, _ = _source(stage, t)
-            out[t.lead.id].counts[stage] = found_by_owner.get(owner, have.get(owner, 0))
-            out[t.lead.id].new += new_by_owner.get(owner, 0) if owner.startswith("lead:") else 0
+            out[t.key].counts[stage] = found_by_owner.get(owner, have.get(owner, 0))
+            out[t.key].new += new_by_owner.get(owner, 0) if owner.startswith("lead:") else 0
         for t in readers:
-            o = out[t.lead.id]
+            o = out[t.key]
             if claude is None:
                 still.append(t)
                 continue
