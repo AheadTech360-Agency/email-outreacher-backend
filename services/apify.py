@@ -23,6 +23,9 @@ EMPLOYEES_ACTOR = "harvestapi~linkedin-company-employees"
 LINKEDIN_POSTS_ACTOR = "harvestapi~linkedin-profile-posts"
 INSTAGRAM_ACTOR = "apify~instagram-scraper"
 INSTAGRAM_PROFILE_ACTOR = "apify~instagram-profile-scraper"
+LINKEDIN_COMPANY_ACTOR = "harvestapi~linkedin-company"  # $0.004 a company page
+LINKEDIN_PROFILE_ACTOR = "harvestapi~linkedin-profile-scraper"  # $0.004 a profile, no email search
+PROFILE_DETAILS = "Profile details no email ($4 per 1k)"
 
 RUN_TIMEOUT = 300  # seconds to wait for a run before giving up on it
 TERMINAL = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
@@ -423,6 +426,36 @@ class ApifyClient:
             if post := _instagram_post(item, owner):
                 posts.append(post)
         return posts, result
+
+    async def linkedin_companies(self, urls: list[str]) -> tuple[dict[str, dict[str, Any]], RunResult]:
+        """LinkedIn company pages (description, size, industry, address, specialties...), keyed by the page's slug."""
+        result = await self.run(LINKEDIN_COMPANY_ACTOR, {"companies": urls}, len(urls) + 5)
+        out: dict[str, dict[str, Any]] = {}
+        wanted = {linkedin_slug(u): u for u in urls}
+        for item in result.items:
+            slug = next((s for s in (linkedin_slug(item.get("linkedinUrl")), linkedin_slug(str(item.get("query") or "")),
+                                     (item.get("universalName") or "").lower()) if s and s in wanted), None)  # fmt: skip
+            if slug is None and len(urls) == 1:
+                slug = linkedin_slug(urls[0])
+            if slug:
+                out[slug] = item
+        return out, result
+
+    async def linkedin_profiles(self, urls: list[str]) -> tuple[dict[str, dict[str, Any]], RunResult]:
+        """Full LinkedIn profiles (about, experience, education, skills), keyed by the profile's slug."""
+        result = await self.run(LINKEDIN_PROFILE_ACTOR, {"urls": urls, "profileScraperMode": PROFILE_DETAILS}, len(urls) + 5)
+        out: dict[str, dict[str, Any]] = {}
+        wanted = {linkedin_slug(u) for u in urls}
+        for item in result.items:
+            query = item.get("query")
+            query_url = query if isinstance(query, str) else next((v for v in (query or {}).values() if isinstance(v, str)), None)
+            slug = next((s for s in (linkedin_slug(query_url), (item.get("publicIdentifier") or "").lower(),
+                                     linkedin_slug(item.get("linkedinUrl"))) if s and s in wanted), None)  # fmt: skip
+            if slug is None and len(urls) == 1:
+                slug = linkedin_slug(urls[0])
+            if slug:
+                out[slug] = item
+        return out, result
 
     async def instagram_profiles(self, handles: list[str]) -> tuple[dict[str, InstagramProfile], RunResult]:
         """Profiles (bio, category, followers) for these usernames, keyed by lower-case handle.

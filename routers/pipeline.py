@@ -16,7 +16,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from config import get_settings
-from services import exports, record_data
+from background import report
+from services import enrich, exports, record_data
 from crud import PRODUCT_FIELDS, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
 from dependencies import (
     get_smart_list_repo,
@@ -47,6 +48,8 @@ from schemas import (
     CompanyDecisionIn,
     CompanyDecisionResult,
     CompanyStatusIn,
+    EnrichCompaniesIn,
+    EnrichResult,
     PipelineCompanyDetailOut,
     RereadResult,
     FindCompaniesIn,
@@ -371,7 +374,7 @@ async def get_company(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     people = await lists.people_at(workspace_id, [company.id])
-    data = record_data.company_groups(company.raw, [p.raw for p in people])
+    data = {**record_data.company_groups(company.raw, [p.raw for p in people]), **record_data.company_extras(company.research)}
     return PipelineCompanyDetailOut.model_validate(company).model_copy(update={"data": data})
 
 
@@ -427,6 +430,52 @@ async def reread_company(
         reached=found.reached, via=found.via, pages=len(found.pages), socials=found.socials, emails=found.emails,
         phone=found.phone, detail=found.detail, company=PipelineCompanyOut.model_validate(company),
     )  # fmt: skip
+
+
+def apify_recorder(calls: ProviderCallRepo, workspace_id: UUID, action: str):
+    async def record(actor: str, run: Any, status: str) -> None:
+        key = f"apify:run:{run.run_id}" if run is not None and run.run_id else None
+        await calls.record(workspace_id, "apify", actor, status, key=key, cost_usd=run.cost_usd if run is not None else None, action=action)
+
+    return record
+
+
+async def enrich_companies_now(
+    workspace_id: UUID, companies: list[Company], website: bool, instagram: bool, linkedin: bool, repo: CompanyRepo,
+    posts: PostRepo, calls: ProviderCallRepo, reader: WebsiteReader, apify: ApifyClient | None,
+) -> EnrichResult:  # fmt: skip
+    """services.enrich.enrich_companies, with what it reads saved and what it costs on Usage."""
+    if (instagram or linkedin) and apify is None:
+        raise HTTPException(status_code=503, detail="APIFY_TOKEN is not set")
+
+    async def save_pages(company: Company, via: str, pages: list[dict]) -> None:
+        await repo.save_pages(workspace_id, company.id, via, pages)
+
+    async def save_posts(company: Company, found: list) -> int:
+        return await posts.save_company(workspace_id, company.id, found)
+
+    out = await enrich.enrich_companies(
+        companies, website=website, instagram=instagram, linkedin=linkedin, reader=reader, apify=apify, save_pages=save_pages,
+        save_posts=save_posts, record=apify_recorder(calls, workspace_id, "Enrich companies"), progress=report,
+    )  # fmt: skip
+    await repo.save_all(companies)
+    return EnrichResult(**vars(out))
+
+
+@router.post("/enrich", response_model=EnrichResult, dependencies=[Depends(require_manager)])
+async def enrich_companies(
+    body: EnrichCompaniesIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+    posts: PostRepo = Depends(get_post_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    reader: WebsiteReader = Depends(get_website_reader),
+    apify: ApifyClient | None = Depends(get_optional_apify),
+) -> EnrichResult:
+    """Fill in companies without judging them (no Claude): their website (free), Instagram profile and LinkedIn page
+    (paid, logged on Usage), as chosen. What's already filled in isn't bought again."""
+    rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
+    return await enrich_companies_now(workspace_id, rows, body.website, body.instagram, body.linkedin, companies, posts, calls, reader, apify)
 
 
 def _decide(company: Company, status: str) -> None:

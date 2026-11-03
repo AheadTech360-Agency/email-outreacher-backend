@@ -61,7 +61,8 @@ def person_groups(raw: dict[str, Any] | None) -> dict[str, dict[str, str]]:
             apollo[column] = _clean(value)
         else:
             other[column] = _clean(value)
-    groups = {"Contact": contact, "Role": role, "Email details": emails, "In Apollo": apollo, "Other": other}
+    groups = {"Contact": contact, "Role": role, "LinkedIn profile": linkedin_profile_group(raw), "Email details": emails,
+              "In Apollo": apollo, "Other": other}  # fmt: skip
     return {name: values for name, values in groups.items() if values}
 
 
@@ -97,3 +98,54 @@ def company_groups(company_raw: dict[str, Any] | None, people_raws: list[dict[st
     about = dict(sorted(about.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order)))
     groups = {"About": about, "Business": business, "Technologies": tech, "From Apollo": more, "Codes": codes}
     return {name: values for name, values in groups.items() if values}
+
+
+def _years(job: dict[str, Any]) -> str:
+    start = job.get("startDate") or {}
+    end = job.get("endDate") or {}
+    start = start.get("text") if isinstance(start, dict) else start
+    end = end.get("text") if isinstance(end, dict) else end
+    span = " – ".join(x for x in (start, end) if x)
+    return f" ({job['duration']})" if job.get("duration") else (f" ({span})" if span else "")
+
+
+def linkedin_profile_group(raw: dict[str, Any] | None) -> dict[str, str]:
+    """A person's LinkedIn profile, read by enrichment (or the LinkedIn email search)."""
+    raw = raw or {}
+    out: dict[str, str] = {}
+    if _filled(raw.get("headline")):
+        out["Headline"] = _clean(raw["headline"])
+    if _filled(raw.get("about")):
+        out["About"] = _clean(raw["about"])
+    jobs = [j for j in raw.get("experience") or [] if isinstance(j, dict)][:6]
+    if jobs:
+        out["Experience"] = "\n".join(
+            f"{j.get('position') or j.get('title') or 'Role'} at {j.get('companyName') or 'a company'}{_years(j)}" for j in jobs
+        )
+    schools = [e for e in raw.get("education") or [] if isinstance(e, dict)][:4]
+    if schools:
+        out["Education"] = "\n".join(
+            " · ".join(x for x in (e.get("schoolName") or e.get("title"), e.get("degree") or e.get("subtitle")) if x) for e in schools
+        )
+    skills = [s.get("name") if isinstance(s, dict) else s for s in raw.get("skills") or []]
+    if skills := [s for s in skills if s][:25]:
+        out["Skills"] = ", ".join(skills)
+    return out
+
+
+def company_extras(research: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    """What enrichment read: the LinkedIn company page and the Instagram profile."""
+    research = research or {}
+    groups: dict[str, dict[str, str]] = {}
+    li = research.get("linkedin") or {}
+    if li:
+        labels = {"tagline": "Tagline", "description": "About", "industry": "Industry", "employees": "Employees on LinkedIn",
+                  "size": "Size", "founded": "Founded", "headquarters": "Headquarters", "specialties": "Specialties",
+                  "followers": "Followers", "type": "Type", "url": "Page"}  # fmt: skip
+        groups["LinkedIn"] = {label: _clean(li[k]) for k, label in labels.items() if _filled(li.get(k))}
+    ig = research.get("instagram") or {}
+    if ig:
+        values = {"Account": f"@{ig['handle']}" if ig.get("handle") else "", "Name": ig.get("name"), "Bio": ig.get("bio"),
+                  "Category": ig.get("category"), "Followers": f"{ig['followers']:,}" if isinstance(ig.get("followers"), int) else ""}  # fmt: skip
+        groups["Instagram"] = {k: _clean(v) for k, v in values.items() if _filled(v)}
+    return {k: v for k, v in groups.items() if v}

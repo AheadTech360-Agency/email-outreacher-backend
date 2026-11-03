@@ -1589,6 +1589,35 @@ class SmartListUpdateIn(ApiModel):
     lead_intel_icp_id: UUID | None = None
 
 
+class EnrichOptions(ApiModel):
+    website: bool = False
+    instagram: bool = False
+    linkedin: bool = False
+    people_linkedin: bool = False
+
+
+class EnrichCompaniesIn(ApiModel):
+    company_ids: list[UUID] = Field(min_length=1, max_length=2000)
+    website: bool = False
+    instagram: bool = False
+    linkedin: bool = False
+
+
+class EnrichPeopleIn(ApiModel):
+    stakeholder_ids: list[UUID] = Field(min_length=1, max_length=2000)
+
+
+class EnrichResult(ApiModel):
+    sites_read: int = 0
+    sites_failed: int = 0
+    instagram: int = 0
+    linkedin_companies: int = 0
+    linkedin_people: int = 0
+    posts_saved: int = 0
+    cost_usd: float = 0.0
+    errors: list[str] = []
+
+
 class ImportRunIn(ApiModel):
     """A people CSV imported as a background job: the file's text, the ICP to give them (or none), and whether
     to sort what it brings in into smart lists and ICPs with Claude afterwards."""
@@ -1596,6 +1625,9 @@ class ImportRunIn(ApiModel):
     csv: str = Field(min_length=1, max_length=5_000_000)
     icp_id: UUID | None = None
     sort: bool = True
+    # Filling in what it brings in (services/enrich.py), each opted into: companies' websites (free), Instagram
+    # profiles and LinkedIn pages, and people's LinkedIn profiles (paid).
+    enrich: EnrichOptions | None = None
 
 
 class ImportRunResult(ApiModel):
@@ -1609,4 +1641,5 @@ class ImportRunResult(ApiModel):
     errors: list[PeopleRowError]
     companies_sorted: SortListsResult | None = None
     people_sorted: SortListsResult | None = None
+    enriched: EnrichResult | None = None
     cost_usd: float = 0.0

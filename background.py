@@ -47,6 +47,8 @@ LONG_RUNNING: dict[str, str] = {
     "/smart-lists/sort": "Sorting smart lists",
     "/stakeholders/import-run": "Importing people",
     "/pipeline/companies/{id}/reread": "Reading the website again",
+    "/pipeline/enrich": "Filling in companies",
+    "/stakeholders/enrich": "Reading LinkedIn profiles",
 }
 
 

@@ -17,7 +17,7 @@ import anthropic
 
 from background import report
 from crud import (
-    CompanyRepo, ExclusionRepo, IcpProfileRepo, PromptRepo, ProviderCallRepo, SmartListRepo, StakeholderRepo, WorkspaceCompanyRepo,
+    CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, PromptRepo, ProviderCallRepo, SmartListRepo, StakeholderRepo, WorkspaceCompanyRepo,
     lead_from_stakeholder,
 )  # fmt: skip
 from database import get_session
@@ -31,6 +31,8 @@ from dependencies import (
     get_icp_profile_repo,
     get_lead_intel_repo,
     get_optional_anthropic,
+    get_optional_apify,
+    get_post_repo,
     get_prompt_repo,
     get_smart_list_repo,
     get_website_reader,
@@ -41,10 +43,13 @@ from dependencies import (
     require_workspace_id,
 )
 from lead_intel import LeadIntelRepo
+from routers.pipeline import apify_recorder, enrich_companies_now
 from routers.smart_lists import recorder, sort_context, sort_out
-from services import exports, record_data
+from services import enrich, exports, record_data
 from services.auth import CurrentUser
 from schemas import (
+    EnrichPeopleIn,
+    EnrichResult,
     ImportRunIn,
     ImportRunResult,
     AddAsLeadsIn,
@@ -224,6 +229,22 @@ async def import_people(
     )
 
 
+@router.post("/enrich", response_model=EnrichResult, dependencies=[Depends(require_manager)])
+async def enrich_people(
+    body: EnrichPeopleIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    apify: ApifyClient = Depends(get_apify),
+) -> EnrichResult:
+    """Their full LinkedIn profiles (about, experience, education, skills), $0.004 each, logged on Usage. Written into
+    their records, where email writing reads them. A profile already read isn't bought again."""
+    people = await stakeholders.get_many(workspace_id, list(dict.fromkeys(body.stakeholder_ids)))
+    out = await enrich.enrich_people(people, apify=apify, record=apify_recorder(calls, workspace_id, "Enrich people"), progress=report)
+    await stakeholders.commit()
+    return EnrichResult(**vars(out))
+
+
 IMPORT_BATCH = 100  # people saved per round of database writes
 
 
@@ -241,6 +262,8 @@ async def import_run(
     calls: ProviderCallRepo = Depends(get_provider_call_repo),
     claude: anthropic.AsyncAnthropic | None = Depends(get_optional_anthropic),
     reader: WebsiteReader = Depends(get_website_reader),
+    posts: PostRepo = Depends(get_post_repo),
+    apify: ApifyClient | None = Depends(get_optional_apify),
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
 ) -> ImportRunResult:
@@ -268,6 +291,7 @@ async def import_run(
     new_companies: set[int] = set()  # by object: a company added earlier in the same batch has no id yet
     person_ids: list[UUID] = []
     company_ids: set[UUID] = set()
+    enriched: list[EnrichResult] = []
     await report("Saving people", 0, len(people))
     for start in range(0, len(people), IMPORT_BATCH):
         items = []
@@ -283,11 +307,38 @@ async def import_run(
         person_ids += ids
         await report("Saving people", min(start + IMPORT_BATCH, len(people)), len(people))
 
+    # Filling in, as opted into, before sorting: sorting then reads the websites too.
+    opts = body.enrich
+    if opts and (opts.website or opts.instagram or opts.linkedin or opts.people_linkedin):
+        if user.role not in ("admin", "management"):
+            raise HTTPException(status_code=403, detail=MANAGERS_ONLY)
+        if opts.website or opts.instagram or opts.linkedin:
+            rows = await companies.get_many(workspace_id, list(company_ids))
+            done = await enrich_companies_now(
+                workspace_id, rows, opts.website, opts.instagram, opts.linkedin, companies, posts, calls, reader, apify
+            )  # fmt: skip
+            enriched.append(done)
+        if opts.people_linkedin:
+            if apify is None:
+                raise HTTPException(status_code=503, detail="APIFY_TOKEN is not set")
+            found = await stakeholders.get_many(workspace_id, person_ids)
+            done_people = await enrich.enrich_people(
+                found, apify=apify, record=apify_recorder(calls, workspace_id, "Enrich people"), progress=report
+            )  # fmt: skip
+            await stakeholders.commit()
+            enriched.append(EnrichResult(**vars(done_people)))
+
     result = ImportRunResult(
         total_rows=len(parsed.people) + len(parsed.errors) + parsed.duplicates, valid=len(parsed.people), added=added,
         updated=updated, leads_created=leads_created, companies_added=len(new_companies), duplicates_in_file=parsed.duplicates,
         errors=[PeopleRowError(row=r, reason=reason) for r, reason in parsed.errors[:200]],
     )  # fmt: skip
+    if enriched:
+        result.enriched = EnrichResult(**{
+            k: (round(sum(getattr(e, k) for e in enriched), 4) if k == "cost_usd" else sum(getattr(e, k) for e in enriched))
+            for k in ("sites_read", "sites_failed", "instagram", "linkedin_companies", "linkedin_people", "posts_saved", "cost_usd")
+        }, errors=[x for e in enriched for x in e.errors])  # fmt: skip
+        result.cost_usd = round(result.cost_usd + result.enriched.cost_usd, 6)
     if not body.sort:
         return result
     record = recorder(calls, workspace_id)
