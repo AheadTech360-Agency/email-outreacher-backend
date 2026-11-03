@@ -227,13 +227,26 @@ def test_deleting_an_unused_icp(client, writer, sequencer, no_real_sending) -> N
     assert writer.deleted == [ICP_ID] and sequencer.archived == ["c1"] and no_real_sending.forgotten == [ICP_ID]
 
 
-def test_an_icp_in_use_is_not_deleted(client, writer, sequencer, no_real_sending) -> None:
-    no_real_sending.in_use = {"leads": 3, "companies": 0}
+def test_an_icp_with_lead_intel_businesses_is_not_deleted(client, writer, sequencer, no_real_sending) -> None:
     writer.businesses = 12
     r = client.delete(f"/api/v1/icps/{ICP_ID}")
     assert r.status_code == 409
-    assert r.json()["detail"] == "Med spas is still used by 12 Lead Intel businesses, 3 leads, so it can't be deleted. Archive it instead."
+    assert r.json()["detail"] == "Med spas has 12 Lead Intel businesses in it, so it can't be deleted. Archive it instead."
+    assert writer.deleted == [] and sequencer.archived == [] and no_real_sending.detached == []
+
+
+def test_an_icp_with_emails_out_is_not_deleted(client, writer, sequencer, no_real_sending) -> None:
+    no_real_sending.sending_count = 4
+    r = client.delete(f"/api/v1/icps/{ICP_ID}")
+    assert r.status_code == 409 and r.json()["detail"].startswith("4 emails for Med spas are queued or sent")
     assert writer.deleted == [] and sequencer.archived == []
+
+
+def test_deleting_an_icp_keeps_its_companies_with_no_icp(client, writer, sequencer, no_real_sending) -> None:
+    """Companies and people under it in Coldbrew don't stop the delete: they're kept, under "No ICP"."""
+    no_real_sending.in_use = {"leads": 3, "companies": 40}
+    assert client.delete(f"/api/v1/icps/{ICP_ID}").status_code == 204
+    assert writer.deleted == [ICP_ID] and no_real_sending.detached == [ICP_ID]
 
 
 def test_deleting_needs_a_manager(client, writer) -> None:

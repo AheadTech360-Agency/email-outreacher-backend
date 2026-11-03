@@ -68,12 +68,8 @@ async def update_product(
 async def delete_product(
     product_id: UUID, workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo)
 ) -> Response:
-    """Delete a product no ICP uses."""
+    """Delete a product. ICPs that sold it are left with no product (the foreign key clears it) until another
+    is picked; their own offer, if they have one, still lets emails be written."""
     product = await _get(products, workspace_id, product_id)
-    if used := await products.used_by(workspace_id, product_id):
-        raise HTTPException(
-            status_code=409,
-            detail=f"{len(used)} {'ICP sells' if len(used) == 1 else 'ICPs sell'} this product. Pick another product on them first.",
-        )
     await products.delete(product)
     return Response(status_code=204)

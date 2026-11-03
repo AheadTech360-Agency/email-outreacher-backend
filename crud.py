@@ -20,6 +20,7 @@ from services.google_places import Place
 from services.identity import identity_keys
 from services.leads import Existing, LeadInput, clean_lead
 from services.prompts import DEFAULTS
+from services.smart_lists import company_key, person_key
 
 
 class IcpCampaignRepo:
@@ -52,6 +53,23 @@ class IcpCampaignRepo:
         ):  # fmt: skip
             counts[label] = int(await self.session.scalar(select(func.count()).select_from(model).where(column == icp_id)) or 0)
         return counts
+
+    async def sending(self, icp_id: UUID) -> int:
+        """Emails queued or sent for the ICP's leads: its campaign is in use, so it isn't deleted."""
+        query = select(func.count()).select_from(Email).join(Lead, Lead.id == Email.lead_id).where(
+            Lead.lead_intel_icp_id == icp_id, Email.status.in_(("queued", "sent"))
+        )
+        return int(await self.session.scalar(query) or 0)
+
+    async def detach(self, icp_id: UUID) -> None:
+        """A deleted ICP's companies, people, leads, ratings and smart lists are kept, with no ICP: they show
+        under "No ICP" until they're given another."""
+        for model, column in (
+            (Company, Company.icp_id), (Stakeholder, Stakeholder.lead_intel_icp_id), (Lead, Lead.lead_intel_icp_id),
+            (EmailFeedback, EmailFeedback.lead_intel_icp_id), (SmartList, SmartList.lead_intel_icp_id),
+        ):  # fmt: skip
+            await self.session.execute(update(model).where(column == icp_id).values({column.key: None}))
+        await self.session.commit()
 
     async def forget(self, icp_id: UUID) -> None:
         """Remove a deleted ICP's settings: its profiles, its campaign link, and it from example emails."""
@@ -2150,6 +2168,11 @@ class SmartListRepo:
         )
         return {key: list_id for key, list_id in rows}
 
+    async def delete(self, lst: SmartList) -> None:
+        """Delete a list. Its companies or people stay, unsorted (their memberships go with it)."""
+        await self.session.delete(lst)
+        await self.session.commit()
+
     async def get_or_create(self, workspace_id: UUID, kind: str, name: str, key: str) -> SmartList:
         statement = insert(SmartList).values(workspace_id=workspace_id, kind=kind, name=name, name_key=key)
         await self.session.execute(statement.on_conflict_do_nothing(index_elements=["workspace_id", "kind", "name_key"]))
@@ -2203,15 +2226,21 @@ class SmartListRepo:
         return [(row[0], row[1]) for row in rows], total
 
     async def move(self, workspace_id: UUID, kind: str, member_ids: list[UUID], list_id: UUID) -> int:
-        """Put these companies or people in another list (one they're already in is left alone). Returns how many moved."""
+        """Put these companies or people in another list (one they're already in is left alone); those in no list
+        yet are added to it. Returns how many moved or were added."""
         result = await self.session.execute(
             update(SmartListMember)
             .where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind,
                    SmartListMember.member_id.in_(member_ids), SmartListMember.list_id != list_id)
             .values(list_id=list_id, reason="Moved by hand")
         )  # fmt: skip
+        moved = result.rowcount or 0
+        unsorted = await self.unsorted_among(workspace_id, kind, member_ids)
+        if unsorted:
+            key = company_key if kind == "company" else person_key
+            await self.add_members(workspace_id, kind, [(m.id, list_id, key(m), "Added by hand") for m in unsorted])
         await self.session.commit()
-        return result.rowcount or 0
+        return moved + len(unsorted)
 
     async def list_names(self, workspace_id: UUID, kind: str, member_ids: list[UUID]) -> dict[UUID, str]:
         if not member_ids:

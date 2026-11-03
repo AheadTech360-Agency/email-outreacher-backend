@@ -233,19 +233,19 @@ async def delete_icp(
     links: IcpCampaignRepo = Depends(get_icp_campaign_repo),
     _: object = Depends(require_manager),
 ) -> None:
-    """Delete the ICP from Lead Intel's icps table and archive its campaign. Only an ICP nothing uses yet:
-    no Lead Intel businesses (deleting would change them) and no leads, companies or ratings in Coldbrew.
-    Anything in use is refused with what uses it; archive it instead."""
+    """Delete the ICP from Lead Intel's icps table and archive its campaign. Its companies, people and leads in
+    Coldbrew are kept with no ICP (they show under "No ICP" until given another). Refused while Lead Intel
+    businesses are in it (deleting would change Lead Intel's rows) or emails are queued or sent for it (its
+    campaign is sending); archive it instead."""
     icp = await lead_intel.get_icp(icp_id)
     if not icp:
         raise HTTPException(status_code=404, detail="ICP not found")
-    in_use = {label: n for label, n in (await links.usage(icp_id)).items() if n}
     if businesses := await writer.businesses_in(icp_id):
-        in_use = {"Lead Intel businesses": businesses, **in_use}
-    if in_use:
-        said = ", ".join(f"{n} {label}" for label, n in in_use.items())
-        raise HTTPException(status_code=409, detail=f"{icp['name']} is still used by {said}, so it can't be deleted. Archive it instead.")
+        raise HTTPException(status_code=409, detail=f"{icp['name']} has {businesses} Lead Intel businesses in it, so it can't be deleted. Archive it instead.")
+    if sending := await links.sending(icp_id):
+        raise HTTPException(status_code=409, detail=f"{sending} emails for {icp['name']} are queued or sent, so it can't be deleted. Archive it instead.")
     await _retire(sequencer, links, icp_id)
     if not await writer.delete_icp(icp_id):
         raise HTTPException(status_code=409, detail=f"{icp['name']} couldn't be deleted: Lead Intel has businesses in it now. Archive it instead.")
+    await links.detach(icp_id)
     await links.forget(icp_id)

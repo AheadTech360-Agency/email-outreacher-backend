@@ -1620,6 +1620,11 @@ class SortListsResult(ApiModel):
     errors: list[str]
 
 
+class SmartListCreateIn(ApiModel):
+    kind: Literal["company", "person"]
+    name: str = Field(min_length=1, max_length=60)
+
+
 class SmartListUpdateIn(ApiModel):
     name: str | None = Field(default=None, min_length=1, max_length=60)
     lead_intel_icp_id: UUID | None = None

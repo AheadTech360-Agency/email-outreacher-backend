@@ -204,6 +204,8 @@ class FakeIcpCampaigns:
         self.rows: dict[UUID, str] = {}
         self.in_use: dict[str, int] = {}  # what usage() reports
         self.forgotten: list[UUID] = []
+        self.sending_count = 0  # emails queued or sent for the ICP
+        self.detached: list[UUID] = []
 
     async def all(self) -> dict[UUID, str]:
         return dict(self.rows)
@@ -216,6 +218,12 @@ class FakeIcpCampaigns:
 
     async def usage(self, icp_id: UUID) -> dict[str, int]:
         return dict(self.in_use)
+
+    async def sending(self, icp_id: UUID) -> int:
+        return self.sending_count
+
+    async def detach(self, icp_id: UUID) -> None:
+        self.detached.append(icp_id)
 
     async def forget(self, icp_id: UUID) -> None:
         self.rows.pop(icp_id, None)

@@ -23,7 +23,7 @@ from routers.icps import create_icp
 from models import Company, SmartList, Stakeholder
 from schemas import (
     IcpCreateIn, MoveMembersIn, MoveMembersResult, SmartListCompanyOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
-    SmartListUpdateIn, SortListsIn, SortListsResult,
+    SmartListCreateIn, SmartListUpdateIn, SortListsIn, SortListsResult,
 )  # fmt: skip
 from services import smart_lists
 from services.apify import search_name
@@ -185,6 +185,28 @@ async def get_list(
                                              email_status=m.email_status, linkedin_url=m.linkedin_url, reason=member.reason))  # fmt: skip
     return SmartListDetailOut(**_out(lst, count).model_dump(), companies=companies, people=people, page=page, page_size=page_size,
                               matching=matching)  # fmt: skip
+
+
+@router.post("", response_model=SmartListOut, status_code=201, dependencies=[Depends(require_manager)])
+async def create_list(
+    body: SmartListCreateIn, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+) -> SmartListOut:
+    """An empty list to move companies or people into. Sorting also puts new ones in it when they fit."""
+    name = " ".join(body.name.split())
+    key = smart_lists.name_key(name)
+    if any(other.name_key == key for other, _ in await repo.lists(workspace_id, body.kind)):
+        raise HTTPException(status_code=409, detail="A list with this name already exists")
+    lst = await repo.get_or_create(workspace_id, body.kind, name, key)
+    await repo.save(lst)  # get_or_create leaves the commit to its caller
+    return _out(lst, 0)
+
+
+@router.delete("/{list_id}", status_code=204, dependencies=[Depends(require_manager)])
+async def delete_list(
+    list_id: UUID, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+) -> None:
+    """Delete a list. Its companies or people are kept, back in "not in a list"; an ICP created from it stays."""
+    await repo.delete(await _list(repo, workspace_id, list_id))
 
 
 @router.patch("/{list_id}", response_model=SmartListOut, dependencies=[Depends(require_manager)])
