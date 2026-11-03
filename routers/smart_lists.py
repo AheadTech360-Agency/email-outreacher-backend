@@ -192,7 +192,7 @@ async def update_list(
     list_id: UUID, body: SmartListUpdateIn, workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
 ) -> SmartListOut:  # fmt: skip
-    """Rename a list, or record the Lead Intel ICP created from its draft."""
+    """Rename a list, or set its Lead Intel ICP (created from its draft, or an existing one)."""
     lst = await _list(repo, workspace_id, list_id)
     if body.name is not None:
         key = smart_lists.name_key(body.name)
@@ -202,6 +202,9 @@ async def update_list(
     if "lead_intel_icp_id" in body.model_fields_set:
         lst.lead_intel_icp_id = body.lead_intel_icp_id
     await repo.save(lst)
+    if body.lead_intel_icp_id and lst.kind == "company":
+        # Giving a company list an ICP puts its companies (with their people) under it, where they have none yet.
+        await repo.assign_icp(workspace_id, body.lead_intel_icp_id, [c.id for c, _ in await repo.members(workspace_id, lst)])
     count = next((n for other, n in await repo.lists(workspace_id, lst.kind) if other.id == lst.id), 0)
     return _out(lst, count)
 
