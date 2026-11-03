@@ -46,7 +46,21 @@ LONG_RUNNING: dict[str, str] = {
     "/sending/campaigns/sync": "Syncing campaigns",
     "/smart-lists/sort": "Sorting smart lists",
     "/stakeholders/import-run": "Importing people",
+    "/pipeline/companies/{id}/reread": "Reading the website again",
 }
+
+
+def long_running(path: str) -> str | None:
+    """The label of the background-only endpoint at this path, if it is one. "{id}" in a registered path stands for
+    any one path segment (a company's id, say)."""
+    if path in LONG_RUNNING:
+        return LONG_RUNNING[path]
+    parts = path.strip("/").split("/")
+    for pattern, label in LONG_RUNNING.items():
+        want = pattern.strip("/").split("/")
+        if len(want) == len(parts) and all(w == "{id}" or w == p for w, p in zip(want, parts, strict=True)):
+            return label
+    return None
 
 
 # The background jobs Sales may start: sending approved emails (the Roles tab's "Send approved emails"). Every

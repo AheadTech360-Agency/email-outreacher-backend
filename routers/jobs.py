@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 
 import response_cache
-from background import LONG_RUNNING, SALES_JOBS
+from background import SALES_JOBS, long_running
 from config import get_settings
 from crud import JobRepo
 from dependencies import MANAGERS_ONLY, get_current_user, get_job_queue, get_job_repo, require_workspace_id
@@ -51,7 +51,7 @@ async def start_job(
 ) -> JobOut:
     """Start one of the long-running endpoints in the background. Who may run it is checked when it runs,
     as the person starting it, exactly as a request would be."""
-    label = LONG_RUNNING.get(body.path)
+    label = long_running(body.path)
     if label is None:
         raise HTTPException(status_code=422, detail="That doesn't run as a background job.")
     # Refused here, before it's queued (the endpoint checks again when the worker runs it as this person).

@@ -902,6 +902,19 @@ class CompanyStatusIn(ApiModel):
     status: Literal["qualified", "not_fit"]
 
 
+class RereadResult(ApiModel):
+    """Reading a company's website again: what it found (no AI used)."""
+
+    reached: bool
+    via: str | None  # own_crawl | jina
+    pages: int
+    socials: dict[str, str]
+    emails: list[str]
+    phone: str | None
+    detail: str | None
+    company: "PipelineCompanyOut"
+
+
 class CompanyDecisionIn(ApiModel):
     """Approve (qualified) or reject (not_fit) companies, from the To approve queue."""
 

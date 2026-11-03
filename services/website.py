@@ -71,6 +71,8 @@ SOCIAL_PATTERNS: dict[str, re.Pattern[str]] = {
     "tiktok": re.compile(r"https?://(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]+)", re.I),
     "youtube": re.compile(r"https?://(?:www\.)?youtube\.com/(?:@|channel/|c/|user/)([A-Za-z0-9_\-]+)", re.I),
     "x": re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/(?!intent/|share)([A-Za-z0-9_]+)", re.I),
+    "pinterest": re.compile(r"https?://(?:[a-z]{2}\.|www\.)?pinterest\.[a-z.]+/(?!pin/|pin-builder|search/)([A-Za-z0-9_]+)", re.I),
+    "threads": re.compile(r"https?://(?:www\.)?threads\.(?:net|com)/@([A-Za-z0-9_.]+)", re.I),
 }
 
 

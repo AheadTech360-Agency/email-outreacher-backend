@@ -47,6 +47,7 @@ from schemas import (
     CompanyDecisionIn,
     CompanyDecisionResult,
     CompanyStatusIn,
+    RereadResult,
     FindCompaniesIn,
     FindCompaniesResult,
     PipelineCompanyOut,
@@ -61,7 +62,7 @@ from services.apollo import SENIORITIES, ApolloClient, ApolloError
 from services.claude import cost_usd
 from services.google_places import CENTER_COST_USD, SEARCH_COST_USD, PlacesClient, PlacesError, shared_domain
 from services.identity import identity_keys
-from services.research import research_companies
+from services.research import research_companies, reread_site
 from services.scoring import CompanyScorer, PromptSpec
 from models import VERIFICATION_SOURCES, Company
 from services.website import WebsiteReader, normalize_domain
@@ -398,6 +399,28 @@ async def set_status(
     _decide(company, body.status)
     await companies.save(company)
     return PipelineCompanyOut.model_validate(company)
+
+
+@router.post("/companies/{company_id}/reread", response_model=RereadResult, dependencies=[Depends(require_manager)])
+async def reread_company(
+    company_id: UUID,
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+    reader: WebsiteReader = Depends(get_website_reader),
+) -> RereadResult:
+    """Read the company's website again for more of what it shows: socials, emails, phone, page texts. No AI and
+    nothing paid: a plain HTTP read, Jina only when the site needs a browser. Its score and status stay as they are."""
+    company = await companies.get(workspace_id, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    found = await reread_site(company, reader)
+    if found.reached:
+        await companies.save_pages(workspace_id, company.id, found.via or "own_crawl", found.pages)
+        await companies.save(company)
+    return RereadResult(
+        reached=found.reached, via=found.via, pages=len(found.pages), socials=found.socials, emails=found.emails,
+        phone=found.phone, detail=found.detail, company=PipelineCompanyOut.model_validate(company),
+    )  # fmt: skip
 
 
 def _decide(company: Company, status: str) -> None:

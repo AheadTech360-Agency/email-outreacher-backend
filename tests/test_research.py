@@ -288,3 +288,29 @@ async def test_with_auto_approve_off_every_company_waits_for_approval() -> None:
     reader = FakeReader({"inkco.com": site("inkco.com", "screen printing")})
     summary = await research_companies([high], ICP, None, reader, None, FakeScorer(95), 60, auto_approve=False)
     assert high.status == "review" and high.status_reason.startswith("Scored 95:") and summary.review == 1
+
+
+@sync
+async def test_reading_the_site_again_keeps_socials_and_contacts_but_not_the_verdict() -> None:
+    """No AI: what the site shows is kept, the score and status aren't touched."""
+    from services.research import reread_site
+
+    ink = company("Ink Co", "inkco.com")
+    ink.status, ink.score, ink.linkedin_url = "qualified", 82, "https://www.linkedin.com/company/old"
+    found = site("inkco.com", "Custom printing. Email hello@inkco.com or call (512) 555-0100",
+                 socials={"instagram": "https://instagram.com/inkco", "tiktok": "https://tiktok.com/@inkco"})  # fmt: skip
+    out = await reread_site(ink, FakeReader({"inkco.com": found}))
+    assert out.reached and (ink.status, ink.score) == ("qualified", 82)
+    assert ink.instagram_url == "https://instagram.com/inkco" and ink.linkedin_url == "https://www.linkedin.com/company/old"
+    assert out.socials["tiktok"] == "https://tiktok.com/@inkco" and "hello@inkco.com" in out.emails
+    assert ink.research["website"]["text"].startswith("Custom printing") and "reread_at" in ink.research
+    down = await reread_site(company("Gone Co", "gone.com"), FakeReader({}))
+    assert not down.reached and down.detail == "down"
+
+
+def test_background_paths_with_an_id() -> None:
+    from background import long_running
+
+    assert long_running("/pipeline/companies/7f3c/reread") == "Reading the website again"
+    assert long_running("/pipeline/research") == "Researching companies"
+    assert long_running("/pipeline/companies/7f3c/content") is None

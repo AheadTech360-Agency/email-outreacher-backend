@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from background import LONG_RUNNING, current_job
+from background import current_job, long_running
 from config import get_settings, origin_of
 from crud import (
     CompanyRepo,
@@ -143,8 +143,8 @@ async def refuse_inline(request: Request) -> None:
     """Long-running endpoints (background.LONG_RUNNING) only run in the worker: a request holding them open
     for minutes is what made pages hang. Start them with POST /jobs instead."""
     path = request.url.path.removeprefix("/api/v1")
-    if request.method == "POST" and path in LONG_RUNNING and current_job.get() is None:
-        raise HTTPException(status_code=409, detail=f"{LONG_RUNNING[path]} runs in the background: start it with POST /api/v1/jobs.")
+    if request.method == "POST" and (label := long_running(path)) and current_job.get() is None:
+        raise HTTPException(status_code=409, detail=f"{label} runs in the background: start it with POST /api/v1/jobs.")
 
 
 def get_job_queue() -> Callable[[UUID], None]:

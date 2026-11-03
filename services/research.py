@@ -276,3 +276,51 @@ async def research_companies(
 
     await asyncio.gather(*(decide(c, s) for c, s in zip(companies, sites, strict=True)))
     return summary
+
+
+@dataclass
+class Reread:
+    """What reading a company's website again found. No AI: a plain HTTP read (Jina when the site needs a browser)."""
+
+    reached: bool
+    via: str | None
+    pages: list[dict]
+    socials: dict[str, str]
+    emails: list[str]
+    phone: str | None
+    detail: str | None
+
+
+async def reread_site(company: Company, reader: WebsiteReader) -> Reread:
+    """Read the company's website again (homepage, contact, about and social pages) and keep what it shows: the
+    socials it links, the emails and phone it publishes, the page texts. Its score and status aren't touched, and a
+    social or phone already known is replaced only when the site shows one."""
+    target = company.domain or normalize_domain(company.website_url)
+    if not target:
+        return Reread(False, None, [], {}, [], None, "No website on file")
+    site = await reader.read(target)
+    if not site.reached:
+        return Reread(False, site.via, [], {}, [], None, site.detail or site.outcome.replace("_", " "))
+    found = site.socials or {}
+    company.instagram_url = found.get("instagram") or company.instagram_url
+    company.facebook_url = found.get("facebook") or company.facebook_url
+    company.linkedin_url = found.get("linkedin") or company.linkedin_url
+    company.twitter_url = found.get("x") or company.twitter_url
+    contacts = extract_contacts(site.pages, site.mailtos, site.tels, site.owner_names, company.domain)
+    company.phone = contacts.phone or company.phone
+    research = dict(company.research or {})
+    research["website"] = {
+        **(research.get("website") or {}),
+        "outcome": site.outcome, "via": site.via, "url": site.resolved_url, "title": site.title, "text": site.text,
+        "detail": site.detail, "pages": [{k: v for k, v in page.items() if k != "text"} for page in site.pages],
+    }  # fmt: skip
+    research["socials"] = {k: v for k, v in {
+        "instagram": company.instagram_url, "facebook": company.facebook_url, "linkedin": company.linkedin_url, "x": company.twitter_url,
+        **{k: v for k, v in found.items() if k not in ("instagram", "facebook", "linkedin", "x")},
+    }.items() if v}  # fmt: skip
+    if not contacts.empty:
+        research["contacts"] = contacts.as_dict()
+    research["reread_at"] = datetime.now(UTC).isoformat()
+    company.research = research
+    return Reread(True, site.via or "own_crawl", site.pages, research["socials"], list(contacts.as_dict().get("all_emails") or []),
+                  company.phone, None)  # fmt: skip
