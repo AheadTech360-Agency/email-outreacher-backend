@@ -42,6 +42,7 @@ from dependencies import (
 )
 from lead_intel import LeadIntelRepo
 from routers.smart_lists import recorder, sort_context, sort_out
+from services import exports
 from services.auth import CurrentUser
 from schemas import (
     ImportRunIn,
@@ -322,6 +323,43 @@ async def list_stakeholders(
     people = await stakeholders.list(workspace_id, company_id, icp_id)
     queued = await stakeholders.queued_at([s.lead_id for s in people if s.lead_id])
     return [StakeholderOut.model_validate(s).model_copy(update={"queued_at": queued.get(s.lead_id)}) for s in people]
+
+
+@router.get("/export.csv", response_class=Response)
+async def export_people(
+    workspace_id: UUID = Depends(require_workspace_id),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    lists: SmartListRepo = Depends(get_smart_list_repo),
+) -> Response:
+    """The People page as a CSV: who they are, their email, ICP, smart list, and whether they're a lead (queued)."""
+    people = await stakeholders.list(workspace_id, None, None)
+    queued = await stakeholders.queued_at([p.lead_id for p in people if p.lead_id])
+    icps = {i["id"]: i["name"] for i in await lead_intel.list_icps()}
+    smart = await lists.list_names(workspace_id, "person", [p.id for p in people])
+    companies = await lists.companies(workspace_id, list({p.company_id for p in people if p.company_id}))
+    body = exports.write(exports.PEOPLE_COLUMNS, [
+        exports.person_row(
+            p, (companies[p.company_id].name if p.company_id in companies else p.organization_name) or "",
+            icps.get(p.lead_intel_icp_id, ""), smart.get(p.id, ""), queued.get(p.lead_id),
+        )
+        for p in people
+    ])  # fmt: skip
+    return Response(content=body, media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="people.csv"'})
+
+
+@router.get("/{stakeholder_id}", response_model=StakeholderOut)
+async def get_stakeholder(
+    stakeholder_id: UUID,
+    workspace_id: UUID = Depends(require_workspace_id),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+) -> StakeholderOut:
+    """One person, for their own page."""
+    [person] = await stakeholders.get_many(workspace_id, [stakeholder_id]) or [None]
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    queued = await stakeholders.queued_at([person.lead_id] if person.lead_id else [])
+    return StakeholderOut.model_validate(person).model_copy(update={"queued_at": queued.get(person.lead_id)})
 
 
 @router.post("/search-linkedin", response_model=StakeholderSearchResult, dependencies=[Depends(require_manager)])

@@ -13,11 +13,13 @@ Lead Intel is only read here.
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from config import get_settings
-from crud import PRODUCT_FIELDS, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
+from services import exports
+from crud import PRODUCT_FIELDS, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
 from dependencies import (
+    get_smart_list_repo,
     get_company_repo,
     get_exclusion_repo,
     get_icp_profile_repo,
@@ -85,11 +87,32 @@ async def _workspace(companies: CompanyRepo, workspace_id: UUID) -> None:
 @router.get("/companies", response_model=list[PipelineCompanyOut])
 async def list_companies(
     icp_id: UUID | None = Query(default=None, alias="icpId"),
-    status: str | None = Query(default=None, pattern="^(found|qualified|not_fit|error)$"),
+    status: str | None = Query(default=None, pattern="^(found|review|qualified|not_fit|error)$"),
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
 ) -> list[PipelineCompanyOut]:
     return [PipelineCompanyOut.model_validate(c) for c in await companies.list(workspace_id, icp_id, status)]
+
+
+@router.get("/companies.csv", response_class=Response)
+async def export_companies(
+    icp_id: UUID | None = Query(default=None, alias="icpId"),
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    lists: SmartListRepo = Depends(get_smart_list_repo),
+) -> Response:
+    """The Companies page as a CSV (all of them, or one ICP's): research, score, ICP, smart list and people found."""
+    rows = await companies.list(workspace_id, icp_id, None)
+    icps = {i["id"]: i["name"] for i in await lead_intel.list_icps()}
+    smart = await lists.list_names(workspace_id, "company", [c.id for c in rows])
+    people: dict[UUID, int] = {}
+    for p in await lists.people_at(workspace_id, [c.id for c in rows]):
+        people[p.company_id] = people.get(p.company_id, 0) + 1
+    body = exports.write(exports.COMPANY_COLUMNS, [
+        exports.company_row(c, icps.get(c.icp_id, ""), smart.get(c.id, ""), people.get(c.id, 0)) for c in rows
+    ])  # fmt: skip
+    return Response(content=body, media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="companies.csv"'})
 
 
 @router.post("/find", response_model=FindCompaniesResult, dependencies=[Depends(require_manager)])
@@ -332,6 +355,17 @@ async def research(
         summary_total.cost_usd = round(summary_total.cost_usd + summary.apify_cost_usd, 4)
         summary_total.notes += summary.notes
     return summary_total
+
+
+@router.get("/companies/{company_id}", response_model=PipelineCompanyOut)
+async def get_company(
+    company_id: UUID, workspace_id: UUID = Depends(require_workspace_id), companies: CompanyRepo = Depends(get_company_repo)
+) -> PipelineCompanyOut:
+    """One company, for its own page."""
+    company = await companies.get(workspace_id, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return PipelineCompanyOut.model_validate(company)
 
 
 @router.get("/companies/{company_id}/content", response_model=CompanyContentOut)
