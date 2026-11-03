@@ -39,6 +39,9 @@ class FakeApollo:
 
 
 class FakeStakeholders:
+    async def queued_at(self, lead_ids):
+        return {}
+
     def __init__(self) -> None:
         self.rows: dict = {}
 

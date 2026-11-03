@@ -230,6 +230,8 @@ class LeadOut(ApiModel):
     # How many of their own posts are stored (from Fetch posts or Enrich).
     post_count: int = 0
     created_at: datetime
+    # When their first email was queued for sending: only then do they count as a lead (the Leads page).
+    queued_at: datetime | None = None
 
 
 class ColumnMapping(ApiModel):
@@ -660,6 +662,8 @@ class StakeholderOut(ApiModel):
     revealed_at: datetime | None
     lead_id: UUID | None
     found_at: datetime
+    # When their first email was queued: a person counts as a lead only from then.
+    queued_at: datetime | None = None
 
 
 class StakeholderSearchIn(ApiModel):

@@ -299,6 +299,17 @@ class LeadRepo:
     async def get(self, workspace_id: UUID, lead_id: UUID) -> Lead | None:
         return await self.session.scalar(select(Lead).where(Lead.workspace_id == workspace_id, Lead.id == lead_id))
 
+    async def queued_at(self, lead_ids: list[UUID]) -> dict[UUID, datetime]:
+        """When each of these leads had its first email queued for sending (leads never queued are left out)."""
+        if not lead_ids:
+            return {}
+        rows = await self.session.execute(
+            select(Email.lead_id, func.min(func.coalesce(Email.queued_at, Email.updated_at)))
+            .where(Email.lead_id.in_(lead_ids), Email.step == 1, Email.sequencer_campaign_id.is_not(None))
+            .group_by(Email.lead_id)
+        )
+        return dict(rows.all())
+
     async def post_counts(self, lead_ids: list[UUID]) -> dict[UUID, int]:
         """How many posts each of these leads has (their own, not their company's)."""
         if not lead_ids:
@@ -938,6 +949,10 @@ class StakeholderRepo:
         if person.email and known.revealed_at is None:
             known.revealed_at = func.now()
         return known, False
+
+    async def queued_at(self, lead_ids: list[UUID]) -> dict[UUID, datetime]:
+        """When each of these people's leads had its first email queued (see LeadRepo.queued_at)."""
+        return await LeadRepo(self.session).queued_at(lead_ids)
 
     async def import_batch(
         self, workspace_id: UUID, icp_id: UUID | None, items: list[tuple[Any, Company | None]], origin: str,

@@ -22,6 +22,9 @@ class FakeLeadRepo:
     async def workspace_exists(self, workspace_id):
         return workspace_id == WORKSPACE_ID
 
+    async def queued_at(self, lead_ids):
+        return {}
+
     async def post_counts(self, lead_ids):
         return {}
 

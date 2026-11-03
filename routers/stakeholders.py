@@ -319,7 +319,9 @@ async def list_stakeholders(
     workspace_id: UUID = Depends(require_workspace_id),
     stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
 ) -> list[StakeholderOut]:
-    return [StakeholderOut.model_validate(s) for s in await stakeholders.list(workspace_id, company_id, icp_id)]
+    people = await stakeholders.list(workspace_id, company_id, icp_id)
+    queued = await stakeholders.queued_at([s.lead_id for s in people if s.lead_id])
+    return [StakeholderOut.model_validate(s).model_copy(update={"queued_at": queued.get(s.lead_id)}) for s in people]
 
 
 @router.post("/search-linkedin", response_model=StakeholderSearchResult, dependencies=[Depends(require_manager)])

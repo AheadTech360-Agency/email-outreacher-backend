@@ -58,7 +58,8 @@ async def list_leads(
 ) -> Page[LeadOut]:
     rows, total = await leads.list(workspace_id, icp_id, status, q, limit, offset)
     posts = await leads.post_counts([r.id for r in rows])
-    items = [LeadOut.model_validate(r).model_copy(update={"post_count": posts.get(r.id, 0)}) for r in rows]
+    queued = await leads.queued_at([r.id for r in rows])
+    items = [LeadOut.model_validate(r).model_copy(update={"post_count": posts.get(r.id, 0), "queued_at": queued.get(r.id)}) for r in rows]
     return Page[LeadOut](items=items, total=total, limit=limit, offset=offset)
 
 
