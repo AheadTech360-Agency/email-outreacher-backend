@@ -16,7 +16,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from config import get_settings
-from services import exports
+from services import exports, record_data
 from crud import PRODUCT_FIELDS, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
 from dependencies import (
     get_smart_list_repo,
@@ -47,6 +47,7 @@ from schemas import (
     CompanyDecisionIn,
     CompanyDecisionResult,
     CompanyStatusIn,
+    PipelineCompanyDetailOut,
     RereadResult,
     FindCompaniesIn,
     FindCompaniesResult,
@@ -358,15 +359,20 @@ async def research(
     return summary_total
 
 
-@router.get("/companies/{company_id}", response_model=PipelineCompanyOut)
+@router.get("/companies/{company_id}", response_model=PipelineCompanyDetailOut)
 async def get_company(
-    company_id: UUID, workspace_id: UUID = Depends(require_workspace_id), companies: CompanyRepo = Depends(get_company_repo)
-) -> PipelineCompanyOut:
-    """One company, for its own page."""
+    company_id: UUID,
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+    lists: SmartListRepo = Depends(get_smart_list_repo),
+) -> PipelineCompanyDetailOut:
+    """One company, for its own page, with everything stored about it (its record and its people's Apollo columns)."""
     company = await companies.get(workspace_id, company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-    return PipelineCompanyOut.model_validate(company)
+    people = await lists.people_at(workspace_id, [company.id])
+    data = record_data.company_groups(company.raw, [p.raw for p in people])
+    return PipelineCompanyDetailOut.model_validate(company).model_copy(update={"data": data})
 
 
 @router.get("/companies/{company_id}/content", response_model=CompanyContentOut)

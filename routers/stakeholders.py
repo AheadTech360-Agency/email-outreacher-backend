@@ -42,7 +42,7 @@ from dependencies import (
 )
 from lead_intel import LeadIntelRepo
 from routers.smart_lists import recorder, sort_context, sort_out
-from services import exports
+from services import exports, record_data
 from services.auth import CurrentUser
 from schemas import (
     ImportRunIn,
@@ -58,6 +58,7 @@ from schemas import (
     IcpSearchIn,
     IcpSearchResult,
     RevealOutcome,
+    StakeholderDetailOut,
     StakeholderOut,
     StakeholderRevealIn,
     StakeholderRevealResult,
@@ -348,7 +349,7 @@ async def export_people(
     return Response(content=body, media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="people.csv"'})
 
 
-@router.get("/{stakeholder_id}", response_model=StakeholderOut)
+@router.get("/{stakeholder_id}", response_model=StakeholderDetailOut)
 async def get_stakeholder(
     stakeholder_id: UUID,
     workspace_id: UUID = Depends(require_workspace_id),
@@ -359,7 +360,9 @@ async def get_stakeholder(
     if person is None:
         raise HTTPException(status_code=404, detail="Person not found")
     queued = await stakeholders.queued_at([person.lead_id] if person.lead_id else [])
-    return StakeholderOut.model_validate(person).model_copy(update={"queued_at": queued.get(person.lead_id)})
+    return StakeholderDetailOut.model_validate(person).model_copy(
+        update={"queued_at": queued.get(person.lead_id), "data": record_data.person_groups(person.raw)}
+    )
 
 
 @router.post("/search-linkedin", response_model=StakeholderSearchResult, dependencies=[Depends(require_manager)])

@@ -666,6 +666,12 @@ class StakeholderOut(ApiModel):
     queued_at: datetime | None = None
 
 
+class StakeholderDetailOut(StakeholderOut):
+    """A person for their page: everything stored about them, grouped ({group: {label: value}})."""
+
+    data: dict[str, dict[str, str]] = {}
+
+
 class StakeholderSearchIn(ApiModel):
     company_ids: list[UUID] = Field(min_length=1, max_length=25)
     titles: list[str] = Field(default=[], max_length=30)
@@ -879,6 +885,12 @@ class PipelineCompanyOut(ApiModel):
     research: dict[str, Any] | None
     researched_at: datetime | None
     created_at: datetime
+
+
+class PipelineCompanyDetailOut(PipelineCompanyOut):
+    """A company for its page: everything stored about it, grouped ({group: {label: value}})."""
+
+    data: dict[str, dict[str, str]] = {}
 
 
 class ResearchIn(ApiModel):
