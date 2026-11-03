@@ -1305,6 +1305,13 @@ class PostRepo:
         query = select(Post).where(Post.workspace_id == workspace_id, or_(*owners))
         return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id).limit(limit)))
 
+    async def of_owner(self, workspace_id: UUID, owner: str, network: str) -> list[Post]:
+        """The posts of this network stored for an owner ("lead:<id>" or "company:<id>"), newest first."""
+        kind, _, raw_id = owner.partition(":")
+        column = Post.lead_id if kind == "lead" else Post.company_id
+        query = select(Post).where(Post.workspace_id == workspace_id, column == UUID(raw_id), Post.source == network)
+        return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id)))
+
     async def count_source(self, workspace_id: UUID, owner: str, network: str) -> int:
         """Posts of this network already stored for an owner ("lead:<id>" or "company:<id>")."""
         kind, _, raw_id = owner.partition(":")

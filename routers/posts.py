@@ -65,8 +65,8 @@ async def fetch_posts(
         await calls.record(workspace_id, "claude", "messages", "succeeded", model=JUDGE_MODEL, cost_usd=cost, action="Fetch posts")
 
     outcome = await gather(
-        targets=targets, stages=stages, max_posts=body.max_posts, since=since, apify=apify, claude=claude, stored=stored,
-        stored_count=lambda owner, network: posts.count_source(workspace_id, owner, network),
+        targets=targets, stages=stages, max_posts=body.max_posts, since=since, apify=apify, claude=claude,
+        owner_posts=lambda owner, network: posts.of_owner(workspace_id, owner, network),
         save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
         record_claude=record_claude, progress=report,
     )  # fmt: skip
@@ -137,8 +137,8 @@ async def gather_posts(
 
     since = datetime.now(UTC) - timedelta(days=body.max_age_days)
     outcome = await gather(
-        targets=targets, stages=list(body.sources), max_posts=body.max_posts, since=since, apify=apify, claude=claude, stored=stored,
-        stored_count=lambda owner, network: posts.count_source(workspace_id, owner, network),
+        targets=targets, stages=list(body.sources), max_posts=body.max_posts, since=since, apify=apify, claude=claude,
+        owner_posts=lambda owner, network: posts.of_owner(workspace_id, owner, network),
         save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
         record_claude=record_claude, progress=report,
     )  # fmt: skip
@@ -147,7 +147,8 @@ async def gather_posts(
         kind, shown = who[o.lead_id]
         results.append(GatheredFor(
             kind=kind, id=shown, company_linkedin=o.counts.get("company_linkedin"), linkedin=o.counts.get("person_linkedin"),
-            instagram=o.counts.get("company_instagram"), new=o.new, enough=o.enough, stopped_at=o.stopped_at, reason=o.reason,
+            instagram=o.counts.get("company_instagram"), new=o.new, enough=o.enough, stopped_at=o.stopped_at,
+            enough_in=o.enough_in, reason=o.reason,
         ))  # fmt: skip
     for t in targets:
         if t.lead is not None and not outcome.error and t.lead.status in REFRESHABLE:

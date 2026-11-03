@@ -1,17 +1,16 @@
-"""Posts for leads, gathered only until there's enough to write a personal opening line.
+"""Posts for people and companies, read source by source, each only as far as it's needed.
 
-Three sources, in order, each tried only for the leads still short of material after the one before:
+Three sources, read in this order, each one ticked on its own:
   1. the company's LinkedIn page,
   2. the person's own LinkedIn,
   3. the company's Instagram (the account its website links, never a personal one).
 
-Each stage is one Apify run for the whole batch (a company shared by several leads is scraped once), fetching a
-few posts per profile. The scrapers can't start from the second post, so asking again for more would pay for the
-first ones twice; a small batch per source is the cheapest way. Posts already stored are used and never bought
-again: the company Instagram posts research read, or a company another lead at it already had scraped.
-
-After each stage Claude reads each lead's posts so far and says whether there's enough; a lead with enough is
-done and costs nothing more. Every post found is kept and used when the email is written.
+Every ticked source is read, whatever the ones before it gave. Within a source: a first look of a couple of posts,
+then Claude says whether they're enough to write with; only where they aren't is the source read up to the limit.
+(The scrapers can't start from the third post, so that second read pays again for the first ones; most profiles
+stop at the first look.) Each read is one Apify run for the whole batch, and a company shared by several people is
+read and judged once. Posts already stored are used and never bought again. Every post found is used when the
+email is written.
 """
 
 from collections.abc import Awaitable, Callable
@@ -27,6 +26,7 @@ from services.apify import INSTAGRAM_ACTOR, LINKEDIN_POSTS_ACTOR, ApifyError, Fe
 from services.claude import cost_usd, error_message
 
 JUDGE_MODEL = "claude-haiku-5-5"
+FIRST_LOOK = 2  # posts read from a source before Claude's check; more only if they weren't enough
 POST_CHARS = 600  # of each post Claude reads while judging
 
 # (stage, network, whose posts)
@@ -69,8 +69,10 @@ class LeadOutcome:
     lead_id: UUID
     counts: dict[str, int | None] = field(default_factory=dict)  # stage -> posts found; None: no URL for it
     new: int = 0
-    enough: bool = False
-    stopped_at: str | None = None  # the stage that gave enough
+    enough: bool = False  # Claude found enough in at least one source
+    stopped_at: str | None = None  # the first source that gave enough
+    enough_in: list[str] = field(default_factory=list)  # every source that gave enough
+    notes: list[str] = field(default_factory=list)  # Claude's word on each source
     reason: str = ""
 
 
@@ -154,92 +156,102 @@ async def gather(
     since: datetime,
     apify: Any,
     claude: anthropic.AsyncAnthropic | None,
-    stored: Callable[[Any], Awaitable[list[Any]]],
-    stored_count: Callable[[str, str], Awaitable[int]],
+    owner_posts: Callable[[str, str], Awaitable[list[Any]]],
     save: Callable[[str, list[FetchedPost]], Awaitable[int]],
     record_apify: Callable[[str, Any, str], Awaitable[None]],
     record_claude: Callable[[float], Awaitable[None]],
     progress: Callable[[str], Awaitable[None]] | None = None,
 ) -> FetchOutcome:
-    """Run the stages for these leads. `stored(target)`: the lead's and its company's posts, newest first.
-    `stored_count(owner, network)`: how many posts of that network are already stored for that owner. `save(owner, posts)`:
-    store them, returns how many were new. Without Claude every stage runs (no judging)."""
+    """Read each ticked source for these people or companies, each source on its own: a first look of a couple of
+    posts, Claude's check on them, and up to `max_posts` only where that wasn't enough. Every ticked source is read,
+    whatever the ones before it gave. `owner_posts(owner, network)`: the posts of that network stored for an owner
+    ("lead:<id>" or "company:<id>"), newest first. `save(owner, posts)`: store them, returns how many were new.
+    Without Claude every source is read up to the limit."""
     out = {t.key: LeadOutcome(t.key) for t in targets}
     result = FetchOutcome(list(out.values()))
-    pending = list(targets)
+    first = min(FIRST_LOOK, max_posts) if claude is not None else max_posts
+
+    async def fetch(network: str, wanted: dict[str, str], limit: int) -> bool:
+        """Scrape these owners' profiles (owner -> URL) for up to `limit` posts each, and store them."""
+        actor = LINKEDIN_POSTS_ACTOR if network == "linkedin" else INSTAGRAM_ACTOR
+        call = apify.linkedin_posts if network == "linkedin" else apify.instagram_posts
+        try:
+            fetched, run = await call(list(dict.fromkeys(wanted.values())), limit, since)
+        except ApifyError as exc:
+            await record_apify(actor, None, "failed")
+            result.error = exc.message
+            return False
+        await record_apify(actor, run, "succeeded")
+        result.apify_cost_usd += run.cost_usd or 0.0
+        by_key = {_match_key(network, url): owner for owner, url in wanted.items()}
+        grouped: dict[str, list[FetchedPost]] = {owner: [] for owner in wanted}
+        for post in fetched:
+            owner = by_key.get(post.owner_key or "") or (next(iter(wanted)) if len(wanted) == 1 else None)
+            if owner:
+                grouped[owner].append(post)
+        for owner, posts in grouped.items():
+            new_posts[owner] = new_posts.get(owner, 0) + await save(owner, posts)
+        return True
+
+    new_posts: dict[str, int] = {}
     for stage, network, _whose in STAGES:
-        if stage not in stages or not pending or result.error:
+        if stage not in stages or result.error:
             continue
         if progress:
             await progress(f"Reading {STAGE_LABEL[stage]}")
-        # Who has something to read at this stage, and which profiles still need scraping.
-        to_scrape: dict[str, str] = {}  # owner -> URL
-        have: dict[str, int] = {}  # owner -> posts already stored, used as they are
-        readers: list[Target] = []
-        for t in pending:
+        owners: dict[str, str] = {}  # owner -> URL
+        speaker: dict[str, Target] = {}  # owner -> a target it belongs to, for Claude's check
+        for t in targets:
             src = _source(stage, t)
             if src is None:
                 out[t.key].counts[stage] = None
                 continue
             owner, url = src
-            readers.append(t)
-            if owner not in to_scrape and owner not in have:
-                if n := await stored_count(owner, network):
-                    have[owner] = n
-                else:
-                    to_scrape[owner] = url
-        if to_scrape:
-            urls = list(dict.fromkeys(to_scrape.values()))
-            actor = LINKEDIN_POSTS_ACTOR if network == "linkedin" else INSTAGRAM_ACTOR
-            try:
-                fetch = apify.linkedin_posts if network == "linkedin" else apify.instagram_posts
-                fetched, run = await fetch(urls, max_posts, since)
-            except ApifyError as exc:
-                await record_apify(actor, None, "failed")
-                result.error = exc.message
-                break
-            await record_apify(actor, run, "succeeded")
-            result.apify_cost_usd += run.cost_usd or 0.0
-            by_key = {_match_key(network, url): owner for owner, url in to_scrape.items()}
-            grouped: dict[str, list[FetchedPost]] = {owner: [] for owner in to_scrape}
-            for post in fetched:
-                owner = by_key.get(post.owner_key or "") or (next(iter(to_scrape)) if len(to_scrape) == 1 else None)
-                if owner:
-                    grouped[owner].append(post)
-            new_by_owner = {owner: await save(owner, posts) for owner, posts in grouped.items()}
-            found_by_owner = {owner: len(posts) for owner, posts in grouped.items()}
-        else:
-            new_by_owner, found_by_owner = {}, {}
-        reading = {t.key for t in readers}
-        still: list[Target] = [t for t in pending if t.key not in reading]  # nothing new to judge at this stage
-        for t in readers:
-            owner, _ = _source(stage, t)
-            out[t.key].counts[stage] = found_by_owner.get(owner, have.get(owner, 0))
-            out[t.key].new += new_by_owner.get(owner, 0) if owner.startswith("lead:") else 0
-        for t in readers:
-            o = out[t.key]
-            if claude is None:
-                still.append(t)
-                continue
-            verdict, cost, error = await judge(claude, t.lead, t.company, await stored(t))
-            if cost:
-                result.claude_cost_usd += cost
-                await record_claude(cost)
-            if error:
-                result.error = error
-                still.append(t)
-                continue
-            o.reason = verdict.reason
-            if verdict.enough:
-                o.enough, o.stopped_at = True, stage
-            else:
-                still.append(t)
-        pending = still
-        if result.error:
+            owners.setdefault(owner, url)
+            speaker.setdefault(owner, t)
+        if not owners:
+            continue
+        # 1. A first look, where fewer than that are stored.
+        have = {owner: len(await owner_posts(owner, network)) for owner in owners}
+        look = {o: u for o, u in owners.items() if have[o] < first}
+        if look and not await fetch(network, look, first):
             break
+        # 2. Claude's check on each profile's posts from this source; where it isn't enough, read up to the limit.
+        verdicts: dict[str, Enough | None] = {}
+        if claude is not None:
+            for owner in owners:
+                t = speaker[owner]
+                posts = (await owner_posts(owner, network))[:max_posts]
+                verdict, cost, error = await judge(claude, t.lead if owner.startswith("lead:") else None, t.company, posts)
+                if cost:
+                    result.claude_cost_usd += cost
+                    await record_claude(cost)
+                if error:
+                    result.error = error
+                    break
+                verdicts[owner] = verdict
+            if result.error:
+                break
+        more = {o: u for o, u in owners.items()
+                if not (verdicts.get(o) and verdicts[o].enough) and max_posts > first and len(await owner_posts(o, network)) < max_posts}  # fmt: skip
+        if more and not await fetch(network, more, max_posts):
+            break
+        for t in targets:
+            src = _source(stage, t)
+            if src is None:
+                continue
+            owner, _ = src
+            o = out[t.key]
+            o.counts[stage] = min(len(await owner_posts(owner, network)), max_posts)
+            o.new += new_posts.get(owner, 0) if owner.startswith("lead:") else 0
+            verdict = verdicts.get(owner)
+            if verdict and verdict.enough:
+                o.enough_in.append(stage)
+                o.enough = True
+                o.stopped_at = o.stopped_at or stage
+            o.notes.append(f"{STAGE_LABEL[stage]}: {verdict.reason if verdict else 'read up to the limit'}")
     for o in out.values():
-        if o.stopped_at is None and not o.reason:
-            o.reason = "no posts found"
+        o.reason = "; ".join(o.notes) or "no posts found"
     result.apify_cost_usd = round(result.apify_cost_usd, 4)
     result.claude_cost_usd = round(result.claude_cost_usd, 6)
     return result

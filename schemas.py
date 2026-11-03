@@ -806,6 +806,7 @@ class GatheredFor(ApiModel):
     new: int = 0
     enough: bool = False
     stopped_at: str | None = None
+    enough_in: list[str] = []  # every source that gave enough
     reason: str = ""
 
 

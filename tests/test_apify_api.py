@@ -142,6 +142,10 @@ class FakePosts:
     async def stored(self, ws, lead_id, company_id, limit=20):
         return [x for x in self.posts if x.lead_id == lead_id or (company_id and x.company_id == company_id)]
 
+    async def of_owner(self, ws, owner, network):
+        col, raw = self._owner(owner)
+        return [x for x in self.posts if str(getattr(x, col)) == raw and x.source == network]
+
     async def count_source(self, ws, owner, network):
         col, raw = self._owner(owner)
         return sum(1 for x in self.posts if str(getattr(x, col)) == raw and x.source == network)
@@ -211,57 +215,50 @@ def fetch(client, *leads, **body):
     return client.post("/api/v1/posts/fetch", json={"leadIds": [str(x.id) for x in leads], **body}, headers=WS).json()
 
 
-def test_company_linkedin_first_and_only_those_still_short_go_on(client, posts_env) -> None:
-    """Ink Co's page has a launch: Ava is done. Tee Shop's page is only promos: Bo's own LinkedIn is read, and has one."""
+def li(url, owner, text):
+    x = post("linkedin", url, owner)
+    x.text = text
+    return x
+
+
+def ig(url, owner, text):
+    x = post("instagram", url, owner)
+    x.text = text
+    return x
+
+
+def test_every_ticked_source_is_read_even_after_one_gave_enough(client, posts_env) -> None:
+    """Ink Co's page has a launch in the first look: that source stops at 2 posts, but Ava's own LinkedIn and the
+    company Instagram are still read (each source is its own choice)."""
     e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco"), post("linkedin", "https://li/2", "teeshop")]
-    e.apify.linkedin_items[0].text = "We launch our spring collection Friday"
-    e.apify.linkedin_items[1].text = "Sale ends Sunday"
-    calls = []
-    original = e.apify.linkedin_posts
+    e.apify.linkedin_items = [li("https://li/1", "inkco", "We launch our spring collection Friday")]
+    e.apify.instagram_items = [ig("https://ig/1", "inkco", "New tees")]
+    result = fetch(client, e.ava, maxPosts=5)
+    r = result["results"][0]
+    calls = [(c[0], c[2]) for c in e.apify.calls]
+    # Company LinkedIn: a first look of 2, enough, no second read. Ava's LinkedIn and Instagram: first look, not enough, up to 5.
+    assert calls[0] == ("linkedin", 2) and ("linkedin", 5) in calls[1:] and ("instagram", 2) in calls and ("instagram", 5) in calls
+    assert sum(1 for c in calls if c == ("linkedin", 2)) == 2  # company page, then Ava's own
+    assert r["enough"] and r["stoppedAt"] == "company_linkedin" and "company LinkedIn: a launch" in r["reason"]
+    assert result["error"] is None and e.ava.status == "enriched"
 
-    async def linkedin_posts(urls, max_posts, since):
-        calls.append(tuple(urls))
-        if len(calls) == 2:
-            e.apify.linkedin_items = [post("linkedin", "https://li/3", "bo-chen")]
-            e.apify.linkedin_items[0].text = "Big launch: we opened a second shop"
-        return await original(urls, max_posts, since)
 
-    e.apify.linkedin_posts = linkedin_posts
-    result = fetch(client, e.ava, e.bo, e.nobody, maxPosts=3)
-    by = {r["leadId"]: r for r in result["results"]}
-    # Stage 1 reads both company pages in one run; stage 2 only Bo's profile; Instagram is never needed.
-    assert calls == [("https://www.linkedin.com/company/inkco/", "https://www.linkedin.com/company/teeshop/"), ("https://linkedin.com/in/bo-chen/",)]
-    assert not any(c[0] == "instagram" for c in e.apify.calls)
-    assert (by[str(e.ava.id)]["enough"], by[str(e.ava.id)]["stoppedAt"]) == (True, "company_linkedin")
-    assert (by[str(e.bo.id)]["enough"], by[str(e.bo.id)]["stoppedAt"], by[str(e.bo.id)]["linkedin"]) == (True, "person_linkedin", 1)
-    assert by[str(e.nobody.id)]["companyLinkedin"] is None and e.nobody.status == "approved"
-    assert e.ava.status == "enriched" and result["claudeCostUsd"] > 0 and result["error"] is None
+def test_a_source_that_isnt_enough_at_first_is_read_up_to_the_limit(client, posts_env) -> None:
+    e = posts_env
+    e.apify.linkedin_items = [li("https://li/1", "teeshop", "Sale ends Sunday"), li("https://li/2", "teeshop", "Promo")]
+    result = fetch(client, e.bo, maxPosts=4, sources=["linkedin"])
+    reads = [c for c in e.apify.calls if c[1] == ("https://www.linkedin.com/company/teeshop/",)]
+    assert [c[2] for c in reads] == [2, 4]  # the first look, then up to the limit
+    assert result["results"][0]["enough"] is False
 
 
 def test_stored_posts_are_read_and_not_bought_again(client, posts_env) -> None:
     e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
-    e.apify.linkedin_items[0].text = "Happy holidays"
-    # Research already stored Ink Co's Instagram posts: they're read, not scraped again.
-    e.repo.posts.append(SimpleNamespace(lead_id=None, company_id=e.ink.id, source="instagram", url="https://ig/0",
-                                        text="New launch drop today", posted_at=None, is_repost=False))  # fmt: skip
-    result = fetch(client, e.ava)
-    r = result["results"][0]
-    # Claude reads every stored post at each check, so the stored Instagram post already gives enough.
-    assert (r["enough"], r["stoppedAt"]) == (True, "company_linkedin")
-    assert not any(c[0] == "instagram" for c in e.apify.calls)
-
-
-def test_company_instagram_is_scraped_when_nothing_else_is_enough(client, posts_env) -> None:
-    e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
-    e.apify.linkedin_items[0].text = "Happy holidays"
-    e.apify.instagram_items = [post("instagram", "https://ig/1", "inkco")]
-    e.apify.instagram_items[0].text = "Launch day for our new tees"
-    r = fetch(client, e.ava)["results"][0]
-    assert (r["enough"], r["stoppedAt"], r["instagram"]) == (True, "company_instagram", 1)
-    assert [c[1] for c in e.apify.calls if c[0] == "instagram"] == [("https://instagram.com/inkco",)]
+    for i in (1, 2):  # research already stored two of Ink Co's Instagram posts
+        e.repo.posts.append(SimpleNamespace(lead_id=None, company_id=e.ink.id, source="instagram", url=f"https://ig/{i}",
+                                            text="New launch drop today", posted_at=None, is_repost=False))  # fmt: skip
+    fetch(client, e.ava, sources=["instagram"])
+    assert not any(c[0] == "instagram" for c in e.apify.calls)  # enough already stored: nothing bought
 
 
 def test_nothing_anywhere_marks_no_content(client, posts_env) -> None:
@@ -271,12 +268,8 @@ def test_nothing_anywhere_marks_no_content(client, posts_env) -> None:
 
 def test_apify_failure_is_reported_and_statuses_untouched(client, posts_env) -> None:
     e = posts_env
-    e.apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
-    e.apify.linkedin_items[0].text = "promo"
     e.apify.error = ApifyError("Apify says the account is out of credit", 402)
-    e.bo.linkedin_url = None
-    e.repo.companies.pop(e.bo.id)
-    result = fetch(client, e.ava)
+    result = fetch(client, e.ava, sources=["instagram"])
     assert result["error"] == "Apify says the account is out of credit" and e.ava.status == "imported"
 
 
@@ -305,35 +298,32 @@ def test_emails_can_be_left_out_to_pay_less(client, apify, apollo_env) -> None: 
     assert apify.calls[-1][-1] is False
 
 
-def test_a_company_on_its_own_reads_its_linkedin_then_its_instagram() -> None:
-    """From the Companies page: no person, so their LinkedIn is skipped; Claude stops as soon as there's enough."""
+def test_a_company_on_its_own_reads_its_linkedin_and_its_instagram() -> None:
+    """From the Companies page: no person, so their LinkedIn is skipped; both company sources are read."""
     from services.smart_posts import Target, gather
 
     ink = company("Ink Co", "https://www.linkedin.com/company/inkco/", "https://instagram.com/inkco")
     stored_posts: list = []
     apify = FakeApify()
-    apify.linkedin_items = [post("linkedin", "https://li/1", "inkco")]
-    apify.linkedin_items[0].text = "Happy holidays"
-    apify.instagram_items = [post("instagram", "https://ig/1", "inkco")]
-    apify.instagram_items[0].text = "Launch of our new tees"
+    apify.linkedin_items = [li("https://li/1", "inkco", "Our launch party")]
+    apify.instagram_items = [ig("https://ig/1", "inkco", "Launch of our new tees")]
 
-    async def stored(t):
-        return list(stored_posts)
-
-    async def count(owner, network):
-        return 0
+    async def owner_posts(owner, network):
+        return [x for x in stored_posts if x.source == network]
 
     async def save(owner, found):
+        known = {x.url for x in stored_posts}
+        new = [f for f in found if f.url not in known]
         stored_posts.extend(SimpleNamespace(company_id=ink.id, lead_id=None, source=f.source, url=f.url, text=f.text, posted_at=None,
-                                            is_repost=False) for f in found)  # fmt: skip
-        return len(found)
+                                            is_repost=False) for f in new)  # fmt: skip
+        return len(new)
 
     async def nothing(*args):
         pass
 
-    out = asyncio.run(gather(targets=[Target(None, ink)], stages=["company_linkedin", "person_linkedin", "company_instagram"], max_posts=2,
-                             since=datetime(2026, 1, 1, tzinfo=UTC), apify=apify, claude=FakeJudge(), stored=stored, stored_count=count,
+    out = asyncio.run(gather(targets=[Target(None, ink)], stages=["company_linkedin", "person_linkedin", "company_instagram"], max_posts=5,
+                             since=datetime(2026, 1, 1, tzinfo=UTC), apify=apify, claude=FakeJudge(), owner_posts=owner_posts,
                              save=save, record_apify=nothing, record_claude=nothing))  # fmt: skip
     [o] = out.leads
-    assert (o.enough, o.stopped_at, o.counts.get("person_linkedin", "skipped")) == (True, "company_instagram", None)
-    assert [c[0] for c in apify.calls] == ["linkedin", "instagram"] and apify.calls[0][2] == 2
+    assert o.enough_in == ["company_linkedin", "company_instagram"] and o.counts["person_linkedin"] is None
+    assert [(c[0], c[2]) for c in apify.calls] == [("linkedin", 2), ("instagram", 2)]  # enough at the first look, both
