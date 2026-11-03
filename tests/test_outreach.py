@@ -102,8 +102,22 @@ def email(status="approved", **extra):
 
 
 class Sending:
-    def __init__(self, pairs):
+    def __init__(self, pairs, queued_before=None):
         self.pairs, self.queued, self.added, self.existing = pairs, [], [], {}
+        self.ledger: dict = dict(queued_before or {})  # address -> when it was queued
+
+    async def queued_before(self, addresses):
+        return {a: self.ledger[a] for a in addresses if a in self.ledger}
+
+    async def claim(self, ws, campaign_id, emails):
+        new = {a for _, a in emails if a not in self.ledger}
+        for a in new:
+            self.ledger[a] = datetime(2026, 11, 3, tzinfo=UTC)
+        return new
+
+    async def release(self, addresses):
+        for a in addresses:
+            self.ledger.pop(a, None)
 
     async def to_queue(self, ws, ids):
         return [(e, l) for e, l in self.pairs if e.id in ids and e.status == "approved"]
@@ -565,3 +579,36 @@ def test_a_failed_queue_can_be_retried() -> None:
     assert out.status == "queued"
     # Same list (same key and name, so CheapSequencer answers with the first one); a new key per import.
     assert seq.lists[0] == seq.lists[1] and seq.import_keys[0] != seq.import_keys[1]
+
+
+# ---------- Nobody is queued twice ----------
+
+
+def test_an_address_queued_before_is_never_queued_again() -> None:
+    """Whichever lead, ICP or workspace it turns up under again, and even after its first lead was deleted."""
+    again = (email(), lead(email="Ana@Shop.com"))  # a new lead and draft for someone queued in October
+    sending = Sending([again], queued_before={"ana@shop.com": datetime(2026, 10, 20, tzinfo=UTC)})
+    seq = Sequencer([CAMPAIGN])
+    out = run(outreach.queue(deps(sending, seq), [again[0].id]))
+    assert out[0].status == "skipped" and out[0].reason.startswith("Ana@Shop.com was already queued on Oct 20, 2026")
+    assert seq.imports == [] and again[0].status == "approved"
+
+
+def test_the_same_address_twice_in_one_batch_is_queued_once() -> None:
+    first, twin = (email(), lead()), (email(), lead())  # two leads, one address
+    sending, seq = Sending([first, twin]), Sequencer([CAMPAIGN])
+    out = run(outreach.queue(deps(sending, seq), [first[0].id, twin[0].id]))
+    assert sorted(o.status for o in out) == ["queued", "skipped"] and "in this batch twice" in next(o.reason for o in out if o.status == "skipped")
+    assert sum(len(rows) for _, rows in seq.imports) == 1
+
+
+def test_once_queued_a_second_run_skips_it_and_a_failed_import_gives_it_back() -> None:
+    sending = Sending([(email(), lead())])
+    out = run(outreach.queue(deps(sending, Sequencer([CAMPAIGN], fail="The import didn't finish")), [sending.pairs[0][0].id]))
+    assert out[0].status == "skipped" and sending.ledger == {}  # not sent, so it can be queued later
+    run(outreach.queue(deps(sending, Sequencer([CAMPAIGN])), [sending.pairs[0][0].id]))
+    assert "ana@shop.com" in sending.ledger
+    later = (email(), lead(email="ana@shop.com"))
+    sending.pairs.append(later)
+    out = run(outreach.queue(deps(sending, Sequencer([CAMPAIGN])), [later[0].id]))
+    assert out[0].status == "skipped" and "already queued" in out[0].reason

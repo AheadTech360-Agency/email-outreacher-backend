@@ -279,6 +279,10 @@ WEBSITE = "A general address from their website (like orders@), not a person's. 
 CONFIRM_FIRST = {"risky": RISKY, "website": WEBSITE}
 
 
+def day(when: datetime) -> str:
+    return f"{when:%b} {when.day}, {when:%Y}"
+
+
 async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozenset()) -> list[QueueOutcome]:
     """Put approved first emails into their ICP's campaign. The campaign isn't activated. An email to a risky
     address is left out unless a person confirmed that one (`risky_ok`)."""
@@ -290,9 +294,18 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
     outcomes = [QueueOutcome(i, "skipped", "Not an approved first email, or already queued") for i in email_ids if i not in found]
     is_excluded = await deps.exclusions.matcher()
 
+    # Nobody is queued twice: not an address queued before (under any lead, ICP or workspace, even one since
+    # deleted), and not one that's twice in this batch.
+    address = lambda lead: (lead.email or "").strip().lower()  # noqa: E731
+    before = await deps.sending.queued_before(sorted({address(lead) for _, lead in pairs if lead.email}))
+    seen: set[str] = set()
     groups: dict[UUID, list[tuple[Email, Lead]]] = {}
     for email, lead in pairs:
-        if not lead.email:
+        if lead.email and address(lead) in before:
+            outcomes.append(QueueOutcome(email.id, "skipped", f"{lead.email} was already queued on {day(before[address(lead)])}. Nobody is queued twice."))
+        elif lead.email and address(lead) in seen:
+            outcomes.append(QueueOutcome(email.id, "skipped", f"{lead.email} is in this batch twice; it's queued once."))
+        elif not lead.email:
             outcomes.append(QueueOutcome(email.id, "skipped", "The lead has no email address"))
         elif lead.email_status in CONFIRM_FIRST and email.id not in risky_ok:
             outcomes.append(QueueOutcome(email.id, "skipped", CONFIRM_FIRST[lead.email_status]))
@@ -301,6 +314,7 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
         elif not lead.lead_intel_icp_id:
             outcomes.append(QueueOutcome(email.id, "skipped", "The lead has no ICP, so there's no campaign to put it in"))
         else:
+            seen.add(address(lead))
             groups.setdefault(lead.lead_intel_icp_id, []).append((email, lead))
     if not groups:
         return outcomes
@@ -313,6 +327,13 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
             outcomes += [QueueOutcome(e.id, "skipped", f'No CheapSequencer campaign named "{CAMPAIGN_PREFIX}{name}"') for e, _ in members]
             continue
         campaign_id, campaign_name = campaigns[icp_id]
+        # Claimed before the import: if another queue run took an address in the meantime, it's left out here.
+        claimed = await deps.sending.claim(deps.workspace_id, campaign_id, [(e, address(lead)) for e, lead in members])
+        outcomes += [QueueOutcome(e.id, "skipped", f"{lead.email} was just queued by someone else. Nobody is queued twice.")
+                     for e, lead in members if address(lead) not in claimed]  # fmt: skip
+        members = [(e, lead) for e, lead in members if address(lead) in claimed]
+        if not members:
+            continue
         ids = sorted(str(e.id) for e, _ in members)
         rows = [lead_row(lead, e.subject, e.edited_body or e.body, settings["followup_fallback_2"], settings["followup_fallback_3"])
                 for e, lead in members]  # fmt: skip
@@ -324,6 +345,7 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
             await deps.sequencer.import_rows(list_id, rows, key_for("import", *ids, uuid4().hex))
             await deps.sequencer.enroll(campaign_id, list_id, key_for("enroll", campaign_id, *ids))
         except SendingError as exc:
+            await deps.sending.release({address(lead) for _, lead in members})  # not sent: they can be queued later
             outcomes += [QueueOutcome(e.id, "skipped", exc.message) for e, _ in members]
             continue
         await deps.sending.mark_queued([e for e, _ in members], campaign_id, list_id)

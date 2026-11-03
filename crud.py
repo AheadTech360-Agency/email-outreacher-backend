@@ -11,7 +11,7 @@ from sqlalchemy.orm import aliased
 
 from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
-    Exclusion, Job, QuickstartRun, SendEvent, SmartList, SmartListMember, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
+    Exclusion, Job, QueuedAddress, QuickstartRun, SendEvent, SmartList, SmartListMember, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
 )  # fmt: skip
 from services.apify import Employee, FetchedPost, search_name
 from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
@@ -510,6 +510,32 @@ class SendingRepo:
             .where(Email.workspace_id == workspace_id, Email.id.in_(email_ids), Email.step == 1, Email.status == "approved")
         )
         return [(e, lead) for e, lead in await self.session.execute(query)]
+
+    async def queued_before(self, addresses: list[str]) -> dict[str, datetime]:
+        """Which of these addresses (lower case) were ever queued, and when."""
+        if not addresses:
+            return {}
+        rows = await self.session.execute(select(QueuedAddress.email, QueuedAddress.queued_at).where(QueuedAddress.email.in_(addresses)))
+        return dict(rows.all())
+
+    async def claim(self, workspace_id: UUID, campaign_id: str, emails: list[tuple[Email, str]]) -> set[str]:
+        """Record these addresses as queued, before they're sent to CheapSequencer. Returns the ones claimed now: an
+        address another queue run claimed first is left out. Committed at once, so the claim holds."""
+        if not emails:
+            return set()
+        values = [{"email": address, "workspace_id": workspace_id, "email_id": e.id, "campaign_id": campaign_id} for e, address in emails]
+        claimed = await self.session.scalars(
+            insert(QueuedAddress).values(values).on_conflict_do_nothing(index_elements=[QueuedAddress.email]).returning(QueuedAddress.email)
+        )
+        out = set(claimed)
+        await self.session.commit()
+        return out
+
+    async def release(self, addresses: set[str]) -> None:
+        """Give back claims whose import failed, so they can be queued once it works."""
+        if addresses:
+            await self.session.execute(delete(QueuedAddress).where(QueuedAddress.email.in_(addresses)))
+            await self.session.commit()
 
     async def mark_queued(self, emails: list[Email], campaign_id: str, list_id: str) -> None:
         now = datetime.now(UTC)

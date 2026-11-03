@@ -611,6 +611,20 @@ class SmartListMember(Base):
     sorted_at: Mapped[datetime] = _created()
 
 
+class QueuedAddress(Base):
+    """Every email address ever queued for sending, for good: nobody is queued twice, whichever lead, ICP or
+    workspace they turn up under again, and even after their lead is deleted. The key holds it for two queue
+    runs at once."""
+
+    __tablename__ = "eo_queued_addresses"
+
+    email: Mapped[str] = mapped_column(Text, primary_key=True)  # lower case
+    workspace_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_workspaces.id", ondelete="SET NULL"), default=None)
+    email_id: Mapped[UUID | None] = mapped_column(default=None)  # the first email it went with (no key: it may be deleted)
+    campaign_id: Mapped[str | None] = mapped_column(Text, default=None)
+    queued_at: Mapped[datetime] = _created()
+
+
 class ProviderCall(Base):
     """Every paid call: the spend ledger, and the check that stops a retry paying twice."""
 
