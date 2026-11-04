@@ -232,6 +232,8 @@ class SequencerClient(_Client):
         """The lead fields, built-in and custom, each with its `tag` (what {{...}} and imports use)."""
         body = await self.get("/custom-fields")
         data = body.get("data") if isinstance(body, dict) else body
+        if isinstance(data, dict):  # {"custom_fields": [...], "custom_field_count": n, "allowed_custom_fields": n}
+            data = data.get("custom_fields")
         return data if isinstance(data, list) else []
 
     async def create_custom_field(self, name: str, kind: str, key: str) -> dict[str, Any]:
