@@ -2242,6 +2242,15 @@ class SmartListRepo:
         await self.session.commit()
         return moved + len(unsorted)
 
+    async def memberships(self, workspace_id: UUID, kind: str) -> dict[UUID, UUID]:
+        """Every company's (or person's) list: member id to list id. Those in no list are left out."""
+        rows = await self.session.execute(
+            select(SmartListMember.member_id, SmartListMember.list_id).where(
+                SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind
+            )
+        )
+        return {member_id: list_id for member_id, list_id in rows}
+
     async def list_names(self, workspace_id: UUID, kind: str, member_ids: list[UUID]) -> dict[UUID, str]:
         if not member_ids:
             return {}

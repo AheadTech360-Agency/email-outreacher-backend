@@ -4,7 +4,7 @@ company list with a draft base ICP to create in Lead Intel, and Apollo-format CS
 Sorting spends (Claude, and Jina for a site our own fetch can't read), so it and drafting are for Management
 and admins; anyone in the workspace can see the lists and download them."""
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import anthropic
@@ -127,6 +127,16 @@ async def sort_lists(
         reader=reader, record=recorder(calls, workspace_id), progress=report,
     )  # fmt: skip
     return sort_out(outcome, await repo.count_unsorted(workspace_id, body.kind))
+
+
+@router.get("/memberships", response_model=dict[UUID, UUID])
+async def memberships(
+    kind: Literal["company", "person"] = Query(),
+    workspace_id: UUID = Depends(require_workspace_id),
+    repo: SmartListRepo = Depends(get_smart_list_repo),
+) -> dict[UUID, UUID]:
+    """Which list each company or person is in (member id to list id), for pickers that add them to a list."""
+    return await repo.memberships(workspace_id, kind)
 
 
 @router.get("/people.csv", response_class=Response)
