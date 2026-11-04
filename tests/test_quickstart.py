@@ -286,6 +286,7 @@ def test_a_run_on_imported_companies_skips_the_search_and_verifying(world) -> No
     assert "/pipeline/find" not in world.calls and "/pipeline/research" not in world.calls
     assert world.calls.count("/pipeline/stakeholders") == 1  # only Tee Shop, which had no one with an email
     assert run.progress["find"]["note"] == "3 of your companies no one has written to yet"
+    assert run.progress["people"]["note"] == "3 already here, 1 found on LinkedIn, 4 with an email"
     assert len(run.lead_ids) == 3  # one per company: Ink Co's second person waits
     assert run.detail.startswith("Done: 3 drafts")
 

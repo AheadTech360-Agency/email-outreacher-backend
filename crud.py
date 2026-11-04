@@ -2075,7 +2075,13 @@ class QuickstartRepo:
                 SmartListMember.workspace_id == workspace_id, SmartListMember.kind == "company", SmartListMember.list_id == smart_list_id
             )
             query = query.where(Company.id.in_(members))
-        query = query.order_by(Company.score.desc().nulls_last(), Company.created_at.desc()).limit(limit)
+        # Companies where someone already has an email first: they're written to without paying for LinkedIn.
+        emailed = (
+            select(Stakeholder.id)
+            .where(Stakeholder.company_id == Company.id, Stakeholder.email.is_not(None))
+            .exists()
+        )
+        query = query.order_by(emailed.desc(), Company.score.desc().nulls_last(), Company.created_at.desc()).limit(limit)
         return list(await self.session.scalars(query))
 
     async def add_website_contacts(self, workspace_id: UUID, contacts: list[tuple[Company, str]]) -> None:

@@ -13,7 +13,7 @@ LinkedIn at companies where no one with an email is known yet.
 
   find      Google Maps search for the ICP's terms around the places; the newest unresearched companies are kept
   research  verify them (website, Instagram, the ICP's rule, Claude's score), 10 at a time
-  people    the qualified ones on LinkedIn, with their work emails, 10 companies at a time
+  people    LinkedIn profiles at the qualified ones, with their work emails, 10 companies at a time
   leads     the people found become leads (only those with an email, unless asked otherwise)
   posts     their recent posts, 25 leads at a time (skipped when posts per lead is 0)
   write     their emails, 25 at a time
@@ -36,7 +36,7 @@ log = logging.getLogger("coldbrew.quickstart")
 
 STEPS = ["find", "research", "people", "leads", "posts", "write"]
 LABELS = {
-    "find": "Find companies", "research": "Verify companies", "people": "Find people and emails",
+    "find": "Find companies", "research": "Verify companies", "people": "Fetch LinkedIn profiles",
     "leads": "Make leads", "posts": "Read their posts", "write": "Write emails",
 }  # fmt: skip
 RESEARCH_BATCH, PEOPLE_BATCH, POSTS_BATCH, WRITE_BATCH = 10, 10, 25, 25
@@ -149,6 +149,10 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
     searched = set(run.progress.get("_searched", []))
     companies = await repo.companies(list(run.company_ids))
     qualified = [c.id for c in companies if c.status == "qualified"]
+    if "_had" not in run.progress:
+        # Who was here before LinkedIn was asked (imported with their company, say), so the note can tell them apart.
+        here = await repo.people_at(run.workspace_id, list(run.company_ids))
+        run.progress = {**run.progress, "_had": sorted(str(p.id) for p in here)}
     if s.get("source") == "existing":
         # Their people are usually here already (imported with them): LinkedIn only where no one has an email,
         # and only when asked.
@@ -176,9 +180,15 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
         if fallback:
             await repo.add_website_contacts(run.workspace_id, fallback)
             people = await repo.people_at(run.workspace_id, list(run.company_ids))
-    on_linkedin = [p for p in people if p.email_status != "website"]
-    from_site = len(people) - len(on_linkedin)
-    note = f"{len(on_linkedin)} found on LinkedIn" + (f", {sum(1 for p in on_linkedin if p.email)} with an email" if s["find_emails"] else "")
+    had = set(run.progress.get("_had", []))
+    already = [p for p in people if str(p.id) in had]
+    found = [p for p in people if str(p.id) not in had and p.email_status != "website"]
+    from_site = sum(1 for p in people if str(p.id) not in had and p.email_status == "website")
+    parts = [f"{len(already)} already here"] if already else []
+    parts.append(f"{len(found)} found on LinkedIn")
+    if s["find_emails"] or already:
+        parts.append(f"{sum(1 for p in [*already, *found] if p.email)} with an email")
+    note = ", ".join(parts)
     if from_site:
         note += f"; {from_site} compan{'ies' if from_site != 1 else 'y'} reached by the email on {'their' if from_site != 1 else 'its'} website"
     _set(run, "people", state="running" if left else "done", done=len(qualified) - left, total=len(qualified), note=note)
