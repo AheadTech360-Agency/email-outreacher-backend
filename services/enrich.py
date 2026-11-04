@@ -94,6 +94,9 @@ async def enrich_companies(
     if website:
         targets = [c for c in companies if c.domain or c.website_url]
         gate, done = asyncio.Semaphore(SITE_READS), 0
+        # Sites are read side by side, but saved one at a time: they share one database session, which refuses
+        # two statements at once (a Quick Start run crashed on it, 2026-11-04).
+        writing = asyncio.Lock()
         await progress("Reading websites", 0, len(targets))
 
         async def read(company: Any) -> None:
@@ -103,14 +106,15 @@ async def enrich_companies(
                     found = await asyncio.wait_for(reread_site(company, reader), SITE_SECONDS)
                 except TimeoutError:
                     found = None
-            if found is not None and found.reached:
-                out.sites_read += 1
-                await save_pages(company, found.via or "own_crawl", found.pages)
-            else:
-                out.sites_failed += 1
-            done += 1
-            if done % 10 == 0 or done == len(targets):
-                await progress("Reading websites", done, len(targets))
+            async with writing:
+                if found is not None and found.reached:
+                    out.sites_read += 1
+                    await save_pages(company, found.via or "own_crawl", found.pages)
+                else:
+                    out.sites_failed += 1
+                done += 1
+                if done % 10 == 0 or done == len(targets):
+                    await progress("Reading websites", done, len(targets))
 
         await asyncio.gather(*(read(c) for c in targets))
 

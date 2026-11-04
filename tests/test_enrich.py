@@ -68,6 +68,25 @@ def test_a_verified_company_is_filled_in_without_being_judged() -> None:
     assert again.cost_usd == 0 and len(apify.calls) == 2
 
 
+def test_sites_read_side_by_side_are_saved_one_at_a_time() -> None:
+    """They share one database session, which refuses two statements at once: a Quick Start run crashed on it
+    (2026-11-04). Saving waits on a slow write here, so overlapping saves would show."""
+    companies = [company(f"Shop {i}", f"shop{i}.com") for i in range(8)]
+    busy, overlapped, saved = False, False, []
+
+    async def save_pages(c, via, found):
+        nonlocal busy, overlapped
+        overlapped = overlapped or busy
+        busy = True
+        await asyncio.sleep(0.01)
+        saved.append(c.id)
+        busy = False
+
+    out = run(enrich.enrich_companies(companies, website=True, instagram=False, linkedin=False, reader=Reader(), apify=None,
+                                      save_pages=save_pages, save_posts=nothing, record=nothing, progress=nothing))  # fmt: skip
+    assert out.sites_read == 8 and len(saved) == 8 and not overlapped
+
+
 def test_only_what_was_ticked_runs() -> None:
     ink, apify = company("Ink Co", "inkco.com", instagram_url="https://instagram.com/inkco"), Apify()
     out = run(enrich.enrich_companies([ink], website=False, instagram=True, linkedin=False, reader=Reader(), apify=apify,
