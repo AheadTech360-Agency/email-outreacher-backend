@@ -7,6 +7,8 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
+from models import FALLBACK_4, FALLBACK_5
+
 
 class ApiModel(BaseModel):
     """camelCase on the wire to match the frontend's TypeScript types; snake_case in Python."""
@@ -390,9 +392,11 @@ class SendingSettingsIn(ApiModel):
     # Who the emails are from: the company and its website, under the sender's name.
     sender_company: str = Field(default="", max_length=200)
     sender_website: str = Field(default="", max_length=300)
-    # What email 2 and 3 say until Coldbrew writes the personal one ({{first_name}} is filled in).
+    # What emails 2 to 5 say until Coldbrew writes the personal one ({{first_name}} is filled in).
     followup_fallback_2: str = Field(min_length=1, max_length=2000)
     followup_fallback_3: str = Field(min_length=1, max_length=2000)
+    followup_fallback_4: str = Field(default=FALLBACK_4, min_length=1, max_length=2000)
+    followup_fallback_5: str = Field(default=FALLBACK_5, min_length=1, max_length=2000)
     # How many hours before a follow-up is due Claude writes it.
     followup_lead_hours: int = Field(ge=2, le=72)
 
@@ -1023,7 +1027,7 @@ class UsageOut(ApiModel):
 
 # ---------- Prompts ----------
 
-PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "sort", "sort_people"]
+PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people"]
 
 
 class PromptVersionIn(ApiModel):
@@ -1462,6 +1466,39 @@ class QuickstartIn(ApiModel):
     posts_per_lead: int = Field(default=5, ge=0, le=20)  # 0: write without their posts
     max_post_age_days: int = Field(default=60, ge=1, le=365)
     spend_limit_usd: float = Field(gt=0, le=500)
+
+
+class PromptTestIn(ApiModel):
+    """Try a prompt as it's being edited (saved or not) on one person: an email, or a follow-up and the ones
+    before it. Nothing is saved; what it costs is logged on Usage."""
+
+    kind: Literal["email", "followup2", "followup3", "followup4", "followup5"]
+    stakeholder_id: UUID
+    system_prompt: str = Field(min_length=1, max_length=100_000)
+    user_prompt: str = Field(min_length=1, max_length=100_000)
+    model: str = Field(min_length=1, max_length=100)
+    max_tokens: int = Field(ge=1, le=64_000)
+    max_posts: int | None = Field(default=None, ge=1, le=50)
+
+
+class PromptTestEmailOut(ApiModel):
+    step: int
+    subject: str
+    body: str
+    # tested: written with the prompt being tried; written: written now with the current prompt (an earlier
+    # email in the thread); saved: the one already saved for them
+    source: Literal["tested", "written", "saved"]
+
+
+class PromptTestOut(ApiModel):
+    name: str
+    company: str
+    emails: list[PromptTestEmailOut]
+    hook: str | None = None
+    score: int | None = None
+    reasons: list[str] = []
+    confidence: int | None = None
+    cost_usd: float = 0.0
 
 
 class QuickstartStep(ApiModel):

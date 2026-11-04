@@ -29,7 +29,7 @@ MANAGEMENT_ONLY = [
     ("post", "/examples", {}), ("put", f"/examples/{uuid4()}", {}), ("delete", f"/examples/{uuid4()}", None),
     ("post", f"/examples/from-email/{uuid4()}", {}),
     ("put", f"/icps/{uuid4()}/profile", {}),
-    ("post", "/emails/generate", {}), ("post", "/posts/fetch", {}), ("post", "/improve/email-prompt", {}),
+    ("post", "/emails/generate", {}), ("post", "/emails/test-prompt", {}), ("post", "/posts/fetch", {}), ("post", "/improve/email-prompt", {}),
     ("post", "/pipeline/find", {}), ("post", "/pipeline/research", {}), ("post", "/pipeline/stakeholders", {}),
     ("patch", f"/pipeline/companies/{uuid4()}", {}), ("post", "/pipeline/companies/decide", {"companyIds": [str(uuid4())], "status": "qualified"}),
     ("post", "/stakeholders/search", {}), ("post", "/stakeholders/search-icp", {}), ("post", "/stakeholders/search-linkedin", {}),

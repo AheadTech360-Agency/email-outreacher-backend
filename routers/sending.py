@@ -138,11 +138,11 @@ async def outbox(deps: outreach.Deps = Depends(_deps)) -> list[OutboxRowOut]:
     except SendingError:
         names = {}
     settings = await deps.settings.sending(deps.workspace_id)
-    fallbacks = {2: settings["followup_fallback_2"], 3: settings["followup_fallback_3"]}
+    fallbacks = {s: settings[f"followup_fallback_{s}"] for s in outreach.FOLLOW_UPS}
     later = await deps.sending.follow_ups([lead.id for _, lead in pairs])
     rows = []
     for email, lead in pairs:
-        steps = outreach.outbox_steps(email, lead, {s: later[(lead.id, s)] for s in (2, 3) if (lead.id, s) in later}, fallbacks)
+        steps = outreach.outbox_steps(email, lead, {s: later[(lead.id, s)] for s in outreach.FOLLOW_UPS if (lead.id, s) in later}, fallbacks)
         rows.append(OutboxRowOut(
             email_id=email.id, lead_id=lead.id, name=f"{lead.first_name or ''} {lead.last_name or ''}".strip() or (lead.email or ""),
             email=lead.email or "", title=lead.title or "", company=lead.company or "",

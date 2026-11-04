@@ -77,6 +77,10 @@ FALLBACK_2 = "Hi {{first_name}}, just bringing this back to the top of your inbo
 FALLBACK_3 = (
     "Hi {{first_name}}, I'll leave it here so I'm not cluttering your inbox. If it's ever useful, just reply and I'll send the details."
 )
+FALLBACK_4 = "Hi {{first_name}}, one more thought on this in case the timing is better now. Happy to share how it would work for you."
+FALLBACK_5 = (
+    "Hi {{first_name}}, I'll leave it here so I'm not cluttering your inbox. If it's ever useful, just reply and I'll send the details."
+)
 
 
 class Base(DeclarativeBase):
@@ -301,6 +305,8 @@ class Settings(Base):
     sender_website: Mapped[str] = mapped_column(Text, server_default="")
     followup_fallback_2: Mapped[str] = mapped_column(Text, server_default=FALLBACK_2)
     followup_fallback_3: Mapped[str] = mapped_column(Text, server_default=FALLBACK_3)
+    followup_fallback_4: Mapped[str] = mapped_column(Text, server_default=FALLBACK_4)
+    followup_fallback_5: Mapped[str] = mapped_column(Text, server_default=FALLBACK_5)
     followup_lead_hours: Mapped[int] = mapped_column(SmallInteger, server_default="24")
     # The cost estimator (schemas.CostEstimate); null until someone saves one.
     cost_estimate: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
@@ -311,7 +317,7 @@ class Prompt(Base):
     __tablename__ = "eo_prompts"
     __table_args__ = (
         # verify: company verification, hook: hook selection, email: email generation, score: email scoring.
-        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "sort", "sort_people")), name="kind"),
+        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people")), name="kind"),
         # At most one default per kind in a workspace.
         Index(
             "eo_prompts_one_default_idx",
@@ -718,7 +724,7 @@ class Email(Base):
     __table_args__ = (
         CheckConstraint(_in("status", ("draft", "edited", "approved", "queued", "sent", "skipped")), name="status"),
         CheckConstraint("sent_by is null or " + _in("sent_by", ("auto", "manual")), name="sent_by"),
-        CheckConstraint("step between 1 and 3", name="step"),
+        CheckConstraint("step between 1 and 5", name="step"),
         Index("eo_emails_sequence_idx", "workspace_id", "sequence_status", postgresql_where=text("sequence_status is not null")),
         CheckConstraint("relevance between 0 and 5", name="relevance"),
         CheckConstraint("confidence between 0 and 100", name="confidence"),
@@ -749,7 +755,7 @@ class Email(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     sent_by: Mapped[str | None] = mapped_column(Text, default=None)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    # 1 is the first email; 2 and 3 are the follow-ups, written only when they're nearly due.
+    # 1 is the first email; 2 to 5 are the follow-ups, written only when they're nearly due.
     step: Mapped[int] = mapped_column(SmallInteger, server_default="1")
     # Where CheapSequencer holds it once queued.
     sequencer_list_id: Mapped[str | None] = mapped_column(Text, default=None)

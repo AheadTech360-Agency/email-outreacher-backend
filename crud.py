@@ -11,7 +11,7 @@ from sqlalchemy.orm import aliased
 
 from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
-    Exclusion, Job, QueuedAddress, QuickstartRun, SendEvent, SmartList, SmartListMember, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3,
+    Exclusion, Job, QueuedAddress, QuickstartRun, SendEvent, SmartList, SmartListMember, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3, FALLBACK_4, FALLBACK_5,
 )  # fmt: skip
 from services.apify import Employee, FetchedPost, search_name
 from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
@@ -1780,7 +1780,7 @@ GENERAL_DEFAULTS: dict[str, Any] = {
 }  # fmt: skip
 SENDING_DEFAULTS: dict[str, Any] = {
     "sender_company": "", "sender_website": "", "followup_fallback_2": FALLBACK_2, "followup_fallback_3": FALLBACK_3,
-    "followup_lead_hours": 24,
+    "followup_fallback_4": FALLBACK_4, "followup_fallback_5": FALLBACK_5, "followup_lead_hours": 24,
 }  # fmt: skip
 
 

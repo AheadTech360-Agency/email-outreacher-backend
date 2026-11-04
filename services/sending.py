@@ -228,6 +228,16 @@ class SequencerClient(_Client):
         """Archive a campaign (CheapSequencer keeps its history). Only called once no lead is left in it."""
         await self._write("DELETE", f"/campaigns/{campaign_id}", key, None, etag)
 
+    async def custom_fields(self) -> list[dict[str, Any]]:
+        """The lead fields, built-in and custom, each with its `tag` (what {{...}} and imports use)."""
+        body = await self.get("/custom-fields")
+        data = body.get("data") if isinstance(body, dict) else body
+        return data if isinstance(data, list) else []
+
+    async def create_custom_field(self, name: str, kind: str, key: str) -> dict[str, Any]:
+        """A custom lead field; its tag is derived from the name ("Email 4 body" is email_4_body)."""
+        return await self._write("POST", "/custom-fields", key, {"name": name, "type": kind})
+
     async def set_steps(self, campaign_id: str, steps: list[dict[str, Any]], etag: str, key: str) -> dict[str, Any]:
         """Replace a draft or paused campaign's step copy (ids echoed, so the steps are kept)."""
         return await self._write("PATCH", f"/campaigns/{campaign_id}", key, {"steps": steps}, etag)

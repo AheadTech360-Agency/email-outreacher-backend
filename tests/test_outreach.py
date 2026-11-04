@@ -22,7 +22,8 @@ WS = uuid4()
 ICP = uuid4()
 SETTINGS = {
     "sender_company": "PrintCoPilot", "sender_website": "printcopilot.co",
-    "followup_fallback_2": "Hi {{first_name}}, bumping this.", "followup_fallback_3": "Hi {{first_name}}, closing the loop.",
+    "followup_fallback_2": "Hi {{first_name}}, bumping this.", "followup_fallback_3": "Hi {{first_name}}, a third.",
+    "followup_fallback_4": "Hi {{first_name}}, a fourth.", "followup_fallback_5": "Hi {{first_name}}, closing the loop.",
     "followup_lead_hours": 24,
 }  # fmt: skip
 
@@ -58,10 +59,12 @@ def test_progress_reads_why_a_lead_stopped() -> None:
 @pytest.mark.parametrize(
     ("sent", "hours_ago", "status", "stop", "expected"),
     [
-        (1, 24 * 2, "active", None, 2),  # email 2 is due in a day: write it now
-        (1, 24 * 1, "active", None, None),  # due in two days: not yet
-        (2, 24 * 4, "active", None, 3),  # email 3 (5 days after email 2) is due in a day
-        (3, 24 * 9, "active", None, None),  # all three sent
+        (1, 24 * 1, "active", None, 2),  # email 2 (day 3, two days after email 1) is due in a day: write it now
+        (1, 12, "active", None, None),  # due in a day and a half: not yet
+        (2, 24 * 2, "active", None, 3),  # email 3 (day 6, three days after email 2) is due in a day
+        (3, 24 * 3, "active", None, 4),  # email 4 (day 10) is due in a day
+        (4, 24 * 5, "active", None, 5),  # email 5 (day 16, six days after email 4) is due in a day
+        (5, 24 * 9, "active", None, None),  # all five sent
         (0, 0, "active", None, None),  # email 1 hasn't gone out
         (1, 24 * 2, "active", "replied", None),  # replied: no follow-up, no cost
         (1, 24 * 2, "completed", None, None),
@@ -75,7 +78,7 @@ def test_due_follow_up(sent, hours_ago, status, stop, expected) -> None:
 
 def test_delays_come_from_the_campaign_steps() -> None:
     campaign = {"steps": [{"delay_days": 0}, {"delay_days": 4}, {"delay_days": "x"}]}
-    assert outreach.delays_of(campaign) == {2: 4, 3: 5}
+    assert outreach.delays_of(campaign) == {2: 4, 3: 3, 4: 4, 5: 6}
 
 
 def test_idempotency_keys_are_stable_and_valid() -> None:
@@ -177,6 +180,12 @@ class Sequencer:
     async def set_steps(self, campaign_id, steps, etag, key):
         self.patched.append((campaign_id, steps, etag))
 
+    async def custom_fields(self):
+        return [{"tag": t} for t in ("email_1_subject", "email_1_body", "email_2_body", "email_3_body", *getattr(self, "made", []))]
+
+    async def create_custom_field(self, name, kind, key):
+        self.made = [*getattr(self, "made", []), name.lower().replace(" ", "_")]
+
     async def duplicate(self, campaign_id, key):
         copy = {"id": f"copy-of-{campaign_id}", "name": "Copy", "status": "draft", "steps": []}
         self.list_campaigns.append(copy)
@@ -252,7 +261,8 @@ def test_queue_imports_and_enrolls_without_activating() -> None:
     assert rows == [{
         "email": "ana@shop.com", "first_name": "Ana", "last_name": "Ruiz", "company_name": "Shop", "job_title": "Owner",
         "website": "shop.com", "linkedin_profile": "", "email_1_subject": "Quick idea", "email_1_body": "Body one",
-        "email_2_body": "Hi Ana, bumping this.", "email_3_body": "Hi Ana, closing the loop.",
+        "email_2_body": "Hi Ana, bumping this.", "email_3_body": "Hi Ana, a third.", "email_4_body": "Hi Ana, a fourth.",
+        "email_5_body": "Hi Ana, closing the loop.",
     }]  # fmt: skip
     assert ok[0].status == "queued" and ok[0].sequencer_campaign_id == "c1"
 
@@ -303,13 +313,18 @@ def test_templates_write_the_signature_into_draft_campaigns_only() -> None:
     assert [(o.campaign, o.status) for o in out] == [("Coldbrew: DTF", "updated"), ("Coldbrew: Live", "skipped")]
     [(campaign_id, steps, etag)] = sending.patched
     assert (campaign_id, etag) == ("c1", "etag-1")
-    assert [s["id"] for s in steps] == ["s1", "s2", "s3"] and steps[0]["subject"] == "{{email_1_subject}}"
+    # Five steps on the schedule: the three it had keep their ids, emails 4 and 5 are added like email 2.
+    assert [s.get("id") for s in steps] == ["s1", "s2", "s3", None, None] and steps[0]["subject"] == "{{email_1_subject}}"
+    assert [s["delay_days"] for s in steps] == [0, 2, 3, 4, 6]
     assert steps[2]["body_text"] == "{{email_3_body}}\n\n{{sender_name}}\nPrintCoPilot\nprintcopilot.co"
-    assert "subject" not in steps[1]
+    assert steps[4]["body_text"].startswith("{{email_5_body}}") and steps[4].get("thread_mode") == steps[1].get("thread_mode", "reply_to_previous")
+    assert "subject" not in steps[1] and "subject" not in steps[3]
+    assert sending.made == ["email_4_body", "email_5_body"]  # the fields emails 4 and 5 ride in
 
 
 def test_templates_already_in_place_are_left_alone() -> None:
-    steps = [s | {"body_text": outreach.step_body(i, "PrintCoPilot", "printcopilot.co")} for i, s in enumerate(CAMPAIGN["steps"], 1)]
+    steps = [{"id": f"s{i}", "delay_days": d, "body_text": outreach.step_body(i, "PrintCoPilot", "printcopilot.co")}
+             for i, d in outreach.SCHEDULE.items()]  # fmt: skip
     seq = Sequencer([CAMPAIGN | {"steps": steps}])
     assert [o.status for o in run(outreach.sync_templates(deps(Sending([]), seq)))] == ["unchanged"] and seq.patched == []
 
@@ -421,12 +436,14 @@ def test_lead_state(status, sent, stop, expected) -> None:
 def test_outbox_steps_show_generic_text_until_written() -> None:
     first = email(status="sent", sequence_status="active", sequence_sent_count=1)
     written = email(status="queued", body="Hi Ana, a new angle.")
-    steps = outreach.outbox_steps(first, lead(), {2: written}, {2: "Hi {{first_name}}, two.", 3: "Hi {{first_name}}, three."})
-    assert [(s.step, s.status, s.personalized) for s in steps] == [(1, "sent", True), (2, "waiting", True), (3, "waiting", False)]
+    fallbacks = {2: "Hi {{first_name}}, two.", 3: "Hi {{first_name}}, three.", 4: "Hi {{first_name}}, four.", 5: "Hi {{first_name}}, five."}
+    steps = outreach.outbox_steps(first, lead(), {2: written}, fallbacks)
+    assert [(s.step, s.status, s.personalized) for s in steps] == [(1, "sent", True), (2, "waiting", True), (3, "waiting", False),
+                                                                   (4, "waiting", False), (5, "waiting", False)]  # fmt: skip
     assert steps[2].body == "Hi Ana, three." and steps[1].subject == ""
 
     replied = email(status="sent", sequence_status="stopped", sequence_sent_count=1, sequence_stop_reason="replied")
-    assert [s.status for s in outreach.outbox_steps(replied, lead(), {}, {2: "", 3: ""})] == ["sent", "skipped", "skipped"]
+    assert [s.status for s in outreach.outbox_steps(replied, lead(), {}, {2: "", 3: "", 4: "", 5: ""})] == ["sent", *["skipped"] * 4]
 
 
 THREAD = {
@@ -472,7 +489,7 @@ def test_outbox_lists_each_lead_with_its_mailbox_and_emails(api) -> None:
     client, ana = api
     [row] = client.get("/api/v1/sending/outbox").json()
     assert (row["leadId"], row["campaign"], row["mailbox"], row["state"]) == (str(ana.id), "Coldbrew: DTF", "emily@meetaheadtech360.com", "sending")
-    assert [s["status"] for s in row["steps"]] == ["sent", "waiting", "waiting"]
+    assert [s["status"] for s in row["steps"]] == ["sent", "waiting", "waiting", "waiting", "waiting"]
     assert row["steps"][1]["body"] == "Hi Ana, bumping this." and row["steps"][1]["personalized"] is False
 
 

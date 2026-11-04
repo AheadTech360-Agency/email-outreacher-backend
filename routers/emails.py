@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from crud import (
     PRODUCT_FIELDS, CompanyRepo, EmailRepo, ExampleRepo, ExclusionRepo, FeedbackRepo, IcpProfileRepo, ProductRepo, PromptRepo,
-    ProviderCallRepo, SettingsRepo, exclusion_note, person_keys,
+    ProviderCallRepo, SendingRepo, SettingsRepo, StakeholderRepo, exclusion_note, person_keys,
 )  # fmt: skip
 from dependencies import (
     get_company_repo,
@@ -35,15 +35,21 @@ from dependencies import (
     get_product_repo,
     get_prompt_repo,
     get_provider_call_repo,
+    get_sending_repo,
     get_settings_repo,
+    get_stakeholder_repo,
     get_website_reader,
     require_manager,
     require_workspace_id,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database import get_session
 from lead_intel import LeadIntelRepo
 from services.identity import identity_keys
 from models import Company, Email, Lead, Post, Stakeholder
 from schemas import (
+    AddAsLeadsIn,
     EmailLeadOut,
     EmailOut,
     EmailPointOut,
@@ -55,11 +61,16 @@ from schemas import (
     GenerateIn,
     GenerateOutcome,
     GenerateResult,
+    PromptTestEmailOut,
+    PromptTestIn,
+    PromptTestOut,
 )
 from services.claude import cost_usd
 from services.prompts import company_variables
 from services.research import _apollo_facts as apollo_facts
-from services.generation import EmailWriter, Example, Item, LeadContext, PromptVersionSpec, Sample
+from services import outreach
+from services.generation import EmailWriter, Example, Item, LeadContext, PromptVersionSpec, Sample, write_follow_up
+from services.prompts import render
 from services.website import WebsiteReader
 
 router = APIRouter(prefix="/emails", tags=["emails"])
@@ -210,28 +221,13 @@ def has_offer(profile: Any, product: Any) -> bool:
     return product is not None or bool(profile and (profile.offer or "").strip())
 
 
-@router.post("/generate", response_model=GenerateResult, dependencies=[Depends(require_manager)])
-async def generate(
-    body: GenerateIn,
-    workspace_id: UUID = Depends(require_workspace_id),
-    emails: EmailRepo = Depends(get_email_repo),
-    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
-    profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
-    prompts: PromptRepo = Depends(get_prompt_repo),
-    calls: ProviderCallRepo = Depends(get_provider_call_repo),
-    feedback: FeedbackRepo = Depends(get_feedback_repo),
-    settings: SettingsRepo = Depends(get_settings_repo),
-    products: ProductRepo = Depends(get_product_repo),
-    library: ExampleRepo = Depends(get_example_repo),
-    writer: EmailWriter | None = Depends(get_optional_writer),
-    exclusions: ExclusionRepo = Depends(get_exclusion_repo),
-    companies: CompanyRepo = Depends(get_company_repo),
-    reader: WebsiteReader = Depends(get_website_reader),
-) -> GenerateResult:
-    """Draft an email for each lead. Leads without an ICP are skipped."""
-    if writer is None:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set")
-    ids = list(dict.fromkeys(body.lead_ids))
+async def _prepare(
+    workspace_id: UUID, ids: list[UUID], instruction: str | None, overrides: dict[str, PromptVersionSpec], emails: EmailRepo,
+    lead_intel: LeadIntelRepo, profiles: IcpProfileRepo, prompts: PromptRepo, feedback: FeedbackRepo, settings: SettingsRepo,
+    products: ProductRepo, library: ExampleRepo, exclusions: ExclusionRepo, companies: CompanyRepo, reader: WebsiteReader,
+) -> tuple[dict[UUID, GenerateOutcome], list[tuple[Lead, LeadContext, PromptVersionSpec, PromptVersionSpec, PromptVersionSpec | None]], dict[UUID, list[UUID]]]:  # fmt: skip
+    """Everything each lead's email is written from (the ICP, its prompts, posts, website, examples, feedback), and
+    why a lead is skipped. `overrides` swaps in a prompt version by kind ("hook", "email"), for a test."""
     leads = {lead.id: lead for lead in await emails.leads(workspace_id, ids)}
     is_excluded = await exclusions.matcher()
     outcomes: dict[UUID, GenerateOutcome] = {}
@@ -280,7 +276,8 @@ async def generate(
             continue
         hook_version = await prompts.for_icp(workspace_id, "hook", profile.hook_prompt_id if profile else None)
         email_version = await prompts.for_icp(workspace_id, "email", profile.email_prompt_id if profile else None)
-        hook_spec, email_spec = _spec(hook_version), _spec(email_version)
+        hook_spec = overrides.get("hook") or _spec(hook_version)
+        email_spec = overrides.get("email") or _spec(email_version)
         # Lead Intel companies weren't researched here: their website and Instagram come from Lead Intel (read only).
         business_id = (company.lead_intel_business_id if company else None) or lead.lead_intel_business_id
         has_research = bool(company and company.research)
@@ -323,13 +320,43 @@ async def generate(
                 Item(p.id, "person" if p.lead_id else "company", p.source, p.posted_at, p.text, p.url, reposted_from(p))
                 for p in posts
             ],
-            instruction=body.instruction,
+            instruction=instruction,
             examples=[Example(f.rating, f.subject, f.body, f.hook, list(f.tags), f.note) for f in picked],
             company=company_variables(_company_evidence(company, lead, fields, pages)),
             samples=samples[icp_id],
         )  # fmt: skip
         examples_used[lead.id] = [f.email_id for f in picked]
         jobs.append((lead, ctx, hook_spec, email_spec, score_spec))
+
+    return outcomes, jobs, examples_used
+
+
+@router.post("/generate", response_model=GenerateResult, dependencies=[Depends(require_manager)])
+async def generate(
+    body: GenerateIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
+    prompts: PromptRepo = Depends(get_prompt_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    feedback: FeedbackRepo = Depends(get_feedback_repo),
+    settings: SettingsRepo = Depends(get_settings_repo),
+    products: ProductRepo = Depends(get_product_repo),
+    library: ExampleRepo = Depends(get_example_repo),
+    writer: EmailWriter | None = Depends(get_optional_writer),
+    exclusions: ExclusionRepo = Depends(get_exclusion_repo),
+    companies: CompanyRepo = Depends(get_company_repo),
+    reader: WebsiteReader = Depends(get_website_reader),
+) -> GenerateResult:
+    """Draft an email for each lead. Leads without an ICP are skipped."""
+    if writer is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set")
+    ids = list(dict.fromkeys(body.lead_ids))
+    outcomes, jobs, examples_used = await _prepare(
+        workspace_id, ids, body.instruction, {}, emails, lead_intel, profiles, prompts, feedback, settings, products, library,
+        exclusions, companies, reader,
+    )  # fmt: skip
 
     drafts = await asyncio.gather(*(writer.write(ctx, hook, email, score) for _, ctx, hook, email, score in jobs))
 
@@ -515,3 +542,110 @@ async def update_email(
     await emails.commit_refresh(email, lead)
     [out] = await _out(emails, [(email, lead)], feedback)
     return out
+
+
+@router.post("/test-prompt", response_model=PromptTestOut, dependencies=[Depends(require_manager)])
+async def test_prompt(
+    body: PromptTestIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
+    prompts: PromptRepo = Depends(get_prompt_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    feedback: FeedbackRepo = Depends(get_feedback_repo),
+    settings: SettingsRepo = Depends(get_settings_repo),
+    products: ProductRepo = Depends(get_product_repo),
+    library: ExampleRepo = Depends(get_example_repo),
+    writer: EmailWriter | None = Depends(get_optional_writer),
+    exclusions: ExclusionRepo = Depends(get_exclusion_repo),
+    companies: CompanyRepo = Depends(get_company_repo),
+    reader: WebsiteReader = Depends(get_website_reader),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    sending: SendingRepo = Depends(get_sending_repo),
+    session: AsyncSession = Depends(get_session),
+) -> PromptTestOut:
+    """Write one email for a person with the prompt as it's being edited, the way a real run would (their ICP,
+    posts, website, examples, feedback), and show it. Nothing is saved or queued. A follow-up needs the emails
+    before it: their saved first email if they have one, and the follow-ups before it written now with the
+    current prompts."""
+    if writer is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set")
+    person = (await stakeholders.get_many(workspace_id, [body.stakeholder_id]) or [None])[0]
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    if not person.lead_id:
+        # The working record emails are written on (not a lead until it's queued), as Write emails on People makes.
+        from routers.stakeholders import add_as_leads  # here: routers.stakeholders imports this module
+
+        await add_as_leads(AddAsLeadsIn(stakeholder_ids=[person.id]), workspace_id, lead_intel, stakeholders, companies, session)
+        person = (await stakeholders.get_many(workspace_id, [person.id]))[0]
+    if not person.lead_id:
+        raise HTTPException(status_code=422, detail="They need an email or a LinkedIn URL to be written to.")
+    tested = PromptVersionSpec(None, body.system_prompt, body.user_prompt, body.model, body.max_tokens, body.max_posts)
+    spent = 0.0
+
+    async def record(draft_calls: list, failed: bool) -> None:
+        nonlocal spent
+        for call in draft_calls:
+            c = cost_usd(call.model, call.input_tokens, call.output_tokens)
+            spent += c
+            await calls.record(workspace_id, "claude", "messages", "failed" if failed else "succeeded", lead_id=person.lead_id,
+                               cost_usd=c, action="Test prompt", model=call.model, input_tokens=call.input_tokens,
+                               output_tokens=call.output_tokens)  # fmt: skip
+
+    # Email 1: the one being tested, or (for a follow-up) the one saved for them, else one written now.
+    first = next((e for e, _ in await emails.list(workspace_id, lead_id=person.lead_id) if e.step == 1), None)
+    out: list[PromptTestEmailOut] = []
+    hook = score = confidence = None
+    reasons: list[str] = []
+    if body.kind == "email" or first is None:
+        overrides = {"email": tested} if body.kind == "email" else {}
+        outcomes, jobs, _ = await _prepare(
+            workspace_id, [person.lead_id], None, overrides, emails, lead_intel, profiles, prompts, feedback, settings, products,
+            library, exclusions, companies, reader,
+        )  # fmt: skip
+        if not jobs:
+            raise HTTPException(status_code=422, detail=outcomes[person.lead_id].reason or "This person can't be written to.")
+        lead, ctx, hook_spec, email_spec, score_spec = jobs[0]
+        draft = await writer.write(ctx, hook_spec, email_spec, score_spec if body.kind == "email" else None)
+        await record(draft.calls, bool(draft.error))
+        if draft.error or draft.email is None:
+            raise HTTPException(status_code=502, detail=draft.error or "Claude didn't return an email.")
+        first = Email(subject=draft.email.subject, body=draft.email.body, edited_body=None, hook=draft.top.hook if draft.top else "")
+        out.append(PromptTestEmailOut(step=1, subject=draft.email.subject, body=draft.email.body,
+                                      source="tested" if body.kind == "email" else "written"))  # fmt: skip
+        hook = draft.top.hook if draft.top else None
+        if body.kind == "email":
+            confidence = draft.email.confidence
+            score, reasons = (draft.score.score, list(draft.score.reasons)) if draft.score else (None, [])
+    else:
+        out.append(PromptTestEmailOut(step=1, subject=first.subject, body=first.edited_body or first.body, source="saved"))
+
+    if body.kind != "email":
+        lead = (await emails.leads(workspace_id, [person.lead_id]))[0]
+        deps = outreach.Deps(workspace_id, sending, settings, profiles, prompts, products, library, exclusions, calls, lead_intel, None)
+        last = int(body.kind.removeprefix("followup"))
+        earlier: dict[int, str] = {}
+        for step in range(2, last + 1):
+            if step == last:
+                spec = tested
+            else:
+                version = await prompts.for_icp(workspace_id, f"followup{step}", None)
+                if version is None:
+                    raise HTTPException(status_code=422, detail=f"There's no prompt for email {step} yet.")
+                spec = _spec(version)
+            variables = await outreach._variables(deps, first, lead, step, earlier)
+            follow, follow_calls, error = await write_follow_up(writer, spec, render(spec.user, variables))
+            await record(follow_calls, bool(error))
+            if error or follow is None:
+                raise HTTPException(status_code=502, detail=f"Email {step}: {error or 'Claude did not return it.'}")
+            earlier[step] = follow.body
+            out.append(PromptTestEmailOut(step=step, subject="", body=follow.body, source="tested" if step == last else "written"))
+            if step == last:
+                confidence = follow.confidence
+
+    lead = (await emails.leads(workspace_id, [person.lead_id]))[0]
+    return PromptTestOut(name=_name(lead) or "", company=lead.company or "", emails=out, hook=hook, score=score, reasons=reasons,
+                         confidence=confidence, cost_usd=round(spent, 6))  # fmt: skip
+

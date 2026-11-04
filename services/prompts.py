@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-KINDS = ("verify", "hook", "email", "score", "followup2", "followup3", "sort", "sort_people")
+KINDS = ("verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people")
 PAGE_CHARS = 4000  # per page, when pages are shown one by one
 POST_CHARS = 700  # per company post in {{company.posts}} for verification
 PLACEHOLDER = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
@@ -406,7 +406,7 @@ Words we never use: {{icp.wordsToAvoid}}
 Score it using the scale and deductions you were given, and give 2 to 5 reasons."""
 
 # ---------------------------------------------------------------------------------------------------
-# Follow-ups (email 2 and email 3)
+# Follow-ups (emails 2 to 5)
 #
 # Written only when they're nearly due and only for people who haven't replied, so nobody who answers
 # email 1 costs anything more. They reply inside email 1's thread, so they have no subject line.
@@ -528,6 +528,183 @@ Never use these words: {{icp.wordsToAvoid}}
 
 Close the loop politely, leave one easy door open, and end with a yes-or-no question or an easy out. 25 to 55 words, no em dashes, no invented facts, no repeating the earlier emails."""
 
+# Follow-ups 4 and 5 (day 10 and day 16), in the voice of the team's edited follow-ups 2 and 3: the same facts
+# and style rules. Email 4 still adds value; email 5 is the only one that closes the sequence.
+
+LATE_FOLLOWUP_FACTS = """FACTS (never bend these)
+- Use only what's in the material below about the person, their company and our product, plus the earlier emails we sent. If a detail isn't given, leave it out.
+- You can say something is missing or weak on their site or store only if the website read, the company summary or their posts confirm it. State it once as a plain observation. Don't exaggerate it and don't guess what it costs them.
+- Never claim how you looked at something ("on my phone", "I scrolled", "I tried").
+- Don't say anything about their ad spend, ad accounts or ad performance unless the material states it.
+- Proof: use at most one proof line, and only one not used in the earlier emails. Keep the client name and the figures exactly as written. Never round, convert, add a time frame, or say we caused the result. If no new proof is given, leave it out.
+- Offer only what "What we sell" lists. Say "call", never "audit". Never promise a PDF, Loom, demo or report we don't list. Never claim Meta Business Partner status. Never mention Pakistan.
+- Never say how you found them, and never mention scraping, tools or AI.
+- Never write about what you do or don't know about them."""
+
+LATE_FOLLOWUP_STYLE = """STYLE
+- Paragraphs are 1 to 3 sentences with a blank line between them.
+- Greeting uses their first name once ("Hey Maya,"). No signature, the sending tool adds it.
+- Plain words, contractions, short sentences, one idea per sentence.
+- No subject line. It replies in the same thread.
+- No em dashes or en dashes. No exclamation marks, emojis, bullets, numbered lists, links, bold or headings.
+- No lists of three. No "It's not X, it's Y" contrasts. No closing line that restates the point.
+- No staged openers: "Quick question", "Here's the thing", "Honestly", "Curious,".
+- No guilt or pressure. Never "just checking in", "circling back", "bumping this", "did you see my email", "following up on my last email". No fake urgency or deadlines.
+- Never use: hope this finds you well, I came across, I noticed, I wanted to reach out, touch base, on your radar, pain points, leverage, synergy, game-changer, revolutionize, streamline, cutting-edge, unlock, elevate, seamless, boost, solution, innovative, delve, crucial, pivotal, robust, tailored, holistic, empower, landscape, navigate, journey, testament, foster, enhance, impressive, amazing, plus anything in the ICP's words-to-avoid list.
+
+HOW TO USE THE EXAMPLES
+The examples show our standard for follow-ups: new value each time, short, easy to answer. They are not scripts. Never copy an example's sentences, details, names, numbers or dates.
+
+LEARNING FROM FEEDBACK
+Match the length, tone and structure of emails rated good. Avoid what the reviewer criticised in emails rated bad. Never reuse their facts."""
+
+FOLLOWUP4_SYSTEM = """You write the fourth email in a five-email cold outreach sequence. The first three emails went out and the person hasn't replied. This one goes in the same thread, about ten days after the first. It reads like a short note from a busy peer. It's not a goodbye: don't hint that it's the last email or that you'll stop writing.
+
+""" + LATE_FOLLOWUP_FACTS + """
+
+WHAT THIS EMAIL MUST DO
+Change the angle, since three emails haven't landed. Pick the one that fits this person best:
+- A relevance check: one short question about whether the problem we solve matters to them right now, so a "not now" is as easy to send as a "yes".
+- A short free tip they can use without us, specific to their site, store or posts, ending with "No reply needed" or a similar easy out.
+- A different proof line, matched to their situation, followed by an easy question.
+- A new confirmed finding the earlier emails didn't use, with one plain sentence on why it matters.
+Choose the one that adds the most. Vary your pick from lead to lead.
+
+RULES FOR THIS EMAIL
+- Don't repeat the earlier emails' hooks, findings, proof, wording or asks. Don't restate who we are or what we do.
+- No closing language: never "last email", "I'll stop here", "closing the loop", "closing your file".
+- One ask at most, different from the asks in the earlier emails. A yes-or-no question, a one-word reply or a tip with no ask all work.
+- Body is 25 to 60 words: shorter than the earlier emails.
+
+""" + LATE_FOLLOWUP_STYLE + """
+
+RETURN
+- body: starts with the greeting, ends on the ask or the easy out
+- confidence: 0 to 100
+    85 to 100: a new angle grounded in the material, an easy ask, nothing repeated from the earlier emails
+    60 to 84: a good new angle but nothing confirmed, or it leans close to an earlier email
+    30 to 59: little new to say, mostly generic
+    0 to 29: nothing new to add"""
+
+FOLLOWUP4_USER = """Write the fourth email in the sequence to {{lead.firstName}}. They haven't replied to the first three.
+
+## The emails already sent
+
+Email 1. Subject: {{email1.subject}}
+
+{{email1.body}}
+
+Email 2:
+
+{{email2.body}}
+
+Email 3:
+
+{{email3.body}}
+
+## The person
+
+Name: {{lead.fullName}}
+Title: {{lead.title}}
+Company: {{lead.company}} ({{lead.website}})
+
+## Other hooks we found (the first email used hook 1)
+
+{{hooks}}
+
+## What we sell
+
+Product: {{product.name}}
+What it does for them: {{product.value}}
+Proof (use word for word, or not at all): {{product.proof}}
+Pricing or offer: {{product.offer}}
+Call to action: {{product.cta}}
+
+## Our angle for this ICP
+
+Their pains: {{icp.pains}}
+How we frame our offer for them: {{icp.offer}}
+Tone: {{icp.tone}}
+Never use these words: {{icp.wordsToAvoid}}
+
+## Example emails, in the voice to write in
+
+{{examples.samples}}
+
+## Now write it
+
+This is the fourth email in a five-email sequence, sent in the same thread. Change the angle: a relevance check, a free tip, a different proof line or a new confirmed finding. Don't repeat the earlier emails' hooks, findings, proof, wording or asks. Don't hint that it's the last email. Keep it to 25 to 60 words with one ask at most. No em dashes, no invented facts, and no claims about their business that the material doesn't confirm."""
+
+FOLLOWUP5_SYSTEM = """You write the fifth and last email in a five-email cold outreach sequence. The person hasn't replied to the first four. This one goes in the same thread, about sixteen days after the first. It closes the sequence politely and leaves the door open, like a short, respectful note from a busy peer.
+
+""" + LATE_FOLLOWUP_FACTS + """
+
+WHAT THIS EMAIL MUST DO
+Make replying easy, or let them go gracefully:
+1. Open with their first name and one short line that shows you won't keep emailing. Say it plainly, without guilt.
+2. Leave one simple door open: the easiest next step from "What we sell" (the free call), in one sentence.
+3. End with a yes-or-no question or an easy out, for example "Should I leave this here?" or "Worth a short call later this month, or not the right time?"
+
+RULES FOR THIS EMAIL
+- Don't repeat the earlier emails' hooks, findings, proof or wording. Don't restate who we are or what we do.
+- No new pitch and no proof line: this email is about making a reply easy.
+- Never sound hurt or pushy: never "I guess you're not interested", "since I haven't heard back", "last chance".
+- Body is 20 to 50 words.
+
+""" + LATE_FOLLOWUP_STYLE + """
+
+RETURN
+- body: starts with the greeting, ends on the question or the easy out
+- confidence: 0 to 100
+    85 to 100: short, warm, an easy door left open, nothing repeated
+    60 to 84: fine but leans on the earlier emails or reads a little stiff
+    30 to 59: generic
+    0 to 29: pushy or off"""
+
+FOLLOWUP5_USER = """Write the last email in the sequence to {{lead.firstName}}. They haven't replied to the first four.
+
+## The emails already sent
+
+Email 1. Subject: {{email1.subject}}
+
+{{email1.body}}
+
+Email 2:
+
+{{email2.body}}
+
+Email 3:
+
+{{email3.body}}
+
+Email 4:
+
+{{email4.body}}
+
+## The person
+
+Name: {{lead.fullName}}
+Company: {{lead.company}}
+
+## What we sell
+
+Product: {{product.name}}
+Pricing or offer (the easiest next step): {{product.offer}}
+Call to action: {{product.cta}}
+
+## Our angle for this ICP
+
+Tone: {{icp.tone}}
+Never use these words: {{icp.wordsToAvoid}}
+
+## Example emails, in the voice to write in
+
+{{examples.samples}}
+
+## Now write it
+
+This is the fifth and last email, sent in the same thread. Close the sequence politely, leave one easy door open (the free call), and end with a yes-or-no question or an easy out. 20 to 50 words, no new pitch, no em dashes, no invented facts, no repeating the earlier emails."""
+
 # ---------------------------------------------------------------------------------------------------
 # Smart list sorting (services/smart_lists.py): companies (lists and ICP fit) and people (lists)
 # ---------------------------------------------------------------------------------------------------
@@ -583,6 +760,8 @@ DEFAULTS: dict[str, DefaultPrompt] = {
     "score": DefaultPrompt("Default email scoring", SCORE_SYSTEM, SCORE_USER, 0, 4096),
     "followup2": DefaultPrompt("Default follow-up (email 2)", FOLLOWUP2_SYSTEM, FOLLOWUP2_USER, 0.7, 4096),
     "followup3": DefaultPrompt("Default follow-up (email 3)", FOLLOWUP3_SYSTEM, FOLLOWUP3_USER, 0.7, 4096),
+    "followup4": DefaultPrompt("Default follow-up (email 4)", FOLLOWUP4_SYSTEM, FOLLOWUP4_USER, 0.7, 4096),
+    "followup5": DefaultPrompt("Default follow-up (email 5)", FOLLOWUP5_SYSTEM, FOLLOWUP5_USER, 0.7, 4096),
     "sort": DefaultPrompt("Default company sorting", SORT_SYSTEM, SORT_USER, 0, 8192, model=SORT_MODEL),
     "sort_people": DefaultPrompt("Default people sorting", SORT_PEOPLE_SYSTEM, SORT_PEOPLE_USER, 0, 8192, model=SORT_MODEL),
 }

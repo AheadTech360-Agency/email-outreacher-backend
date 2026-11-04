@@ -3,8 +3,10 @@ sends: a campaign only sends once a person activates it in CheapSequencer.
 
   queue       An approved first email goes into its ICP's campaign ("Coldbrew: <ICP>"): the lead is
               imported into a new list with email_1_subject and email_1_body, and the generic
-              follow-ups in email_2_body and email_3_body (so a step can never go out blank), then
+              follow-ups in email_2_body to email_5_body (so a step can never go out blank), then
               the list is enrolled.
+  sequence    Five emails: day 1, 3, 6, 10 and 16 (SCHEDULE). CheapSequencer stops a lead's sequence when
+              they reply, bounce or unsubscribe.
   follow-ups  Every run reads each campaign's enrollments. When a lead's next email is due within
               the lead time (last send + the step's delay) and they haven't replied, bounced or
               unsubscribed, Claude writes it with the follow-up prompt and it replaces the generic
@@ -29,7 +31,12 @@ from services.sending import SendingError
 
 
 CAMPAIGN_PREFIX = "Coldbrew: "
-DEFAULT_DELAYS = {2: 3, 3: 5}  # days after the previous email, as the campaigns are set up
+# Day 1, 3, 6, 10 and 16: the days after the previous email that each step waits.
+SCHEDULE = {1: 0, 2: 2, 3: 3, 4: 4, 5: 6}
+FOLLOW_UPS = (2, 3, 4, 5)
+DEFAULT_DELAYS = {s: SCHEDULE[s] for s in FOLLOW_UPS}
+# The lead fields each follow-up's text rides in; CheapSequencer needs them to exist before an import uses them.
+BODY_FIELDS = {s: (f"Email {s} body", f"email_{s}_body") for s in FOLLOW_UPS}
 ENDED = {"completed", "stopped", "paused", "removed", "cancelled"}
 
 
@@ -62,8 +69,8 @@ def step_body(step: int, company: str, website: str) -> str:
     return f"{{{{email_{step}_body}}}}\n\n{signature(company, website)}"
 
 
-def lead_row(lead: Lead, subject: str, body: str, fallback_2: str, fallback_3: str) -> dict[str, str]:
-    """One CSV row for CheapSequencer: built-in lead fields plus the four email fields."""
+def lead_row(lead: Lead, subject: str, body: str, fallbacks: dict[int, str]) -> dict[str, str]:
+    """One CSV row for CheapSequencer: built-in lead fields plus the email fields (subject, then bodies 1 to 5)."""
     first = lead.first_name or ""
     return {
         "email": (lead.email or "").strip().lower(),
@@ -75,8 +82,7 @@ def lead_row(lead: Lead, subject: str, body: str, fallback_2: str, fallback_3: s
         "linkedin_profile": lead.linkedin_url or "",
         "email_1_subject": subject,
         "email_1_body": body,
-        "email_2_body": first_name_in(fallback_2, first),
-        "email_3_body": first_name_in(fallback_3, first),
+        **{f"email_{s}_body": first_name_in(fallbacks[s], first) for s in FOLLOW_UPS},
     }
 
 
@@ -112,12 +118,12 @@ def progress(enrollment: dict[str, Any]) -> Progress:
 
 
 def due_follow_up(p: Progress, delays: dict[int, int], now: datetime, lead_hours: int) -> int | None:
-    """The follow-up (2 or 3) to write now: the lead is still active with no reply, the previous email
+    """The follow-up (2 to 5) to write now: the lead is still active with no reply, the previous email
     has gone out, and the next one is due within `lead_hours`."""
     if p.status != "active" or p.stop_reason or p.last_sent_at is None:
         return None
     step = p.sent + 1
-    if step not in (2, 3):
+    if step not in FOLLOW_UPS:
         return None
     due = p.last_sent_at + timedelta(days=delays.get(step, DEFAULT_DELAYS[step]))
     return step if now >= due - timedelta(hours=lead_hours) else None
@@ -126,7 +132,7 @@ def due_follow_up(p: Progress, delays: dict[int, int], now: datetime, lead_hours
 def delays_of(campaign: dict[str, Any]) -> dict[int, int]:
     steps = campaign.get("steps") or []
     out = dict(DEFAULT_DELAYS)
-    for index, s in enumerate(steps[:3], start=1):
+    for index, s in enumerate(steps[: len(SCHEDULE)], start=1):
         if index > 1 and isinstance(s.get("delay_days"), int):
             out[index] = s["delay_days"]
     return out
@@ -335,8 +341,8 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
         if not members:
             continue
         ids = sorted(str(e.id) for e, _ in members)
-        rows = [lead_row(lead, e.subject, e.edited_body or e.body, settings["followup_fallback_2"], settings["followup_fallback_3"])
-                for e, lead in members]  # fmt: skip
+        fallbacks = {s: settings[f"followup_fallback_{s}"] for s in FOLLOW_UPS}
+        rows = [lead_row(lead, e.subject, e.edited_body or e.body, fallbacks) for e, lead in members]
         try:
             # The list's key and name depend only on which emails these are, so a retry reuses the same list.
             # Each import gets a fresh key: re-importing only updates the same leads by email.
@@ -361,11 +367,17 @@ class TemplateOutcome:
 
 
 async def sync_templates(deps: Deps) -> list[TemplateOutcome]:
-    """Write the signature (sender name, company, website) into every Coldbrew campaign's steps.
-    Only draft or paused campaigns can be changed; an active one is reported, not touched."""
+    """Give every Coldbrew campaign its five steps on the schedule (day 1, 3, 6, 10, 16), each with the
+    signature (sender name, company, website). Steps it already has keep their ids and settings; missing
+    ones are added like step 2 (in the same thread). Only draft or paused campaigns can be changed; an
+    active one is reported, not touched. The lead fields emails 4 and 5 ride in are created first."""
     settings = await deps.settings.sending(deps.workspace_id)
     company, website = settings["sender_company"], settings["sender_website"]
     out: list[TemplateOutcome] = []
+    try:
+        await ensure_body_fields(deps.sequencer)
+    except SendingError as exc:
+        return [TemplateOutcome("Lead fields", "skipped", exc.message)]
     for summary in await deps.sequencer.campaigns():
         name = summary.get("name") or ""
         if not name.startswith(CAMPAIGN_PREFIX):
@@ -375,23 +387,49 @@ async def sync_templates(deps: Deps) -> list[TemplateOutcome]:
             out.append(TemplateOutcome(name, "skipped", "It's sending. Pause it in CheapSequencer to change its text."))
             continue
         steps = campaign.get("steps") or []
-        wanted = [step_body(i, company, website) for i in range(1, len(steps) + 1)]
-        if [s.get("body_text") for s in steps] == wanted:
+        wanted = [step_body(i, company, website) for i in SCHEDULE]
+        if [s.get("body_text") for s in steps] == wanted and [s.get("delay_days") for s in steps] == list(SCHEDULE.values()):
             out.append(TemplateOutcome(name, "unchanged"))
             continue
-        new_steps = []
-        for i, s in enumerate(steps, start=1):
-            step = {k: s[k] for k in ("id", "delay_days", "thread_mode", "send_as_plain_text") if k in s}
-            step["body_text"] = wanted[i - 1]
-            if i == 1:
-                step["subject"] = s.get("subject") or "{{email_1_subject}}"
-            new_steps.append(step)
+        new_steps = campaign_steps(steps, wanted)
         try:
             await deps.sequencer.set_steps(summary["id"], new_steps, etag, key_for("steps", summary["id"], *wanted))
             out.append(TemplateOutcome(name, "updated"))
         except SendingError as exc:
             out.append(TemplateOutcome(name, "skipped", exc.message))
     return out
+
+
+def campaign_steps(steps: list[dict[str, Any]], bodies: list[str]) -> list[dict[str, Any]]:
+    """The campaign's steps as they should be: one per email on SCHEDULE. A step it has keeps its id, thread
+    mode and plain-text setting; a missing one copies step 2's (a reply in the same thread)."""
+    like = steps[1] if len(steps) > 1 else {}
+    out = []
+    for i, body in zip(SCHEDULE, bodies, strict=True):
+        have = steps[i - 1] if i <= len(steps) else None
+        source = have or like
+        step = {k: source[k] for k in ("thread_mode", "send_as_plain_text") if k in source}
+        if have and "id" in have:
+            step["id"] = have["id"]
+        if i > 1:
+            step.setdefault("thread_mode", "reply_to_previous")
+        step["delay_days"], step["body_text"] = SCHEDULE[i], body
+        if i == 1:
+            step["subject"] = (have or {}).get("subject") or "{{email_1_subject}}"
+        out.append(step)
+    return out
+
+
+async def ensure_body_fields(sequencer: Any) -> list[str]:
+    """Create the lead fields emails 2 to 5 ride in (Email 4 body, Email 5 body...) where CheapSequencer
+    doesn't have them yet. Returns the tags it created."""
+    tags = {f.get("tag") for f in await sequencer.custom_fields()}
+    made = []
+    for name, tag in BODY_FIELDS.values():
+        if tag not in tags:
+            await sequencer.create_custom_field(name, "textarea", key_for("field", tag))
+            made.append(tag)
+    return made
 
 
 @dataclass
@@ -422,7 +460,8 @@ async def _variables(deps: Deps, email: Email, lead: Lead, step: int, earlier: d
         "hook.text": email.hook or "",
         "examples.samples": format_samples(samples),
         "email1.subject": email.subject, "email1.body": email.edited_body or email.body,
-        "email2.body": earlier.get(2, ""), "followup.step": str(step),
+        "email2.body": earlier.get(2, ""), "email3.body": earlier.get(3, ""), "email4.body": earlier.get(4, ""),
+        "followup.step": str(step),
     }  # fmt: skip
     out.update(product_variables(None if product is None else {k: getattr(product, k) for k in PRODUCT_FIELDS}))
     return out
@@ -474,7 +513,7 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
         email.sequence_synced_at, email.sequence_raw = now, row
         if p.sent >= 1 and email.status == "queued":
             email.status, email.sent_at = "sent", email.sent_at or p.last_sent_at
-        for step in (2, 3):
+        for step in FOLLOW_UPS:
             later = existing.get((lead.id, step))
             if later is not None and p.sent >= step and later.status == "queued":
                 later.status, later.sent_at = "sent", p.last_sent_at
@@ -491,7 +530,7 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
         if version is None:
             continue
         spec = PromptVersionSpec(version.id, version.system_prompt, version.user_prompt, version.model, version.max_tokens)
-        earlier = {k: (existing[(lead.id, k)].edited_body or existing[(lead.id, k)].body) for k in (2,) if (lead.id, k) in existing}
+        earlier = {k: (existing[(lead.id, k)].edited_body or existing[(lead.id, k)].body) for k in range(2, step) if (lead.id, k) in existing}
         variables = await _variables(deps, email, lead, step, earlier)
         draft, calls, error = await write_follow_up(deps.writer, spec, render(spec.user, variables))
         cost = sum(cost_usd(c.model, c.input_tokens, c.output_tokens) for c in calls)
@@ -553,12 +592,12 @@ class OutboxStep:
 
 
 def outbox_steps(email: Email, lead: Lead, later: dict[int, Email], fallbacks: dict[int, str]) -> list[OutboxStep]:
-    """The three emails as the lead gets them: email 2 and 3 are the generic text until Claude writes them."""
+    """The five emails as the lead gets them: emails 2 to 5 are the generic text until Claude writes them."""
     sent = email.sequence_sent_count or 0
     ended = lead_state(email) not in ("queued", "sending")
     steps = [OutboxStep(1, email.subject, email.edited_body or email.body, "sent" if sent >= 1 else "skipped" if ended else "waiting",
                         True, email.sent_at)]  # fmt: skip
-    for step in (2, 3):
+    for step in FOLLOW_UPS:
         row = later.get(step)
         body = (row.edited_body or row.body) if row else first_name_in(fallbacks[step], lead.first_name or "")
         status = "sent" if sent >= step else "skipped" if ended else "waiting"
