@@ -20,7 +20,7 @@ from schemas import (
     QuickstartCompanyOut, QuickstartDetailOut, QuickstartDraftOut, QuickstartIn, QuickstartLeadOut, QuickstartRunOut, QuickstartStep,
 )  # fmt: skip
 from services.auth import CurrentUser
-from services.quickstart import STEPS
+from services.quickstart import steps_for
 
 router = APIRouter(prefix="/quickstart", tags=["quickstart"])
 
@@ -37,10 +37,19 @@ def _out(run: QuickstartRun, icp_name: str) -> dict:
     settings = {_camel(k): v for k, v in run.settings.items()}
     return {
         "id": run.id, "icp_id": run.icp_id, "icp_name": icp_name, "status": run.status, "step": run.step, "settings": settings,
-        "steps": {s: QuickstartStep(**(run.progress.get(s) or {})) for s in STEPS},
+        "steps": {s: QuickstartStep(**(run.progress.get(s) or {})) for s in _order(run)},
+        "step_order": _order(run),
         "spent_usd": float(run.spent_usd), "spend_limit_usd": float(run.spend_limit_usd), "detail": run.detail,
         "created_at": run.created_at, "finished_at": run.finished_at,
     }  # fmt: skip
+
+
+def _order(run: QuickstartRun) -> list[str]:
+    """The run's steps. A run that started before a step existed doesn't show it."""
+    order = steps_for(run.settings)
+    if run.status in ("done", "stopped", "failed", "cancelled"):
+        order = [s for s in order if s in run.progress or s not in ("website", "profiles")]
+    return order
 
 
 async def _name(lead_intel: LeadIntelRepo, icp_id: UUID) -> str:

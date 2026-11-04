@@ -2084,6 +2084,28 @@ class QuickstartRepo:
         query = query.order_by(emailed.desc(), Company.score.desc().nulls_last(), Company.created_at.desc()).limit(limit)
         return list(await self.session.scalars(query))
 
+    async def without_pages(self, ids: list[UUID]) -> list[UUID]:
+        """Which of these companies have no website pages read yet."""
+        if not ids:
+            return []
+        read = select(CompanyPage.company_id).where(CompanyPage.company_id.in_(ids))
+        return list(await self.session.scalars(select(Company.id).where(Company.id.in_(ids), Company.id.not_in(read))))
+
+    async def contacted(self, workspace_id: UUID, people: list[Stakeholder]) -> set[UUID]:
+        """Who among these people was already contacted: an email of theirs queued or sent, or their address ever
+        queued (eo_queued_addresses), whichever record it was under."""
+        if not people:
+            return set()
+        lead_ids = [p.lead_id for p in people if p.lead_id]
+        sent = set()
+        if lead_ids:
+            sent = set(await self.session.scalars(
+                select(Email.lead_id).where(Email.lead_id.in_(lead_ids), Email.status.in_(("queued", "sent")))
+            ))  # fmt: skip
+        emails = {p.email.lower() for p in people if p.email}
+        queued = set(await self.session.scalars(select(QueuedAddress.email).where(QueuedAddress.email.in_(emails)))) if emails else set()
+        return {p.id for p in people if (p.lead_id and p.lead_id in sent) or (p.email and p.email.lower() in queued)}
+
     async def add_website_contacts(self, workspace_id: UUID, contacts: list[tuple[Company, str]]) -> None:
         """A company's published address as its contact, for companies where LinkedIn found no one with an email.
         Stored as a manual contact (the sources the table allows) marked by its email status, "website". Adding

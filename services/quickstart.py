@@ -7,9 +7,20 @@ get their turn in between. Spend is the total of the run's jobs' paid calls; the
 
 Nothing is queued for sending: the run ends with drafts in review, approved by a person.
 
-A run on existing companies (source "existing": imported ones, say) skips the search: `find` picks the ICP's
-companies no one has written to yet, `research` verifies only those never verified, and `people` only looks on
-LinkedIn at companies where no one with an email is known yet.
+A run on existing companies (source "existing": imported ones, say) skips the search, and fills in only what's
+missing before writing:
+
+  find      the ICP's companies no one has written to yet, those with someone emailable first
+  research  verifies only those never verified (imported ones count as verified)
+  website   reads the websites not read yet (free: a plain request, Jina when a site needs a browser)
+  people    LinkedIn at companies where no one has a verified email
+  leads     the people to write to, never anyone already contacted
+  profiles  the LinkedIn profiles of those people and the LinkedIn page and Instagram of their companies, where
+            not read yet: only for who gets an email, so nothing is paid for anyone else
+  posts     their company's LinkedIn and Instagram posts and their own LinkedIn posts
+  write     their emails, left for review
+
+A Google Maps run has no website or profiles step: verifying already reads the website and Instagram.
 
   find      Google Maps search for the ICP's terms around the places; the newest unresearched companies are kept
   research  verify them (website, Instagram, the ICP's rule, Claude's score), 10 at a time
@@ -34,11 +45,19 @@ from models import Job, QuickstartRun
 
 log = logging.getLogger("coldbrew.quickstart")
 
-STEPS = ["find", "research", "people", "leads", "posts", "write"]
+STEPS = ["find", "research", "website", "people", "leads", "profiles", "posts", "write"]
 LABELS = {
-    "find": "Find companies", "research": "Verify companies", "people": "Fetch LinkedIn profiles",
-    "leads": "Make leads", "posts": "Read their posts", "write": "Write emails",
+    "find": "Find companies", "research": "Verify companies", "website": "Read websites", "people": "Fetch LinkedIn profiles",
+    "leads": "Make leads", "profiles": "Fill in profiles", "posts": "Read their posts", "write": "Write emails",
 }  # fmt: skip
+EXISTING_ONLY = ("website", "profiles")
+WEBSITE_BATCH = 25
+VERIFIED = ("verified", "valid")  # Apollo's word, and the LinkedIn finder's
+
+
+def steps_for(settings: dict[str, Any]) -> list[str]:
+    """The steps a run goes through: a Google Maps run has no website or profiles step."""
+    return STEPS if settings.get("source") == "existing" else [s for s in STEPS if s not in EXISTING_ONLY]
 RESEARCH_BATCH, PEOPLE_BATCH, POSTS_BATCH, WRITE_BATCH = 10, 10, 25, 25
 CRASHED = "Something went wrong running it. The worker's log has the details."
 
@@ -79,8 +98,8 @@ async def _step(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
         return False
     _set(run, run.step, state="running")
     await session.commit()
-    return await {"find": _find, "research": _research, "people": _people, "leads": _leads, "posts": _posts,
-                  "write": _write}[run.step](session, repo, run)  # fmt: skip
+    return await {"find": _find, "research": _research, "website": _website, "people": _people, "leads": _leads,
+                  "profiles": _profiles, "posts": _posts, "write": _write}[run.step](session, repo, run)  # fmt: skip
 
 
 # ---------- Steps ----------
@@ -141,7 +160,31 @@ async def _research(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> b
         return False
     if not qualified:
         return _finish(run, "None of the companies qualified for this ICP, so there's no one to write to.")
-    return _next(run, "people")
+    return _next(run, "website" if run.settings.get("source") == "existing" else "people")
+
+
+async def _website(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
+    """Read the websites of the qualified companies that haven't been read yet. Free."""
+    tried = set(run.progress.get("_sited", []))
+    companies = await repo.companies(list(run.company_ids))
+    qualified = [c.id for c in companies if c.status == "qualified"]
+    unread = set(await repo.without_pages(qualified))
+    todo = [i for i in qualified if i in unread and str(i) not in tried][:WEBSITE_BATCH]
+    read, failed = run.progress.get("_sites", [0, 0])
+    if todo:
+        ok, out, detail = await _job(session, run, "/pipeline/enrich", {"companyIds": [str(i) for i in todo], "website": True},
+                                     "Quick Start: reading websites")  # fmt: skip
+        if not ok:
+            return _fail(run, "website", detail)
+        read, failed = read + (out or {}).get("sitesRead", 0), failed + (out or {}).get("sitesFailed", 0)
+        run.progress = {**run.progress, "_sited": sorted(tried | {str(i) for i in todo}), "_sites": [read, failed]}
+    tried = set(run.progress.get("_sited", []))
+    left = [i for i in qualified if i in unread and str(i) not in tried]
+    already = len(qualified) - len(unread)
+    note = ", ".join(x for x in (f"{already} read before" if already else "", f"{read} read now" if read else "",
+                                 f"{failed} couldn't be reached" if failed else "") if x) or "No websites to read"  # fmt: skip
+    _set(run, "website", state="running" if left else "done", done=len(qualified) - len(left), total=len(qualified), note=note)
+    return True if left else _next(run, "people")
 
 
 async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
@@ -154,9 +197,9 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
         here = await repo.people_at(run.workspace_id, list(run.company_ids))
         run.progress = {**run.progress, "_had": sorted(str(p.id) for p in here)}
     if s.get("source") == "existing":
-        # Their people are usually here already (imported with them): LinkedIn only where no one has an email,
-        # and only when asked.
-        emailed = {p.company_id for p in await repo.people_at(run.workspace_id, qualified) if p.email}
+        # Their people are usually here already (imported with them): LinkedIn only where no one has a verified
+        # email, and only when asked.
+        emailed = {p.company_id for p in await repo.people_at(run.workspace_id, qualified) if p.email and p.email_status in VERIFIED}
         lookup = [i for i in qualified if i not in emailed] if s.get("find_people", True) else []
         searched |= {str(i) for i in qualified if i not in lookup}
         run.progress = {**run.progress, "_searched": sorted(searched)}
@@ -212,12 +255,14 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     # was already written for them; only the others need one made.
     drafted = {e.lead_id for e in await repo.first_emails([p.lead_id for p in people if p.lead_id])}
     taken = set(run.lead_ids)
-    eligible = [p for p in people if p.lead_id not in drafted and p.lead_id not in taken
+    contacted = await repo.contacted(run.workspace_id, people)
+    eligible = [p for p in people if p.lead_id not in drafted and p.lead_id not in taken and p.id not in contacted
                 and (p.email or not s["only_with_email"]) and (p.email or p.linkedin_url)]  # fmt: skip
-    # No more than the people per company asked for (imported companies can hold many), those with an email first.
+    # No more than the people per company asked for (imported companies can hold many): verified emails first,
+    # then any email.
     per: dict[Any, int] = {}
     picked = []
-    for p in sorted(eligible, key=lambda p: not p.email):
+    for p in sorted(eligible, key=lambda p: (p.email_status not in VERIFIED, not p.email)):
         if per.get(p.company_id, 0) < s["people_per_company"]:
             per[p.company_id] = per.get(p.company_id, 0) + 1
             picked.append(p)
@@ -233,17 +278,59 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     lead_ids = list(dict.fromkeys([*run.lead_ids, *(p.lead_id for p in people if p.id in chosen and p.lead_id)]))[: s["leads"]]
     run.lead_ids = lead_ids
     leads = await repo.leads(lead_ids)
-    valid = sum(1 for lead in leads if lead.email and lead.email_status in ("valid", "website"))
+    valid = sum(1 for lead in leads if lead.email and lead.email_status in (*VERIFIED, "website"))
     risky = sum(1 for lead in leads if lead.email and lead.email_status == "risky")
     no_email = sum(1 for lead in leads if not lead.email)
+    skipped = len([p for p in people if p.id in contacted])
     note = f"{len(leads)} leads: {valid} valid email{'s' if valid != 1 else ''}, {risky} risky" + (f", {no_email} without one" if no_email else "")
+    if skipped:
+        note += f". {skipped} already contacted, skipped"
     _set(run, "leads", state="done", done=len(leads), total=s["leads"], note=note)
     if not leads:
         return _finish(run, "No one had an email address, so no leads were made." if s["only_with_email"] else "No leads were made.")
-    if s["posts_per_lead"] == 0:
+    if s.get("source") == "existing":
+        return _next(run, "profiles")
+    return _after_profiles(run)
+
+
+def _after_profiles(run: QuickstartRun) -> bool:
+    if run.settings["posts_per_lead"] == 0:
         _set(run, "posts", state="skipped", note="Posts per lead is 0")
         return _next(run, "write")
     return _next(run, "posts")
+
+
+async def _profiles(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
+    """LinkedIn profiles of the people being written to, and their companies' LinkedIn pages and Instagram, where
+    not read yet (the enrich endpoints skip what's there, so nothing is bought twice)."""
+    people = [p for p in await repo.people_at(run.workspace_id, list(run.company_ids)) if p.lead_id in set(run.lead_ids)]
+    done = dict(run.progress.get("_profiled", {}))
+    if "companies" not in done:
+        ids = sorted({str(p.company_id) for p in people if p.company_id})
+        out = {}
+        if ids:
+            ok, out, detail = await _job(session, run, "/pipeline/enrich", {"companyIds": ids, "instagram": True, "linkedin": True},
+                                         "Quick Start: company profiles")  # fmt: skip
+            if not ok:
+                return _fail(run, "profiles", detail)
+        done["companies"] = [(out or {}).get("instagram", 0), (out or {}).get("linkedinCompanies", 0)]
+        run.progress = {**run.progress, "_profiled": done}
+        _set(run, "profiles", state="running", done=0, total=len(people),
+             note=f"{done['companies'][0]} Instagram and {done['companies'][1]} LinkedIn company pages read")  # fmt: skip
+        return True
+    if "people" not in done:
+        ids = [str(p.id) for p in people if p.linkedin_url]
+        out = {}
+        if ids:
+            ok, out, detail = await _job(session, run, "/stakeholders/enrich", {"stakeholderIds": ids}, "Quick Start: people's profiles")
+            if not ok:
+                return _fail(run, "profiles", detail)
+        done["people"] = (out or {}).get("linkedinPeople", 0)
+        run.progress = {**run.progress, "_profiled": done}
+    ig, li = done["companies"]
+    note = f"{done['people']} people's LinkedIn profiles, {ig} Instagram and {li} LinkedIn company pages read; the rest were read before"
+    _set(run, "profiles", state="done", done=len(people), total=len(people), note=note)
+    return _after_profiles(run)
 
 
 async def _posts(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
@@ -340,7 +427,8 @@ def _next(run: QuickstartRun, step: str) -> bool:
 
 def _finish(run: QuickstartRun, detail: str) -> bool:
     run.detail = detail
-    for step in STEPS[STEPS.index(run.step) + 1 :]:
+    order = steps_for(run.settings)
+    for step in order[order.index(run.step) + 1 :]:
         if run.progress.get(step, {}).get("state") in (None, "waiting"):
             _set(run, step, state="skipped")
     run.step = "done"

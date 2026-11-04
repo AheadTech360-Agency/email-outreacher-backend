@@ -1479,6 +1479,7 @@ class QuickstartRunOut(ApiModel):
     step: str
     settings: dict[str, Any]
     steps: dict[str, QuickstartStep]
+    step_order: list[str] = []  # the run's own steps, in order
     spent_usd: float
     spend_limit_usd: float
     detail: str | None

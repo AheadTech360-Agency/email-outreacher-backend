@@ -24,6 +24,8 @@ class World:
         self.calls = []
         self.spent = 0.0
         self.finished = {}  # path -> the answer of a job this run already finished
+        self.sites: set[str] = set()  # companies whose website was read
+        self.contacted: set = set()  # people already emailed
         for name in ("Ink Co", "Tee Shop", "Big Box"):
             c = SimpleNamespace(id=uuid4(), name=name, domain=None, status="found", status_reason=None, score=None, researched_at=None)
             self.companies[c.id] = c
@@ -64,6 +66,14 @@ class World:
                 lead.status = "enriched"
                 self.posts[lead.id] = 3
             return True, {"error": None}, None
+        if path == "/pipeline/enrich":
+            if body.get("website"):
+                for cid in body["companyIds"]:
+                    self.sites.add(cid)
+                return True, {"sitesRead": len(body["companyIds"]), "sitesFailed": 0}, None
+            return True, {"instagram": 1, "linkedinCompanies": 1}, None
+        if path == "/stakeholders/enrich":
+            return True, {"linkedinPeople": len(body["stakeholderIds"])}, None
         if path == "/emails/generate":
             for lid in body["leadIds"]:
                 self.emails.append(SimpleNamespace(id=uuid4(), lead_id=next(x.id for x in self.leads.values() if str(x.id) == lid)))
@@ -80,6 +90,12 @@ class Repo:
 
     async def existing_companies(self, workspace_id, icp_id, smart_list_id, limit):
         return [c.id for c in self.w.companies.values()][:limit]
+
+    async def without_pages(self, ids):
+        return [i for i in ids if str(i) not in self.w.sites]
+
+    async def contacted(self, workspace_id, people):
+        return {p.id for p in people if p.id in self.w.contacted}
 
     async def companies(self, ids):
         return [self.w.companies[i] for i in ids]
@@ -163,7 +179,7 @@ def test_a_run_goes_from_google_maps_to_drafts_in_review(world) -> None:
     steps = run.progress
     assert steps["research"]["note"] == "2 qualified, 1 not a fit"
     assert steps["leads"]["note"] == "2 leads: 1 valid email, 1 risky"
-    assert steps["write"]["done"] == 2 and all(steps[s]["state"] == "done" for s in quickstart.STEPS)
+    assert steps["write"]["done"] == 2 and all(steps[s]["state"] == "done" for s in quickstart.steps_for(run.settings))
     assert len(run.lead_ids) == 2 and len(run.company_ids) == 3
 
 
@@ -313,3 +329,37 @@ def test_people_already_worked_on_are_reused_and_those_written_to_are_not(world)
     assert done_before.id in run.lead_ids and written.id not in run.lead_ids and len(run.lead_ids) == 2
     assert world.calls.count("/stakeholders/add-as-leads") == 1  # only for Big Box's person
     assert world.calls.count("/posts/fetch") == 1 and run.detail.startswith("Done: 2 drafts")
+
+
+def test_an_existing_run_fills_in_before_writing_and_skips_anyone_contacted(world) -> None:
+    """Websites not read yet, LinkedIn only where no one has a verified email, profiles only for who's written to,
+    then posts and emails. Someone already emailed is never picked."""
+    ink, tee, big = world.companies.values()
+    for c in (ink, tee, big):
+        c.status = "qualified"
+    world.sites.add(str(ink.id))  # Ink Co's site was read before
+    emailed = SimpleNamespace(id=uuid4(), company_id=ink.id, lead_id=None, linkedin_url="https://linkedin.com/in/a", email="a@ink.com", email_status="verified")
+    unverified = SimpleNamespace(id=uuid4(), company_id=big.id, lead_id=None, linkedin_url=None, email="b@big.com", email_status="extrapolated")
+    ready = SimpleNamespace(id=uuid4(), company_id=ink.id, lead_id=None, linkedin_url="https://linkedin.com/in/c", email="c@ink.com", email_status="verified")
+    for p in (emailed, unverified, ready):
+        world.people[p.id] = p
+    world.contacted.add(emailed.id)
+    run = new_run(source="existing", smart_list_id=None, search_terms=[], places=[])
+    run_all(run, world)
+    # One LinkedIn search, for Tee Shop (no one) and Big Box (an unverified email) together; Ink Co is skipped.
+    assert world.calls == ["/pipeline/enrich", "/pipeline/stakeholders", "/stakeholders/add-as-leads",
+                           "/pipeline/enrich", "/stakeholders/enrich", "/posts/fetch", "/emails/generate"]  # fmt: skip
+    assert run.progress["website"]["note"] == "1 read before, 2 read now"
+    picked = {p.id for p in world.people.values() if p.lead_id in set(run.lead_ids)}
+    assert emailed.id not in picked and ready.id in picked
+    assert "1 already contacted, skipped" in run.progress["leads"]["note"]
+    assert run.detail.startswith("Done: 3 drafts")
+
+
+def test_a_past_run_shows_only_the_steps_it_went_through() -> None:
+    from routers.quickstart import _out
+
+    run = new_run(source="existing")
+    run.status, run.progress = "done", {s: {"state": "done"} for s in ("find", "research", "people", "leads", "posts", "write")}
+    run.created_at, run.finished_at = "2026-11-04T10:00:00Z", None
+    assert _out(run, "Retail")["step_order"] == ["find", "research", "people", "leads", "posts", "write"]
