@@ -183,3 +183,32 @@ def test_helpers() -> None:
     assert find_socials(['"sameAs":["https://instagram.com/p/ABC","https://instagram.com/real"]']) == {
         "instagram": "https://instagram.com/real"
     }
+
+
+# ---------- The rate limit stays (2026-11-05) ----------
+
+
+def test_jina_is_never_allowed_more_than_its_published_limit() -> None:
+    """Without a key Jina allows 20 a minute. Whatever JINA_RPM says, the limiter never lets more through."""
+    from services.jina import MAX_RPM_WITHOUT_KEY, MAX_RPM_WITH_KEY, limiter_for
+
+    assert MAX_RPM_WITHOUT_KEY == 20 and MAX_RPM_WITH_KEY == 500
+    assert limiter_for(None, None).rpm <= 20
+    assert limiter_for(None, 1000).rpm == 20
+    assert limiter_for("key", 100_000).rpm == 500
+
+
+def test_the_shared_limiter_works_on_every_job_s_event_loop() -> None:
+    """Each background job runs on a fresh event loop and the limiter is shared by the process: the second job crashed
+    with "bound to a different event loop" once callers had waited on it in the first."""
+    import asyncio
+
+    limiter = RateLimiter(2)
+
+    async def job() -> None:
+        limiter._starts.clear()
+        waits = [asyncio.wait_for(limiter.wait_turn(), 0.2) for _ in range(4)]
+        await asyncio.gather(*waits, return_exceptions=True)  # two get through, two wait on the lock
+
+    asyncio.run(job())
+    asyncio.run(job())  # raised RuntimeError before

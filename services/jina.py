@@ -5,7 +5,8 @@ turn away plain HTTP clients. Never used for a site whose robots.txt forbids us.
 
 Rate limits (published per IP, or per key when one is sent): 20 requests/minute without a key,
 500 with one, plus a tokens-per-minute cap. Two things keep us inside them:
-  - a limiter shared by every request in this process, which spaces calls to `rpm` a minute;
+  - a limiter shared by every request in this process, which spaces calls to `rpm` a minute. It never allows more
+    than the published limit (MAX_RPM_*), whatever JINA_RPM says: don't remove it (tests/test_jina_and_website.py);
   - a 429 (or a 503 while overloaded) is retried after `Retry-After`, or with growing waits.
 Failed requests aren't charged.
 """
@@ -22,6 +23,8 @@ import httpx
 READER_URL = "https://r.jina.ai/"
 DEFAULT_RPM_WITHOUT_KEY = 18  # published limit 20
 DEFAULT_RPM_WITH_KEY = 450  # published limit 500
+MAX_RPM_WITHOUT_KEY = 20  # Jina's published limits: the most a minute, ever
+MAX_RPM_WITH_KEY = 500
 MAX_RETRIES = 4
 MAX_WAIT_SECONDS = 60.0
 
@@ -51,12 +54,21 @@ class RateLimiter:
         self.rpm = max(1, rpm)
         self._starts: deque[float] = deque()
         self._blocked_until = 0.0
-        self._lock = asyncio.Lock()
+        self._locks: dict[int, asyncio.Lock] = {}
         self._clock = clock
         self._sleep = sleep
 
+    def _lock(self) -> asyncio.Lock:
+        # One lock per event loop. The limiter outlives a loop (it's shared by the whole process), and each background
+        # job runs on a fresh loop: a single lock, tied to the first loop that waited on it, crashed the next job with
+        # "bound to a different event loop" (Quick Start's Read websites, 2026-11-05). The count of starts is shared.
+        loop = id(asyncio.get_running_loop())
+        if loop not in self._locks:
+            self._locks = {loop: asyncio.Lock()}  # the old loops are gone; their locks with them
+        return self._locks[loop]
+
     async def wait_turn(self) -> None:
-        async with self._lock:
+        async with self._lock():
             while True:
                 now = self._clock()
                 if now < self._blocked_until:
@@ -80,7 +92,8 @@ _limiters: dict[str, RateLimiter] = {}
 
 def limiter_for(api_key: str | None, rpm: int | None) -> RateLimiter:
     name = api_key or "anonymous"
-    wanted = rpm or (DEFAULT_RPM_WITH_KEY if api_key else DEFAULT_RPM_WITHOUT_KEY)
+    wanted = min(rpm or (DEFAULT_RPM_WITH_KEY if api_key else DEFAULT_RPM_WITHOUT_KEY),
+                 MAX_RPM_WITH_KEY if api_key else MAX_RPM_WITHOUT_KEY)
     if name not in _limiters or _limiters[name].rpm != wanted:
         _limiters[name] = RateLimiter(wanted)
     return _limiters[name]

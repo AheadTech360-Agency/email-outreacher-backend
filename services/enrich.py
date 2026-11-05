@@ -13,6 +13,7 @@ Anything already filled in isn't bought again. One Apify run per kind per batch.
 """
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -21,8 +22,11 @@ from typing import Any
 from services.apify import (
     INSTAGRAM_PROFILE_ACTOR, LINKEDIN_COMPANY_ACTOR, LINKEDIN_PROFILE_ACTOR, ApifyError, FetchedPost, instagram_handle, linkedin_slug,
 )  # fmt: skip
-from services.research import reread_site
+from services.research import apply_site
 from services.smart_posts import company_linkedin
+from services.website import normalize_domain
+
+log = logging.getLogger(__name__)
 
 SITE_READS = 10  # websites read at once
 SITE_SECONDS = 45  # the most one website may take
@@ -101,12 +105,18 @@ async def enrich_companies(
 
         async def read(company: Any) -> None:
             nonlocal done
+            site = None
             async with gate:
                 try:
-                    found = await asyncio.wait_for(reread_site(company, reader), SITE_SECONDS)
+                    site = await asyncio.wait_for(reader.read(company.domain or normalize_domain(company.website_url)), SITE_SECONDS)
                 except TimeoutError:
-                    found = None
+                    pass
+                except Exception:  # noqa: BLE001 - one site's failure is that site's, never the whole run's
+                    log.exception("reading %s failed", company.domain or company.website_url)
+            # Applied and saved one at a time: the companies share one database session, which refuses two statements
+            # at once, and a company changed while another's save is flushing loses the change.
             async with writing:
+                found = apply_site(company, site) if site is not None else None
                 if found is not None and found.reached:
                     out.sites_read += 1
                     await save_pages(company, found.via or "own_crawl", found.pages)

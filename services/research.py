@@ -298,7 +298,12 @@ async def reread_site(company: Company, reader: WebsiteReader) -> Reread:
     target = company.domain or normalize_domain(company.website_url)
     if not target:
         return Reread(False, None, [], {}, [], None, "No website on file")
-    site = await reader.read(target)
+    return apply_site(company, await reader.read(target))
+
+
+def apply_site(company: Company, site: Any) -> Reread:
+    """Keep what a website read found on the company (see reread_site). No awaits: callers reading several sites at
+    once apply each under one lock, so a save in progress never sees a company half changed."""
     if not site.reached:
         return Reread(False, site.via, [], {}, [], None, site.detail or site.outcome.replace("_", " "))
     found = site.socials or {}
