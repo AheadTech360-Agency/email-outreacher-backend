@@ -2098,6 +2098,13 @@ class QuickstartRepo:
         read = select(CompanyPage.company_id).where(CompanyPage.company_id.in_(ids))
         return list(await self.session.scalars(select(Company.id).where(Company.id.in_(ids), Company.id.not_in(read))))
 
+    async def read_before(self, ids: list[UUID], since: datetime) -> set[UUID]:
+        """Which of these companies had their website read before this moment (a run's start)."""
+        if not ids:
+            return set()
+        query = select(CompanyPage.company_id).where(CompanyPage.company_id.in_(ids)).group_by(CompanyPage.company_id)
+        return set(await self.session.scalars(query.having(func.min(CompanyPage.fetched_at) < since)))
+
     async def contacted(self, workspace_id: UUID, people: list[Stakeholder]) -> set[UUID]:
         """Who among these people was already contacted: an email of theirs queued or sent, or their address ever
         queued (eo_queued_addresses), whichever record it was under."""

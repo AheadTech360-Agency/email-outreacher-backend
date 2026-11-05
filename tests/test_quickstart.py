@@ -25,6 +25,7 @@ class World:
         self.spent = 0.0
         self.finished = {}  # path -> the answer of a job this run already finished
         self.sites: set[str] = set()  # companies whose website was read
+        self.sites_before: set[str] = set()  # ...before the run started
         self.contacted: set = set()  # people already emailed
         for name in ("Ink Co", "Tee Shop", "Big Box"):
             c = SimpleNamespace(id=uuid4(), name=name, domain=None, status="found", status_reason=None, score=None, researched_at=None)
@@ -94,6 +95,9 @@ class Repo:
     async def without_pages(self, ids):
         return [i for i in ids if str(i) not in self.w.sites]
 
+    async def read_before(self, ids, since):
+        return {i for i in ids if str(i) in self.w.sites_before}
+
     async def contacted(self, workspace_id, people):
         return {p.id for p in people if p.id in self.w.contacted}
 
@@ -158,7 +162,8 @@ def new_run(limit=5.0, **settings) -> SimpleNamespace:
          "people_per_company": 1, "titles": [], "find_emails": True, "leads": 20, "only_with_email": True, "posts_per_lead": 5,
          "max_post_age_days": 60, **settings}  # fmt: skip
     return SimpleNamespace(id=uuid4(), workspace_id=WS, icp_id=ICP, status="running", step="find", settings=s, progress={},
-                           company_ids=[], lead_ids=[], job_ids=[], spent_usd=0, spend_limit_usd=limit, detail=None)  # fmt: skip
+                           company_ids=[], lead_ids=[], job_ids=[], spent_usd=0, spend_limit_usd=limit, detail=None,
+                           created_at=None)  # fmt: skip
 
 
 def run_all(run, world) -> int:
@@ -338,6 +343,7 @@ def test_an_existing_run_fills_in_before_writing_and_skips_anyone_contacted(worl
     for c in (ink, tee, big):
         c.status = "qualified"
     world.sites.add(str(ink.id))  # Ink Co's site was read before
+    world.sites_before.add(str(ink.id))
     emailed = SimpleNamespace(id=uuid4(), company_id=ink.id, lead_id=None, linkedin_url="https://linkedin.com/in/a", email="a@ink.com", email_status="verified")
     unverified = SimpleNamespace(id=uuid4(), company_id=big.id, lead_id=None, linkedin_url=None, email="b@big.com", email_status="extrapolated")
     ready = SimpleNamespace(id=uuid4(), company_id=ink.id, lead_id=None, linkedin_url="https://linkedin.com/in/c", email="c@ink.com", email_status="verified")
@@ -363,3 +369,15 @@ def test_a_past_run_shows_only_the_steps_it_went_through() -> None:
     run.status, run.progress = "done", {s: {"state": "done"} for s in ("find", "research", "people", "leads", "posts", "write")}
     run.created_at, run.finished_at = "2026-11-04T10:00:00Z", None
     assert _out(run, "Retail")["step_order"] == ["find", "research", "people", "leads", "posts", "write"]
+
+
+def test_sites_a_crashed_batch_saved_are_counted_as_read_now_not_before(world) -> None:
+    """2026-11-05: a batch crashed after saving some sites; when it ran again the note said "83 read before, 82 read
+    now" for 100 companies that had none read before."""
+    ink, tee, big = world.companies.values()
+    for c in (ink, tee, big):
+        c.status = "qualified"
+    world.sites.add(str(ink.id))  # saved by the batch that crashed: read during this run, not before
+    run = new_run(source="existing", smart_list_id=None, search_terms=[], places=[])
+    run_all(run, world)
+    assert run.progress["website"]["note"] == "3 read now"

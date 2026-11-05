@@ -179,8 +179,13 @@ async def _website(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bo
         read, failed = read + (out or {}).get("sitesRead", 0), failed + (out or {}).get("sitesFailed", 0)
         run.progress = {**run.progress, "_sited": sorted(tried | {str(i) for i in todo}), "_sites": [read, failed]}
     tried = set(run.progress.get("_sited", []))
+    unread = set(await repo.without_pages(qualified))
     left = [i for i in qualified if i in unread and str(i) not in tried]
-    already = len(qualified) - len(unread)
+    # Counted from the pages saved, not added up from each batch: a batch that crashed and was tried again had
+    # already saved some sites, which were then counted as read before this run (2026-11-05).
+    already = len(await repo.read_before(qualified, run.created_at))
+    read = len(qualified) - len(unread) - already
+    failed = sum(1 for i in qualified if i in unread and str(i) in tried)
     note = ", ".join(x for x in (f"{already} read before" if already else "", f"{read} read now" if read else "",
                                  f"{failed} couldn't be reached" if failed else "") if x) or "No websites to read"  # fmt: skip
     _set(run, "website", state="running" if left else "done", done=len(qualified) - len(left), total=len(qualified), note=note)
