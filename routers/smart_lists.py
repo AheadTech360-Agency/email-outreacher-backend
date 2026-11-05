@@ -22,7 +22,7 @@ from lead_intel_writes import LeadIntelIcpWriter
 from routers.icps import create_icp
 from models import Company, SmartList, Stakeholder
 from schemas import (
-    IcpCreateIn, MoveMembersIn, MoveMembersResult, SmartListCompanyOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
+    IcpCreateIn, MoveMembersIn, MoveMembersResult, SmartListCompanyOut, SmartListFactsOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
     SmartListCreateIn, SmartListUpdateIn, SortListsIn, SortListsResult,
 )  # fmt: skip
 from services import smart_lists
@@ -139,6 +139,17 @@ async def memberships(
     return await repo.memberships(workspace_id, kind)
 
 
+@router.get("/facts", response_model=SmartListFactsOut)
+async def facts(
+    kind: Literal["company", "person"] = Query(),
+    workspace_id: UUID = Depends(require_workspace_id),
+    repo: SmartListRepo = Depends(get_smart_list_repo),
+) -> SmartListFactsOut:
+    """Which companies (or people) were written to, sent or queued, have a verified email and have any email (for a
+    company, anyone at it), for pickers that filter by them."""
+    return SmartListFactsOut(**await repo.facts(workspace_id, kind))
+
+
 @router.get("/people.csv", response_class=Response)
 async def export_people(
     workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
@@ -178,15 +189,18 @@ async def get_list(
     q: str = Query(default="", max_length=200),
     processed: str = Query(default="", pattern="^(|yes|no)$"),
     emails: str = Query(default="", pattern="^(|yes|no)$"),
+    contacted: str = Query(default="", pattern="^(|yes|no)$"),
+    verified: str = Query(default="", pattern="^(|yes|no)$"),
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
 ) -> SmartListDetailOut:
     """A list with one page of its members (50 by default), optionally searched by name and filtered by whether they
-    were written to yet and whether they have an email (for a company, anyone at it)."""
+    were written to yet, sent or queued, and have a verified email or any email (for a company, anyone at it), together."""
     if page_size not in PAGE_SIZES:
         raise HTTPException(status_code=422, detail=f"pageSize is one of {', '.join(map(str, PAGE_SIZES))}")
     lst = await _list(repo, workspace_id, list_id)
-    members, matching = await repo.members_page(workspace_id, lst, (page - 1) * page_size, page_size, q, processed, emails)
+    members, matching = await repo.members_page(workspace_id, lst, (page - 1) * page_size, page_size, q,
+                                               {"processed": processed, "emails": emails, "contacted": contacted, "verified": verified})
     written, with_email = await repo.member_facts(workspace_id, lst.kind, [m.id for m, _ in members])
     count = next((n for other, n in await repo.lists(workspace_id, lst.kind) if other.id == lst.id), 0)
     companies, people = [], []

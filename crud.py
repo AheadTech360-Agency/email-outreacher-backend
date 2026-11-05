@@ -2167,6 +2167,15 @@ class QuickstartRepo:
         return {lead_id: n for lead_id, n in rows}
 
 
+VERIFIED_EMAIL = ("verified", "valid")  # Apollo's word, and the LinkedIn finder's
+
+
+def _members(kind: str) -> Any:
+    """The members person rows stand for in a list: their company, or them. Never null, so a "not" filter works."""
+    col = Stakeholder.company_id if kind == "company" else Stakeholder.id
+    return select(col).where(col.is_not(None))
+
+
 class SmartListRepo:
     """Smart lists (`outreach.eo_smart_lists`) and who's in them (`eo_smart_list_members`). Companies and people
     themselves are only read here."""
@@ -2257,14 +2266,38 @@ class SmartListRepo:
     def _written(self, workspace_id: UUID, kind: str) -> Any:
         """Members someone has already had an email written to (what Quick Start counts as worked on): for a company,
         anyone at it; for a person, them."""
-        written = select(Stakeholder.company_id if kind == "company" else Stakeholder.id).join(Email, Email.lead_id == Stakeholder.lead_id)
-        return written.where(Stakeholder.workspace_id == workspace_id).scalar_subquery()
+        written = _members(kind).join(Email, Email.lead_id == Stakeholder.lead_id)
+        return written.where(Stakeholder.workspace_id == workspace_id)
 
     def _with_email(self, workspace_id: UUID, kind: str) -> Any:
         """Members with an email address: for a company, anyone at it who has one."""
-        with_email = select(Stakeholder.company_id if kind == "company" else Stakeholder.id)
-        return with_email.where(Stakeholder.workspace_id == workspace_id, Stakeholder.email.is_not(None), Stakeholder.email != "").scalar_subquery()
+        return _members(kind).where(Stakeholder.workspace_id == workspace_id, Stakeholder.email.is_not(None), Stakeholder.email != "")
 
+    def _contacted(self, workspace_id: UUID, kind: str) -> Any:
+        """Members already sent to or queued (what the send queue won't take again): an email of theirs queued or
+        sent, or their address ever queued. For a company, anyone at it."""
+        return _members(kind).where(
+            Stakeholder.workspace_id == workspace_id,
+            or_(Stakeholder.lead_id.in_(select(Email.lead_id).where(Email.status.in_(("queued", "sent")))),
+                func.lower(Stakeholder.email).in_(select(QueuedAddress.email))),
+        )  # fmt: skip
+
+    def _verified(self, workspace_id: UUID, kind: str) -> Any:
+        """Members with a verified email: for a company, anyone at it."""
+        return _members(kind).where(
+            Stakeholder.workspace_id == workspace_id, Stakeholder.email.is_not(None), Stakeholder.email != "",
+            Stakeholder.email_status.in_(VERIFIED_EMAIL),
+        )  # fmt: skip
+
+    def _facets(self, workspace_id: UUID, kind: str) -> dict[str, Any]:
+        """The yes/no filters on list members, each the ids it holds for."""
+        return {"processed": self._written(workspace_id, kind), "contacted": self._contacted(workspace_id, kind),
+                "verified": self._verified(workspace_id, kind), "emails": self._with_email(workspace_id, kind)}  # fmt: skip
+
+    async def facts(self, workspace_id: UUID, kind: str) -> dict[str, list[UUID]]:
+        """For pickers: every company (or person) in the workspace written to, sent or queued, with a verified email,
+        and with any email."""
+        return {key: [i for i in set(await self.session.scalars(query)) if i] for key, query in self._facets(workspace_id, kind).items()}
     async def member_facts(self, workspace_id: UUID, kind: str, ids: list[UUID]) -> tuple[set[UUID], dict[UUID, int]]:
         """Which of these members were written to, and (companies) how many people at each have an email."""
         if not ids:
@@ -2281,11 +2314,11 @@ class SmartListRepo:
         return written, {company: int(n) for company, n in counts.all()}
 
     async def members_page(
-        self, workspace_id: UUID, lst: SmartList, offset: int, limit: int, q: str = "", processed: str = "", emails: str = ""
+        self, workspace_id: UUID, lst: SmartList, offset: int, limit: int, q: str = "", filters: dict[str, str] | None = None
     ) -> tuple[list[tuple[Any, SmartListMember]], int]:
         """One page of a list's members, optionally filtered by name (company name, or person's name, title, company,
-        email), by whether they were written to yet (processed: yes | no) and by whether they have an email (emails:
-        yes | no; for a company, anyone at it), and how many match in all."""
+        email) and by any of the yes/no filters together (_facets: written to, sent or queued, a verified email, any
+        email; for a company, anyone at it), and how many match in all."""
         model = Company if lst.kind == "company" else Stakeholder
         query = (
             select(model, SmartListMember)
@@ -2300,12 +2333,11 @@ class SmartListRepo:
                 full = func.concat(Stakeholder.first_name, " ", Stakeholder.last_name)
                 query = query.where(or_(full.ilike(like), Stakeholder.title.ilike(like), Stakeholder.organization_name.ilike(like),
                                         Stakeholder.email.ilike(like)))  # fmt: skip
-        if processed in ("yes", "no"):
-            written = model.id.in_(self._written(workspace_id, lst.kind))
-            query = query.where(written if processed == "yes" else ~written)
-        if emails in ("yes", "no"):
-            with_email = model.id.in_(self._with_email(workspace_id, lst.kind))
-            query = query.where(with_email if emails == "yes" else ~with_email)
+        for key, ids in self._facets(workspace_id, lst.kind).items():
+            value = (filters or {}).get(key)
+            if value in ("yes", "no"):
+                holds = model.id.in_(ids)
+                query = query.where(holds if value == "yes" else ~holds)
         total = int(await self.session.scalar(select(func.count()).select_from(query.subquery())) or 0)
         order = (model.name,) if lst.kind == "company" else (model.first_name, model.last_name)
         rows = await self.session.execute(query.order_by(*order, model.id).offset(offset).limit(limit))

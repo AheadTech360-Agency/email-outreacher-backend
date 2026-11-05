@@ -1663,6 +1663,15 @@ class SmartListPersonOut(ApiModel):
     processed: bool = False  # an email was already written to them
 
 
+class SmartListFactsOut(ApiModel):
+    """Companies (or people) by what's true of them; for a company, of anyone at it."""
+
+    processed: list[UUID]  # an email written
+    contacted: list[UUID]  # sent or queued
+    verified: list[UUID]  # a verified email
+    emails: list[UUID]  # any email
+
+
 class SmartListDetailOut(SmartListOut):
     companies: list[SmartListCompanyOut]
     people: list[SmartListPersonOut]
