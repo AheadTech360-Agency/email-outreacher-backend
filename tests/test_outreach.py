@@ -255,7 +255,7 @@ CAMPAIGN = {"id": "c1", "name": "Coldbrew: DTF", "status": "draft", "steps": [
 # ---------- Queue ----------
 
 
-def test_queue_imports_and_enrolls_without_activating() -> None:
+def test_queue_imports_enrolls_and_starts_a_draft_campaign() -> None:
     ok, no_address, no_icp, blocked = (email(), lead()), (email(), lead(email="")), (email(), lead(icp=None)), (email(), lead(email="x@dnc.com"))
     draft = (email(status="draft"), lead())
     sending, seq = Sending([ok, no_address, no_icp, blocked, draft]), Sequencer([CAMPAIGN])
@@ -266,7 +266,7 @@ def test_queue_imports_and_enrolls_without_activating() -> None:
     assert [by_id[p[0].id].status for p in (no_address, no_icp, blocked, draft)] == ["skipped"] * 4
     assert by_id[blocked[0].id].reason == "On the do-not-contact list: asked not to be contacted (x@dnc.com)"
     assert seq.enrolled == [("c1", "list-1")]
-    assert seq.activated == []  # starting to send stays a person's decision
+    assert len(seq.activated) == 1 and seq.activated[0][0] == "c1"  # queueing means sending
     [(_, rows)] = seq.imports
     assert rows == [{
         "email": "ana@shop.com", "first_name": "Ana", "last_name": "Ruiz", "company_name": "Shop", "job_title": "Owner",
@@ -641,13 +641,27 @@ def test_once_queued_a_second_run_skips_it_and_a_failed_import_gives_it_back() -
     assert out[0].status == "skipped" and "already queued" in out[0].reason
 
 
-@pytest.mark.parametrize("status", ["draft", "active", "paused"])
-def test_queueing_never_activates_a_campaign(status):
+@pytest.mark.parametrize("status", ["active", "paused"])
+def test_queue_never_resumes_or_restarts_a_campaign(status):
     pair = email(), lead()
     seq = Sequencer([{**CAMPAIGN, "status": status}])
     outcomes = run(outreach.queue(deps(Sending([pair]), seq), [pair[0].id]))
-    assert outcomes[0].status == "queued" and outcomes[0].reason is None and not seq.activated
-    assert not hasattr(outreach.SequencerClient if hasattr(outreach, "SequencerClient") else object, "activate")
+    assert outcomes[0].status == "queued" and not seq.activated
+    if status == "paused":
+        assert "resume it in CheapSequencer" in outcomes[0].reason
+
+
+def test_a_failed_start_keeps_them_enrolled_and_never_queues_them_twice():
+    pair = email(), lead()
+    sending, seq = Sending([pair]), Sequencer([CAMPAIGN])
+
+    async def fail(campaign_id, key):
+        raise SendingError("missing_sending_inboxes")
+
+    seq.activate = fail
+    outcomes = run(outreach.queue(deps(sending, seq), [pair[0].id]))
+    assert outcomes[0].status == "queued" and "couldn't start" in outcomes[0].reason
+    assert run(outreach.queue(deps(sending, seq), [pair[0].id]))[0].status == "skipped" and len(seq.enrolled) == 1
 
 
 def test_nothing_enrolled_never_activates_campaign():

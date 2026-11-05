@@ -40,7 +40,7 @@ def assess(campaign: dict[str, Any], enrolled: int) -> dict[str, Any]:
         add("senders", "unknown", "Mailbox eligibility is not exposed here; CheapSequencer validates it at launch.")
     status = campaign.get("status") or "unknown"
     if status == "paused":
-        add("state", "fail", "Campaign is paused. Resume it in CheapSequencer when you're ready to send.")
+        add("state", "fail", "Campaign is paused. Queueing doesn't resume it: resume it in CheapSequencer to send.")
     elif status not in ("draft", "active"):
         add("state", "fail", f"Campaign is {status}, so it can't send.")
     return {"id": campaign["id"], "name": campaign.get("name") or "Campaign", "status": status,

@@ -1,7 +1,7 @@
 """Sending through CheapSequencer: settings, campaigns, queueing approved emails, and follow-ups.
 
-Nothing here activates a campaign or sends: emails wait in a campaign until a person activates it in
-CheapSequencer. See services/outreach.py for how queueing and follow-ups work.
+Queueing approved emails starts sending: a draft campaign is activated once they're enrolled; a paused one
+stays paused. See services/outreach.py for how queueing and follow-ups work.
 """
 
 import asyncio
@@ -117,8 +117,7 @@ async def campaign_readiness(campaign_id: str, deps: outreach.Deps = Depends(_de
 
 @router.post("/queue", response_model=QueueOut)
 async def queue(body: QueueIn, deps: outreach.Deps = Depends(_deps)) -> QueueOut:
-    """Put approved first emails into their ICP's campaign. The campaign isn't activated: nothing sends
-    until a person activates it in CheapSequencer."""
+    """Queue approved first emails and start their campaign if it's a draft. Paused campaigns stay paused."""
     try:
         outcomes = await outreach.queue(deps, list(dict.fromkeys(body.email_ids)), set(body.risky_ok))
     except SendingError as exc:

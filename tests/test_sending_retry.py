@@ -47,9 +47,18 @@ def test_a_write_is_never_retried() -> None:
 
 
 
-def test_the_client_has_no_way_to_activate_a_campaign():
-    """Starting to send is a person's decision in CheapSequencer; Coldbrew can't do it."""
-    assert not hasattr(SequencerClient, "activate")
+def test_activate_waits_for_the_command_and_uses_its_key():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers.get("Idempotency-Key")))
+        if request.method == "POST":
+            return httpx.Response(202, json={"data": {"action": {"id": "a1", "status": "pending", "retry_after_seconds": 0.001}}})
+        return httpx.Response(200, json={"data": {"id": "a1", "status": "completed"}})
+
+    c = SequencerClient("fake", transport=httpx.MockTransport(handler))
+    asyncio.run(c.activate("c1", "launch-batch-1"))
+    assert seen == [("POST", "/v1/campaigns/c1/activate", "launch-batch-1"), ("GET", "/v1/api-actions/a1", None)]
 
 
 

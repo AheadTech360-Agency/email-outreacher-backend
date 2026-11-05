@@ -5,8 +5,8 @@ sells and runs those mailboxes and their domains. CheapInboxes is only read. Che
 written in exactly these ways: lists, CSV imports of leads (with each lead's emails in custom fields),
 enrolling a list into a campaign, the step text and name of a draft or paused campaign, a draft copy
 of a campaign for a new ICP (with its name, daily cap and sending window), and archiving the campaign of an
-archived or deleted ICP once it's empty. Nothing here can activate a campaign or send an email: that stays a
-person's decision in CheapSequencer.
+archived or deleted ICP once it's empty, and activating a draft campaign once approved emails are queued into it
+(queueing means sending). A paused campaign is never resumed.
 
 Docs: https://docs.cheapsequencer.com/llms.txt and https://api.cheapinboxes.com/v1/openapi.json.
 """
@@ -152,7 +152,7 @@ class SequencerClient(_Client):
         body = await self.get(f"/inbox/threads/{quote(thread_id, safe='')}")
         return body.get("data") or body
 
-    # ---- Writes: never activate, never send. ----
+    # ---- Writes. Activation only after approved emails are enrolled (outreach.queue). ----
 
     async def _write(self, method: str, path: str, key: str, body: Any = None, etag: str | None = None) -> dict[str, Any]:
         headers = {"Idempotency-Key": key[:255]}
@@ -217,6 +217,11 @@ class SequencerClient(_Client):
         """Enroll a list's leads into a campaign. A draft or paused campaign doesn't send them."""
         queued = await self._write("POST", f"/campaigns/{campaign_id}/enrollments", key, {"list_ids": [list_id]})
         await self._wait(queued.get("action") or queued, "Adding the leads to the campaign")
+
+    async def activate(self, campaign_id: str, key: str) -> None:
+        """Start an enrolled draft campaign sending, and wait for the command to finish."""
+        queued = await self._write("POST", f"/campaigns/{campaign_id}/activate", key)
+        await self._wait(queued.get("action") or queued, "Starting the campaign")
 
     async def duplicate(self, campaign_id: str, key: str) -> dict[str, Any]:
         """A draft copy of a campaign (steps, settings and mailboxes, no leads). The same key never makes a second copy."""

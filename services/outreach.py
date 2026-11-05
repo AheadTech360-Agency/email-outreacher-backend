@@ -1,5 +1,5 @@
-"""Coldbrew's emails, sent through CheapSequencer's campaigns. Nothing here activates a campaign or
-sends: a campaign only sends once a person activates it in CheapSequencer.
+"""Coldbrew's emails, sent through CheapSequencer's campaigns. Queueing approved emails starts sending: a draft
+campaign is activated once they're enrolled (approved 2026-11-05: queueing means sending). Paused campaigns stay paused.
 
   queue       An approved first email goes into its ICP's campaign ("Coldbrew: <ICP>"): the lead is
               imported into a new list with email_1_subject and email_1_body, and the generic
@@ -304,8 +304,8 @@ def day(when: datetime) -> str:
 
 
 async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozenset()) -> list[QueueOutcome]:
-    """Put approved first emails into their ICP's campaign. The campaign isn't activated. An email to a risky
-    address is left out unless a person confirmed that one (`risky_ok`)."""
+    """Put approved first emails into their ICP's campaign, then activate it if it's still a draft. An email to a
+    risky address is left out unless a person confirmed that one (`risky_ok`)."""
     settings = await deps.settings.sending(deps.workspace_id)
     if not settings["sender_company"].strip() or not settings["sender_website"].strip():
         raise SendingError("Add the sender's company and website in Settings, under Sending, before queueing emails.")
@@ -369,9 +369,18 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
             outcomes += [QueueOutcome(e.id, "skipped", exc.message) for e, _ in members]
             continue
         await deps.sending.mark_queued([e for e, _ in members], campaign_id, list_id)
-        # Never activated here (2026-11-05: an automatic launch was added and taken out again): starting to send
-        # stays a person's decision in CheapSequencer.
-        outcomes += [QueueOutcome(e.id, "queued", None, campaign_name) for e, _ in members]
+        # Enrolled first, then launched: a failed launch never releases the address claim or reports these as
+        # unqueued, which could enroll them twice.
+        launch_note = None
+        try:
+            campaign, _ = await deps.sequencer.campaign(campaign_id)
+            if campaign.get("status") == "draft":
+                await deps.sequencer.activate(campaign_id, key_for("activate", campaign_id, *ids))
+            elif campaign.get("status") != "active":
+                launch_note = f"Queued, but {campaign_name} is {campaign.get('status') or 'inactive'}: resume it in CheapSequencer to send."
+        except SendingError as exc:
+            launch_note = f"Queued, but the campaign couldn't start: {exc.message}. They stay enrolled; don't queue them again."
+        outcomes += [QueueOutcome(e.id, "queued", launch_note, campaign_name) for e, _ in members]
     return outcomes
 
 
