@@ -27,6 +27,9 @@ class FakeJobs:
         self.rows[job.id] = job
         return job
 
+    async def quickstart_runs(self, workspace_id, job_ids):
+        return {}
+
     async def recent(self, workspace_id, user_id, limit=50):
         return [row for row in self.rows.values() if row.workspace_id == workspace_id and (user_id is None or row.created_by == user_id)][:limit]
 

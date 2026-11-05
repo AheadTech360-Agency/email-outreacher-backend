@@ -75,7 +75,12 @@ async def recent_jobs(
 ) -> list[JobOut]:
     """Recent jobs, active first. Same visibility as the individual job endpoint; omit large results."""
     rows = await jobs.recent(workspace_id, None if user.is_admin else user.id)
-    return [_out(job).model_copy(update={"result": None}) for job in rows]
+    runs = await jobs.quickstart_runs(workspace_id, [job.id for job in rows])
+    return [_out(job).model_copy(update={"result": None, "link": _link(runs.get(job.id))}) for job in rows]
+
+
+def _link(run_id: UUID | None) -> str | None:
+    return f"/quickstart/{run_id}" if run_id else None
 
 
 @router.get("/{job_id}", response_model=JobOut)
@@ -90,6 +95,7 @@ async def get_job(
     if job is None or job.workspace_id != workspace_id or (job.created_by != user.id and not user.is_admin):
         raise HTTPException(status_code=404, detail="Job not found")
     out = _out(job)
+    out.link = _link((await jobs.quickstart_runs(workspace_id, [job.id])).get(job.id))
     if out.status not in ("queued", "running"):
         # The worker changed things in another process: reads cached before it finished are out of date.
         response_cache.clear()

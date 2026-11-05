@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import case, delete, exists, func, or_, select, tuple_, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import Uuid, case, cast, delete, exists, func, or_, select, tuple_, update
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, array, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -1980,6 +1980,17 @@ class JobRepo:
         query = query.order_by(case((Job.status.in_(("queued", "running")), 0), else_=1), Job.created_at.desc(), Job.id)
         return list(await self.session.scalars(query.limit(limit)))
 
+    async def quickstart_runs(self, workspace_id: UUID, job_ids: list[UUID]) -> dict[UUID, UUID]:
+        """Which Quick Start run each of these jobs is a step of (a run keeps its jobs' ids)."""
+        if not job_ids:
+            return {}
+        wanted = {str(i) for i in job_ids}
+        ids = cast(array(list(job_ids)), PG_ARRAY(Uuid))
+        query = select(QuickstartRun.id, QuickstartRun.job_ids).where(
+            QuickstartRun.workspace_id == workspace_id, QuickstartRun.job_ids.op("&&")(ids)
+        )
+        return {job: run for run, jobs in (await self.session.execute(query)).all() for job in jobs or [] if str(job) in wanted}
+
     async def get(self, job_id: UUID) -> Job | None:
         return await self.session.get(Job, job_id)
 
@@ -2243,11 +2254,38 @@ class SmartListRepo:
         )
         return [(row[0], row[1]) for row in rows]
 
+    def _written(self, workspace_id: UUID, kind: str) -> Any:
+        """Members someone has already had an email written to (what Quick Start counts as worked on): for a company,
+        anyone at it; for a person, them."""
+        written = select(Stakeholder.company_id if kind == "company" else Stakeholder.id).join(Email, Email.lead_id == Stakeholder.lead_id)
+        return written.where(Stakeholder.workspace_id == workspace_id).scalar_subquery()
+
+    def _with_email(self, workspace_id: UUID, kind: str) -> Any:
+        """Members with an email address: for a company, anyone at it who has one."""
+        with_email = select(Stakeholder.company_id if kind == "company" else Stakeholder.id)
+        return with_email.where(Stakeholder.workspace_id == workspace_id, Stakeholder.email.is_not(None), Stakeholder.email != "").scalar_subquery()
+
+    async def member_facts(self, workspace_id: UUID, kind: str, ids: list[UUID]) -> tuple[set[UUID], dict[UUID, int]]:
+        """Which of these members were written to, and (companies) how many people at each have an email."""
+        if not ids:
+            return set(), {}
+        model = Company if kind == "company" else Stakeholder
+        written = set(await self.session.scalars(select(model.id).where(model.id.in_(ids), model.id.in_(self._written(workspace_id, kind)))))
+        if kind != "company":
+            return written, {}
+        counts = await self.session.execute(
+            select(Stakeholder.company_id, func.count()).where(
+                Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(ids), Stakeholder.email.is_not(None), Stakeholder.email != ""
+            ).group_by(Stakeholder.company_id)
+        )  # fmt: skip
+        return written, {company: int(n) for company, n in counts.all()}
+
     async def members_page(
-        self, workspace_id: UUID, lst: SmartList, offset: int, limit: int, q: str = ""
+        self, workspace_id: UUID, lst: SmartList, offset: int, limit: int, q: str = "", processed: str = "", emails: str = ""
     ) -> tuple[list[tuple[Any, SmartListMember]], int]:
         """One page of a list's members, optionally filtered by name (company name, or person's name, title, company,
-        email), and how many match in all."""
+        email), by whether they were written to yet (processed: yes | no) and by whether they have an email (emails:
+        yes | no; for a company, anyone at it), and how many match in all."""
         model = Company if lst.kind == "company" else Stakeholder
         query = (
             select(model, SmartListMember)
@@ -2262,6 +2300,12 @@ class SmartListRepo:
                 full = func.concat(Stakeholder.first_name, " ", Stakeholder.last_name)
                 query = query.where(or_(full.ilike(like), Stakeholder.title.ilike(like), Stakeholder.organization_name.ilike(like),
                                         Stakeholder.email.ilike(like)))  # fmt: skip
+        if processed in ("yes", "no"):
+            written = model.id.in_(self._written(workspace_id, lst.kind))
+            query = query.where(written if processed == "yes" else ~written)
+        if emails in ("yes", "no"):
+            with_email = model.id.in_(self._with_email(workspace_id, lst.kind))
+            query = query.where(with_email if emails == "yes" else ~with_email)
         total = int(await self.session.scalar(select(func.count()).select_from(query.subquery())) or 0)
         order = (model.name,) if lst.kind == "company" else (model.first_name, model.last_name)
         rows = await self.session.execute(query.order_by(*order, model.id).offset(offset).limit(limit))

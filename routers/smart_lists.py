@@ -176,23 +176,29 @@ async def get_list(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, alias="pageSize"),
     q: str = Query(default="", max_length=200),
+    processed: str = Query(default="", pattern="^(|yes|no)$"),
+    emails: str = Query(default="", pattern="^(|yes|no)$"),
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
 ) -> SmartListDetailOut:
-    """A list with one page of its members (50 by default), optionally searched by name."""
+    """A list with one page of its members (50 by default), optionally searched by name and filtered by whether they
+    were written to yet and whether they have an email (for a company, anyone at it)."""
     if page_size not in PAGE_SIZES:
         raise HTTPException(status_code=422, detail=f"pageSize is one of {', '.join(map(str, PAGE_SIZES))}")
     lst = await _list(repo, workspace_id, list_id)
-    members, matching = await repo.members_page(workspace_id, lst, (page - 1) * page_size, page_size, q)
+    members, matching = await repo.members_page(workspace_id, lst, (page - 1) * page_size, page_size, q, processed, emails)
+    written, with_email = await repo.member_facts(workspace_id, lst.kind, [m.id for m, _ in members])
     count = next((n for other, n in await repo.lists(workspace_id, lst.kind) if other.id == lst.id), 0)
     companies, people = [], []
     for m, member in members:
         if lst.kind == "company":
             companies.append(SmartListCompanyOut(id=m.id, name=m.name, domain=m.domain, city=m.city, state=m.state, source=m.source,
-                                                 status=m.status, reason=member.reason))  # fmt: skip
+                                                 status=m.status, reason=member.reason, processed=m.id in written,
+                                                 people_with_email=with_email.get(m.id, 0)))  # fmt: skip
         else:
             people.append(SmartListPersonOut(id=m.id, name=_name(m), title=m.title, company=m.organization_name, email=m.email,
-                                             email_status=m.email_status, linkedin_url=m.linkedin_url, reason=member.reason))  # fmt: skip
+                                             email_status=m.email_status, linkedin_url=m.linkedin_url, reason=member.reason,
+                                             processed=m.id in written))  # fmt: skip
     return SmartListDetailOut(**_out(lst, count).model_dump(), companies=companies, people=people, page=page, page_size=page_size,
                               matching=matching)  # fmt: skip
 

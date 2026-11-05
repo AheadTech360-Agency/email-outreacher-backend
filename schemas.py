@@ -1484,6 +1484,8 @@ class JobOut(ApiModel):
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    # The page it belongs to, when that isn't the one its kind suggests: a Quick Start step's run page.
+    link: str | None = None
 
 
 # ---------- Quick Start ----------
@@ -1644,6 +1646,9 @@ class SmartListCompanyOut(ApiModel):
     source: str
     status: str
     reason: str
+    # Someone at it already had an email written (Quick Start skips it), and how many people at it have an email.
+    processed: bool = False
+    people_with_email: int = 0
 
 
 class SmartListPersonOut(ApiModel):
@@ -1655,6 +1660,7 @@ class SmartListPersonOut(ApiModel):
     email_status: str | None
     linkedin_url: str | None
     reason: str
+    processed: bool = False  # an email was already written to them
 
 
 class SmartListDetailOut(SmartListOut):
