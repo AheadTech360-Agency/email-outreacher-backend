@@ -713,7 +713,7 @@ class LinkedInSearchIn(ApiModel):
 
 
 class AddAsLeadsIn(ApiModel):
-    stakeholder_ids: list[UUID] = Field(min_length=1, max_length=100)
+    stakeholder_ids: list[UUID] = Field(min_length=1, max_length=2000)
 
 
 class AddAsLeadsResult(ApiModel):
