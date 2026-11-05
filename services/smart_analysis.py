@@ -13,7 +13,8 @@ from services.prompts import PLACEHOLDER, render
 
 # One row per saved first email, with deduplicated outcome flags rather than joined event counts.
 COHORT = text("""
-select e.id::text as id, e.lead_id::text as lead_id, e.sent_at,
+select e.id::text as id, e.lead_id::text as lead_id, e.sent_at, e.sequence_sent_count as emails_sent,
+  array_length(regexp_split_to_array(trim(coalesce(e.subject, '')), '[[:space:]]+'),1) as subject_words,
   l.lead_intel_icp_id::text as icp_id, left(e.subject, 250) as subject,
   left(coalesce(e.edited_body,e.body),1200) as body,
   array_length(regexp_split_to_array(trim(coalesce(e.edited_body,e.body)), '[[:space:]]+'),1) as words,
@@ -64,6 +65,22 @@ def source_of(row):
     return 'Other / unknown hook' if row['hook'] else 'No recorded hook'
 
 
+EXAMPLES, BODY_CHARS = 400, 500
+
+
+def reply_after(row):
+    """Which of the five emails the reply came after: emails sent when the sequence stopped on the reply."""
+    return max(1, min(5, int(row['emails_sent'] or 1))) if row['replied'] else None
+
+
+def replies_by_email(rows):
+    counts = defaultdict(int)
+    for row in rows:
+        if row['replied']:
+            counts[reply_after(row)] += 1
+    return [{'label':f'Email {step}','replies':counts.get(step,0)} for step in range(1,6)]
+
+
 def metrics(rows):
     n = len(rows)
     replied = sum(bool(row['replied']) for row in rows)
@@ -95,23 +112,20 @@ async def snapshot(session, workspace_id, start, end, icp_id):
         if row['lead_id'] not in prev_seen:
             prev_rows.append(row);prev_seen.add(row['lead_id'])
     activity = dict((await session.execute(ACTIVITY,params)).mappings().one())
-    # A bounded, explicitly nonrepresentative sample: both replies and non-replies, spread across sources.
-    pools = defaultdict(list)
-    for row in rows: pools[(bool(row['replied']),source_of(row))].append(row)
-    sample = []
-    while len(sample)<60 and any(pools.values()):
-        for pool in pools.values():
-            if pool and len(sample)<60: sample.append(pool.pop(0))
-    examples = [{'emailId':r['id'],'subject':r['subject'],'body':r['body'],'hook':r['hook'],
-        'source':source_of(r),'replied':r['replied'],'rating':r['rating'],'icpId':r['icp_id'],'prompt':r['prompt']} for r in sample]
+    # Every sent first email (up to EXAMPLES), replies first so none is cut: subject, hook, where the hook came
+    # from, length, the outcome and which email the reply came after. Bodies shortened to keep the cost down.
+    ordered = sorted(rows, key=lambda r: not r['replied'])[:EXAMPLES]
+    examples = [{'emailId':r['id'],'subject':r['subject'],'body':(r['body'] or '')[:BODY_CHARS],'hook':r['hook'],
+        'source':source_of(r),'words':r['words'],'replied':r['replied'],'replyAfterEmail':reply_after(r),
+        'bounced':r['bounced'],'rating':r['rating'],'icpId':r['icp_id'],'prompt':r['prompt']} for r in ordered]
     limitations = [
-        'Replies are any recorded reply, not verified positive replies or revenue. No open-rate conclusions are available.',
+        'Replies are any recorded reply, not verified positive replies or revenue. Opens are not tracked: CheapSequencer does not report them.',
         'Reply attribution is to the recipient sequence; follow-ups may have contributed. Source is the chosen hook source, not all fetched platforms.',
         'Only first emails with a recorded sent timestamp enter the recipient cohort. Queued emails and missing send timestamps are excluded.',
         'Outcomes are observed only until the selected range end. Recent cohorts have had less time to reply; comparisons are observational, not randomized.',
         'Recipients recontacted in different periods may appear in both cohorts; these are not independent randomized groups.',
         'Analysis uses the local database only. Missing or delayed webhooks and unsynced sending records reduce coverage.',
-        'Review ratings reflect internal opinion, not recipient outcomes. Copy examples are a bounded qualitative sample, with bodies truncated to 1,200 characters.',
+        'Review ratings reflect internal opinion, not recipient outcomes. Up to 400 sent emails are shown in full detail, replies first, with bodies shortened to 500 characters.',
         'Historical refreshes use records still present now; saved reports preserve the original snapshot even if source records later change.',
     ]
     if len(result)>10000 or len(previous)>10000: limitations.append('Cohorts are capped at the earliest 10,000 first-email records per period; counts and rates cover that bounded cohort only.')
@@ -121,9 +135,10 @@ async def snapshot(session, workspace_id, start, end, icp_id):
         'sources':group_rows(rows,source_of),
         'emailLength':group_rows(rows,lambda r:'Short (up to 75 words)' if (r['words'] or 0)<=75 else 'Medium (76-150 words)' if r['words']<=150 else 'Long (151+ words)'),
         'hooks':group_rows(rows,lambda r:'Hook recorded' if r['hook'] else 'No recorded hook'),
+        'subjectLength':group_rows(rows,lambda r:'Short subject (1-3 words)' if (r['subject_words'] or 0)<=3 else 'Medium subject (4-6 words)' if r['subject_words']<=6 else 'Long subject (7+ words)'),
         'icps':group_rows(rows,lambda r:r['icp_id'] or 'No ICP'),
         'prompts':group_rows(rows,lambda r:r['prompt']),
-        },'examples':examples,'limitations':limitations,
+        },'repliesByEmail':replies_by_email(rows),'examples':examples,'limitations':limitations,
         'coverage':{'currentCapped':len(result)>10000,'previousCapped':len(previous)>10000,'firstEmailRecordsAnalyzed':min(len(result),10000)},
         'method':'Unique recipients with step-1 sent_at in [start, end), outcomes before end. Same-length previous window measured to its own end. Draft activity uses created_at and is a separate cohort. Awaiting-review status is current, not historical.'}
 
