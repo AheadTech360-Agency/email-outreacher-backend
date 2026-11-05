@@ -27,6 +27,9 @@ class FakeJobs:
         self.rows[job.id] = job
         return job
 
+    async def recent(self, workspace_id, user_id, limit=50):
+        return [row for row in self.rows.values() if row.workspace_id == workspace_id and (user_id is None or row.created_by == user_id)][:limit]
+
     async def get(self, job_id):
         return self.rows.get(job_id)
 
@@ -168,3 +171,36 @@ def test_a_job_that_runs_out_of_time_is_stopped_and_recorded(monkeypatch) -> Non
     asyncio.run(background.run_job(uuid4()))
     assert finished["status"] == "failed" and "ran out of time" in finished["detail"]
     assert finished["result"]["statusCode"] == 504
+
+
+
+def test_job_progress_counts_are_returned(jobs):
+    jobs.client.post("/api/v1/jobs", headers=H, json={"path": "/posts/fetch", "body": {}})
+    row = next(iter(jobs.rows.values()))
+    row.status, row.done, row.total = "running", 7, 20
+    row.started_at = datetime.now(UTC)
+    detail = jobs.client.get(f"/api/v1/jobs/{row.id}", headers=H).json()
+    assert detail["done"] == 7 and detail["total"] == 20
+    recent = jobs.client.get("/api/v1/jobs", headers=H).json()
+    assert recent[0]["done"] == 7 and recent[0]["total"] == 20
+
+
+def test_recent_jobs_hide_large_results_and_other_workspaces(jobs):
+    jobs.client.post("/api/v1/jobs", headers=H, json={"path": "/posts/fetch", "body": {}})
+    row = next(iter(jobs.rows.values()))
+    row.result = {"statusCode": 200, "body": {"secret": "large result"}}
+    assert jobs.client.get("/api/v1/jobs", headers=H).json()[0]["result"] is None
+    row.workspace_id = uuid4()
+    assert jobs.client.get("/api/v1/jobs", headers=H).json() == []
+
+
+def test_recent_jobs_only_show_starters_jobs_to_non_admins(jobs):
+    jobs.client.post("/api/v1/jobs", headers=H, json={"path": "/posts/fetch", "body": {}})
+    row = next(iter(jobs.rows.values()))
+    row.created_by = uuid4()
+    from dependencies import get_current_user
+    sales = SimpleNamespace(**{**ADMIN.__dict__, "role": "sales", "workspace_ids": [WORKSPACE_ID]})
+    sales.is_admin = False
+    sales.can_open = lambda w: w == WORKSPACE_ID
+    app.dependency_overrides[get_current_user] = lambda: sales
+    assert jobs.client.get("/api/v1/jobs", headers=H).json() == []

@@ -3,17 +3,22 @@ details fill the {{product.*}} placeholders in its verification, hook and email 
 
 from uuid import UUID
 
+import anthropic
+
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from crud import ProductRepo
-from dependencies import get_product_repo, require_manager, require_workspace_id
+from crud import ProductRepo, PromptRepo, ProviderCallRepo
+from dependencies import get_product_repo, get_prompt_repo, get_provider_call_repo, get_optional_anthropic, require_manager, require_workspace_id
 from schemas import ProductIn, ProductOut
+from services.product_suggestions import suggest_product
+from services.prompts import PLACEHOLDER
 
 router = APIRouter(prefix="/products", tags=["products"])
 
 
-def _clean(body: ProductIn) -> dict[str, str]:
-    return {k: v.strip() for k, v in body.model_dump().items()}
+def _clean(body: ProductIn) -> dict:
+    values = body.model_dump(mode="json")
+    return {k: v.strip() if isinstance(v, str) else v for k, v in values.items()}
 
 
 async def _out(products: ProductRepo, workspace_id: UUID, product) -> ProductOut:
@@ -32,6 +37,41 @@ async def list_products(
     workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo)
 ) -> list[ProductOut]:
     return [await _out(products, workspace_id, p) for p in await products.list(workspace_id)]
+
+
+@router.post("/suggest", dependencies=[Depends(require_manager)])
+async def product_suggestions(
+    body: ProductIn, workspace_id: UUID = Depends(require_workspace_id),
+    products: ProductRepo = Depends(get_product_repo), prompts: PromptRepo = Depends(get_prompt_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    client: anthropic.AsyncAnthropic | None = Depends(get_optional_anthropic),
+):
+    if client is None:
+        raise HTTPException(503, "ANTHROPIC_API_KEY is not set")
+    if not await products.workspace_exists(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    version = await prompts.for_icp(workspace_id, "product", None)
+    if version is None:
+        raise HTTPException(404, "Set a default Product suggestions prompt in Prompts first")
+    templates, versions = await prompts.list(workspace_id)
+    current = {p.current_version_id: p.name for p in templates}
+    usage = {}
+    for prompt_version in versions:
+        if prompt_version.id not in current:
+            continue
+        for match in PLACEHOLDER.finditer(prompt_version.system_prompt + "\n" + prompt_version.user_prompt):
+            key = match.group(1)
+            if key.startswith("product."):
+                usage.setdefault(key, set()).add(current[prompt_version.id])
+    proposal, error, cost, inputs, outputs = await suggest_product(client, version, body,
+        {key: sorted(names) for key, names in usage.items()})
+    await calls.record(workspace_id, "claude", "messages", "failed" if error else "succeeded", cost_usd=cost,
+        action="Product suggestions", model=version.model, input_tokens=inputs, output_tokens=outputs)
+    if error:
+        raise HTTPException(502, error)
+    # This endpoint never writes to the product. Approval happens in the editor before its normal save.
+    return {**proposal.model_dump(mode="json", by_alias=True), "costUsd":cost,
+            "promptId":str(version.prompt_id), "promptVersion":version.version}
 
 
 @router.post("", response_model=ProductOut, status_code=201, dependencies=[Depends(require_manager)])

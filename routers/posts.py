@@ -66,6 +66,7 @@ async def fetch_posts(
 
     outcome = await gather(
         targets=targets, stages=stages, max_posts=body.max_posts, since=since, apify=apify, claude=claude,
+        instagram_since=(datetime.now(UTC) - timedelta(days=body.instagram_max_age_days)) if body.instagram_max_age_days else None,
         owner_posts=lambda owner, network: posts.of_owner(workspace_id, owner, network),
         save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
         record_claude=record_claude, progress=report,
@@ -138,6 +139,7 @@ async def gather_posts(
     since = datetime.now(UTC) - timedelta(days=body.max_age_days)
     outcome = await gather(
         targets=targets, stages=list(body.sources), max_posts=body.max_posts, since=since, apify=apify, claude=claude,
+        instagram_since=(datetime.now(UTC) - timedelta(days=body.instagram_max_age_days)) if body.instagram_max_age_days else None,
         owner_posts=lambda owner, network: posts.of_owner(workspace_id, owner, network),
         save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
         record_claude=record_claude, progress=report,

@@ -36,6 +36,7 @@ def _out(job: Job) -> JobOut:
     result = job.result or {}
     return JobOut(
         id=job.id, kind=job.kind, label=job.label, status=status, step=step, detail=detail,
+        done=max(0, getattr(job, "done", 0) or 0), total=getattr(job, "total", None),
         status_code=result.get("statusCode"), result=result.get("body"),
         created_at=job.created_at, started_at=job.started_at, finished_at=job.finished_at,
     )  # fmt: skip
@@ -64,6 +65,17 @@ async def start_job(
         await jobs.finish(job.id, "failed", None, NO_QUEUE)
         raise HTTPException(status_code=503, detail=NO_QUEUE) from exc
     return _out(job)
+
+
+@router.get("", response_model=list[JobOut])
+async def recent_jobs(
+    workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(get_current_user),
+    jobs: JobRepo = Depends(get_job_repo),
+) -> list[JobOut]:
+    """Recent jobs, active first. Same visibility as the individual job endpoint; omit large results."""
+    rows = await jobs.recent(workspace_id, None if user.is_admin else user.id)
+    return [_out(job).model_copy(update={"result": None}) for job in rows]
 
 
 @router.get("/{job_id}", response_model=JobOut)

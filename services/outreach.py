@@ -17,7 +17,7 @@ sends: a campaign only sends once a person activates it in CheapSequencer.
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -26,7 +26,7 @@ from crud import PRODUCT_FIELDS, exclusion_note, person_keys
 from models import Email, Lead
 from services.claude import cost_usd
 from services.generation import PromptVersionSpec, Sample, format_samples, write_follow_up
-from services.prompts import product_variables, render
+from services.prompts import product_variables, render_product as render, render as render_template
 from services.sending import SendingError
 
 
@@ -202,6 +202,20 @@ class CampaignOutcome:
 # Above what the mailboxes can send together (16 x 18 a day = 288), so each mailbox's own daily limit is what
 # holds sending back, not the campaign.
 CAMPAIGN_DAILY_CAP = 300
+CAMPAIGN_START_HOUR = 8
+CAMPAIGN_END_HOUR = 18
+CAMPAIGN_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+async def configure_new_campaign(sequencer: Any, campaign_id: str, name: str) -> None:
+    campaign, etag = await sequencer.campaign(campaign_id)
+    inherited = campaign.get("sending_days") or {}
+    days = {day: {"enabled": inherited.get(day, {}).get("enabled", index < 5),
+                  "start_hour": CAMPAIGN_START_HOUR, "end_hour": CAMPAIGN_END_HOUR}
+            for index, day in enumerate(CAMPAIGN_WEEKDAYS)}
+    await sequencer.configure_new_campaign(campaign_id, name, CAMPAIGN_DAILY_CAP, days, etag,
+        key_for("new-campaign-defaults", campaign_id, name, str(CAMPAIGN_START_HOUR), str(CAMPAIGN_END_HOUR), etag))
+
 
 
 async def ensure_campaign(sequencer: Any, links: Any, icp_id: UUID, icp_name: str) -> CampaignOutcome:
@@ -217,8 +231,11 @@ async def ensure_campaign(sequencer: Any, links: Any, icp_id: UUID, icp_name: st
             return CampaignOutcome("unchanged", wanted)
         if linked.get("status") not in ("draft", "paused"):
             return CampaignOutcome("skipped", linked.get("name") or "", "it's sending, so it keeps its name. Pause it in CheapSequencer and save the ICP again to rename it.")
-        _, etag = await sequencer.campaign(linked["id"])
-        await sequencer.rename(linked["id"], wanted, etag, key_for("rename", linked["id"], wanted))
+        if (linked.get("name") or "").endswith(" (copy)"):
+            await configure_new_campaign(sequencer, linked["id"], wanted)
+        else:
+            _, etag = await sequencer.campaign(linked["id"])
+            await sequencer.rename(linked["id"], wanted, etag, key_for("rename", linked["id"], wanted))
         return CampaignOutcome("renamed", wanted)
     if named := next((c for c in campaigns if c.get("name") == wanted), None):
         await links.link(icp_id, named["id"])
@@ -229,10 +246,7 @@ async def ensure_campaign(sequencer: Any, links: Any, icp_id: UUID, icp_name: st
     # The minute is in the key: a retry doesn't copy twice, but a later restore gets a new copy, not the archived one.
     copy = await sequencer.duplicate(templates[0]["id"], key_for("duplicate", icp_id, templates[0]["id"], f"{datetime.now(UTC):%Y%m%d%H%M}"))
     await links.link(icp_id, copy["id"])  # linked first, so a failed rename is finished by the next save, not copied again
-    _, etag = await sequencer.campaign(copy["id"])
-    await sequencer.rename(copy["id"], wanted, etag, key_for("rename", copy["id"], wanted))
-    _, etag = await sequencer.campaign(copy["id"])
-    await sequencer.set_daily_cap(copy["id"], CAMPAIGN_DAILY_CAP, etag, key_for("cap", copy["id"], str(CAMPAIGN_DAILY_CAP)))
+    await configure_new_campaign(sequencer, copy["id"], wanted)
     return CampaignOutcome("created", wanted)
 
 
@@ -355,6 +369,8 @@ async def queue(deps: Deps, email_ids: list[UUID], risky_ok: set[UUID] = frozens
             outcomes += [QueueOutcome(e.id, "skipped", exc.message) for e, _ in members]
             continue
         await deps.sending.mark_queued([e for e, _ in members], campaign_id, list_id)
+        # Never activated here (2026-11-05: an automatic launch was added and taken out again): starting to send
+        # stays a person's decision in CheapSequencer.
         outcomes += [QueueOutcome(e.id, "queued", None, campaign_name) for e, _ in members]
     return outcomes
 
@@ -463,7 +479,7 @@ async def _variables(deps: Deps, email: Email, lead: Lead, step: int, earlier: d
         "email2.body": earlier.get(2, ""), "email3.body": earlier.get(3, ""), "email4.body": earlier.get(4, ""),
         "followup.step": str(step),
     }  # fmt: skip
-    out.update(product_variables(None if product is None else {k: getattr(product, k) for k in PRODUCT_FIELDS}))
+    out.update(product_variables(None if product is None else {k: getattr(product, k, [] if k in ("custom_fields", "notes") else "") for k in PRODUCT_FIELDS}))
     return out
 
 
@@ -532,7 +548,7 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
         spec = PromptVersionSpec(version.id, version.system_prompt, version.user_prompt, version.model, version.max_tokens)
         earlier = {k: (existing[(lead.id, k)].edited_body or existing[(lead.id, k)].body) for k in range(2, step) if (lead.id, k) in existing}
         variables = await _variables(deps, email, lead, step, earlier)
-        draft, calls, error = await write_follow_up(deps.writer, spec, render(spec.user, variables))
+        draft, calls, error = await write_follow_up(deps.writer, replace(spec, system=render_template(spec.system, variables)), render(spec.user, variables))
         cost = sum(cost_usd(c.model, c.input_tokens, c.output_tokens) for c in calls)
         if calls:
             await deps.calls.record(

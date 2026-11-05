@@ -13,6 +13,7 @@
 """
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -70,7 +71,7 @@ from services.prompts import company_variables
 from services.research import _apollo_facts as apollo_facts
 from services import outreach
 from services.generation import EmailWriter, Example, Item, LeadContext, PromptVersionSpec, Sample, write_follow_up
-from services.prompts import render
+from services.prompts import render, render_product
 from services.website import WebsiteReader
 
 router = APIRouter(prefix="/emails", tags=["emails"])
@@ -313,7 +314,7 @@ async def _prepare(
                     "description", "titles", "pains", "offer", "proof", "cta", "tone",
                     "words_to_avoid", "hook_guidance",
                 )},
-                "product": None if product is None else {k: getattr(product, k) for k in PRODUCT_FIELDS},
+                "product": None if product is None else {k: getattr(product, k, [] if k in ("custom_fields", "notes") else "") for k in PRODUCT_FIELDS},
             },
             lead=_person(lead, person, company, posts),
             items=[
@@ -636,7 +637,10 @@ async def test_prompt(
                     raise HTTPException(status_code=422, detail=f"There's no prompt for email {step} yet.")
                 spec = _spec(version)
             variables = await outreach._variables(deps, first, lead, step, earlier)
-            follow, follow_calls, error = await write_follow_up(writer, spec, render(spec.user, variables))
+            # Filled exactly as the follow-up check fills it (services/outreach.run_follow_ups).
+            follow, follow_calls, error = await write_follow_up(
+                writer, replace(spec, system=render(spec.system, variables)), render_product(spec.user, variables)
+            )
             await record(follow_calls, bool(error))
             if error or follow is None:
                 raise HTTPException(status_code=502, detail=f"Email {step}: {error or 'Claude did not return it.'}")

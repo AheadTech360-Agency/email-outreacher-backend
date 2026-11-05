@@ -318,7 +318,7 @@ async def research(
         product = await products.get(workspace_id, profile.product_id) if profile and profile.product_id else None
         profile_dict = None if profile is None else {
             "description": profile.description, "pains": profile.pains, "offer": profile.offer,
-            "product": None if product is None else {k: getattr(product, k) for k in PRODUCT_FIELDS},
+            "product": None if product is None else {k: getattr(product, k, [] if k in ("custom_fields", "notes") else "") for k in PRODUCT_FIELDS},
         }  # fmt: skip
         version = await prompts.for_icp(workspace_id, "verify", profile.verify_prompt_id if profile else None)
         spec = None if version is None else PromptSpec(

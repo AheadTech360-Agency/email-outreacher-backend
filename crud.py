@@ -1855,7 +1855,7 @@ class SettingsRepo:
         return await self.research(workspace_id)
 
 
-PRODUCT_FIELDS = ("name", "description", "value", "proof", "offer", "cta", "url")
+PRODUCT_FIELDS = ("name", "description", "value", "proof", "offer", "cta", "url", "custom_fields", "notes")
 
 
 class ProductRepo:
@@ -1881,14 +1881,14 @@ class ProductRepo:
             query = query.where(Product.id != except_id)
         return (await self.session.scalar(query)) is not None
 
-    async def create(self, workspace_id: UUID, values: dict[str, str]) -> Product:
+    async def create(self, workspace_id: UUID, values: dict) -> Product:
         product = Product(workspace_id=workspace_id, **values)
         self.session.add(product)
         await self.session.commit()
         await self.session.refresh(product)
         return product
 
-    async def update(self, product: Product, values: dict[str, str]) -> Product:
+    async def update(self, product: Product, values: dict) -> Product:
         for key, value in values.items():
             setattr(product, key, value)
         product.updated_at = datetime.now(UTC)
@@ -1972,6 +1972,13 @@ class JobRepo:
         await self.session.commit()
         await self.session.refresh(job)
         return job
+
+    async def recent(self, workspace_id: UUID, user_id: UUID | None, limit: int = 50) -> list[Job]:
+        query = select(Job).where(Job.workspace_id == workspace_id)
+        if user_id is not None:
+            query = query.where(Job.created_by == user_id)
+        query = query.order_by(case((Job.status.in_(("queued", "running")), 0), else_=1), Job.created_at.desc(), Job.id)
+        return list(await self.session.scalars(query.limit(limit)))
 
     async def get(self, job_id: UUID) -> Job | None:
         return await self.session.get(Job, job_id)

@@ -4,8 +4,9 @@ CheapSequencer sends the campaigns through 16 Google mailboxes and keeps them wa
 sells and runs those mailboxes and their domains. CheapInboxes is only read. CheapSequencer is read, and
 written in exactly these ways: lists, CSV imports of leads (with each lead's emails in custom fields),
 enrolling a list into a campaign, the step text and name of a draft or paused campaign, a draft copy
-of a campaign for a new ICP, and archiving the campaign of an archived or deleted ICP once it's empty. Nothing here can
-activate a campaign or send an email: that stays a person's decision in CheapSequencer.
+of a campaign for a new ICP (with its name, daily cap and sending window), and archiving the campaign of an
+archived or deleted ICP once it's empty. Nothing here can activate a campaign or send an email: that stays a
+person's decision in CheapSequencer.
 
 Docs: https://docs.cheapsequencer.com/llms.txt and https://api.cheapinboxes.com/v1/openapi.json.
 """
@@ -35,7 +36,13 @@ class SendingError(Exception):
 def _message(service: str, response: httpx.Response) -> str:
     try:
         body = response.json()
-        detail = (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
+        error = body.get("error")
+        detail = (error or {}).get("message") if isinstance(error, dict) else body.get("message")
+        reasons = error.get("details") if isinstance(error, dict) else None
+        if isinstance(reasons, list) and reasons:
+            codes = [str(reason).replace("_", " ") for reason in reasons if isinstance(reason, str)]
+            if codes:
+                detail = f"{detail or 'Campaign needs attention'}: {', '.join(codes)}"
     except ValueError:
         detail = None
     if response.status_code in (401, 403):
@@ -219,6 +226,12 @@ class SequencerClient(_Client):
     async def rename(self, campaign_id: str, name: str, etag: str, key: str) -> dict[str, Any]:
         """Rename a draft or paused campaign."""
         return await self._write("PATCH", f"/campaigns/{campaign_id}", key, {"name": name[:200]}, etag)
+
+    async def configure_new_campaign(self, campaign_id: str, name: str, cap: int,
+                                     sending_days: dict[str, Any], etag: str, key: str) -> dict[str, Any]:
+        """Set a copied draft's name, daily cap, and sending window together."""
+        return await self._write("PATCH", f"/campaigns/{campaign_id}", key,
+                                 {"name": name[:200], "daily_send_cap": cap, "sending_days": sending_days}, etag)
 
     async def set_daily_cap(self, campaign_id: str, cap: int, etag: str, key: str) -> dict[str, Any]:
         """The most a draft or paused campaign sends a day, across its mailboxes."""

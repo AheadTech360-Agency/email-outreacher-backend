@@ -256,7 +256,7 @@ def test_stored_posts_are_read_and_not_bought_again(client, posts_env) -> None:
     e = posts_env
     for i in (1, 2):  # research already stored two of Ink Co's Instagram posts
         e.repo.posts.append(SimpleNamespace(lead_id=None, company_id=e.ink.id, source="instagram", url=f"https://ig/{i}",
-                                            text="New launch drop today", posted_at=None, is_repost=False))  # fmt: skip
+                                            text="New launch drop today", posted_at=datetime.now(UTC), is_repost=False))  # fmt: skip
     fetch(client, e.ava, sources=["instagram"])
     assert not any(c[0] == "instagram" for c in e.apify.calls)  # enough already stored: nothing bought
 
@@ -314,7 +314,7 @@ def test_a_company_on_its_own_reads_its_linkedin_and_its_instagram() -> None:
     async def save(owner, found):
         known = {x.url for x in stored_posts}
         new = [f for f in found if f.url not in known]
-        stored_posts.extend(SimpleNamespace(company_id=ink.id, lead_id=None, source=f.source, url=f.url, text=f.text, posted_at=None,
+        stored_posts.extend(SimpleNamespace(company_id=ink.id, lead_id=None, source=f.source, url=f.url, text=f.text, posted_at=f.posted_at,
                                             is_repost=False) for f in new)  # fmt: skip
         return len(new)
 

@@ -153,6 +153,7 @@ class Sequencer:
         self.fail = fail
         self.list_threads, self.detail = {}, {}
         self.copied, self.renamed = [], []
+        self.activated = []
 
     async def campaigns(self):
         return self.list_campaigns
@@ -177,6 +178,9 @@ class Sequencer:
     async def enroll(self, campaign_id, list_id, key):
         self.enrolled.append((campaign_id, list_id))
 
+    async def activate(self, campaign_id, key):
+        self.activated.append((campaign_id, key))
+
     async def set_steps(self, campaign_id, steps, etag, key):
         self.patched.append((campaign_id, steps, etag))
 
@@ -187,13 +191,18 @@ class Sequencer:
         self.made = [*getattr(self, "made", []), name.lower().replace(" ", "_")]
 
     async def duplicate(self, campaign_id, key):
-        copy = {"id": f"copy-of-{campaign_id}", "name": "Copy", "status": "draft", "steps": []}
+        copy = {**next(c for c in self.list_campaigns if c["id"] == campaign_id), "id": f"copy-of-{campaign_id}", "name": "Template (copy)", "status": "draft", "steps": []}
         self.list_campaigns.append(copy)
         self.copied.append((campaign_id, key))
         return copy
 
     async def rename(self, campaign_id, name, etag, key):
         next(c for c in self.list_campaigns if c["id"] == campaign_id)["name"] = name
+        self.renamed.append((campaign_id, name))
+
+    async def configure_new_campaign(self, campaign_id, name, cap, sending_days, etag, key):
+        row = next(c for c in self.list_campaigns if c["id"] == campaign_id)
+        row.update(name=name, daily_send_cap=cap, sending_days=sending_days)
         self.renamed.append((campaign_id, name))
 
     async def set_daily_cap(self, campaign_id, cap, etag, key):
@@ -257,6 +266,7 @@ def test_queue_imports_and_enrolls_without_activating() -> None:
     assert [by_id[p[0].id].status for p in (no_address, no_icp, blocked, draft)] == ["skipped"] * 4
     assert by_id[blocked[0].id].reason == "On the do-not-contact list: asked not to be contacted (x@dnc.com)"
     assert seq.enrolled == [("c1", "list-1")]
+    assert seq.activated == []  # starting to send stays a person's decision
     [(_, rows)] = seq.imports
     assert rows == [{
         "email": "ana@shop.com", "first_name": "Ana", "last_name": "Ruiz", "company_name": "Shop", "job_title": "Owner",
@@ -629,3 +639,49 @@ def test_once_queued_a_second_run_skips_it_and_a_failed_import_gives_it_back() -
     sending.pairs.append(later)
     out = run(outreach.queue(deps(sending, Sequencer([CAMPAIGN])), [later[0].id]))
     assert out[0].status == "skipped" and "already queued" in out[0].reason
+
+
+@pytest.mark.parametrize("status", ["draft", "active", "paused"])
+def test_queueing_never_activates_a_campaign(status):
+    pair = email(), lead()
+    seq = Sequencer([{**CAMPAIGN, "status": status}])
+    outcomes = run(outreach.queue(deps(Sending([pair]), seq), [pair[0].id]))
+    assert outcomes[0].status == "queued" and outcomes[0].reason is None and not seq.activated
+    assert not hasattr(outreach.SequencerClient if hasattr(outreach, "SequencerClient") else object, "activate")
+
+
+def test_nothing_enrolled_never_activates_campaign():
+    pair = email(), lead()
+    sending, seq = Sending([pair]), Sequencer([CAMPAIGN], fail="Import failed")
+    out = run(outreach.queue(deps(sending, seq), [pair[0].id]))
+    assert out[0].status == "skipped" and not seq.activated
+
+
+
+def test_new_campaign_has_8_to_6_window_and_preserves_timezone_and_enabled_days():
+    template = {**CAMPAIGN, "timezone": "America/Chicago", "sending_days": {
+        day: {"enabled": day in ("tuesday", "saturday"), "start_hour": 10, "end_hour": 15}
+        for day in outreach.CAMPAIGN_WEEKDAYS}}
+    seq, links = Sequencer([template]), Links()
+    result = run(outreach.ensure_campaign(seq, links, uuid4(), "New ICP"))
+    copied = next(c for c in seq.list_campaigns if c["id"] == "copy-of-c1")
+    assert result.status == "created" and copied["timezone"] == "America/Chicago"
+    for day, window in copied["sending_days"].items():
+        assert window == {"enabled": day in ("tuesday", "saturday"), "start_hour": 8, "end_hour": 18}
+    assert template["sending_days"]["tuesday"]["start_hour"] == 10
+
+
+def test_failed_new_campaign_configuration_is_finished_on_retry_without_copying_again():
+    seq, links, icp = Sequencer([dict(CAMPAIGN)]), Links(), uuid4()
+    configure = seq.configure_new_campaign
+    async def fail(*args):
+        raise SendingError("temporary failure")
+    seq.configure_new_campaign = fail
+    with pytest.raises(SendingError):
+        run(outreach.ensure_campaign(seq, links, icp, "New ICP"))
+    seq.configure_new_campaign = configure
+    run(outreach.ensure_campaign(seq, links, icp, "New ICP"))
+    assert len(seq.copied) == 1
+    copied = next(c for c in seq.list_campaigns if c["id"] == "copy-of-c1")
+    assert copied["name"] == "Coldbrew: New ICP"
+    assert all(d["start_hour"] == 8 and d["end_hour"] == 18 for d in copied["sending_days"].values())

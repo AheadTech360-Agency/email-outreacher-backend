@@ -18,7 +18,7 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from services.claude import error_message
-from services.prompts import DEFAULTS, render, verify_variables
+from services.prompts import DEFAULTS, render_product as render, render as render_template, verify_variables
 
 class CompanyScore(BaseModel):
     """Company Verification's verdict on one company."""
@@ -122,7 +122,7 @@ class CompanyScorer:
                 response = await self._client.messages.parse(
                     model=model,
                     max_tokens=spec.max_tokens,
-                    system=spec.system,
+                    system=render_template(spec.system, verify_variables(icp, profile, evidence)),
                     output_config={"effort": "low"},
                     output_format=CompanyScore if more is None else CompanyScoreOrRead,
                     messages=[{"role": "user", "content": user}],

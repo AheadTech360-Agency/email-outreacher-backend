@@ -11,12 +11,16 @@ from typing import Any
 import anthropic
 from pydantic import BaseModel, TypeAdapter
 
+from services.product_suggestions import ProductProposal
+from services.smart_analysis import AnalystReport
 from services.generation import EmailDraft, EmailScore, FollowUpDraft, HookChoice
 from services.scoring import CompanyScore, CompanyScoreOrRead
 from services.smart_lists import CompanySorted, Sorted
 
 # kind -> [(name, model, when it's used)]
 OUTPUTS: dict[str, list[tuple[str, type[BaseModel], str]]] = {
+    "analysis": [("Senior analyst report", AnalystReport, "Evidence-based findings, experiments and limitations saved with recorded metrics.")],
+    "product": [("Product suggestions", ProductProposal, "Proposed product changes only; a person selects changes and saves them from Products.")],
     "verify": [
         (
             "Company verdict",

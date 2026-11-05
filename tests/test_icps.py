@@ -182,6 +182,10 @@ class Campaigns:
     async def rename(self, campaign_id, name, etag, key):
         next(c for c in self.list if c["id"] == campaign_id)["name"] = name
 
+    async def configure_new_campaign(self, campaign_id, name, cap, sending_days, etag, key):
+        row = next(c for c in self.list if c["id"] == campaign_id)
+        row.update(name=name, daily_send_cap=cap, sending_days=sending_days)
+
     async def set_daily_cap(self, campaign_id, cap, etag, key):
         next(c for c in self.list if c["id"] == campaign_id)["daily_send_cap"] = cap
 

@@ -212,6 +212,7 @@ class Company(Base):
     )  # fmt: skip
 
     id: Mapped[UUID] = _uuid_pk()
+    archived: Mapped[bool] = mapped_column(Boolean, server_default="false", default=False)
     workspace_id: Mapped[UUID] = _workspace()
     # The Lead Intel ICP this company was found for (no foreign key: Lead Intel's table).
     icp_id: Mapped[UUID | None] = mapped_column(default=None)
@@ -317,7 +318,7 @@ class Prompt(Base):
     __tablename__ = "eo_prompts"
     __table_args__ = (
         # verify: company verification, hook: hook selection, email: email generation, score: email scoring.
-        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people")), name="kind"),
+        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people", "product", "analysis")), name="kind"),
         # At most one default per kind in a workspace.
         Index(
             "eo_prompts_one_default_idx",
@@ -485,6 +486,7 @@ class Stakeholder(Base):
     )
 
     id: Mapped[UUID] = _uuid_pk()
+    archived: Mapped[bool] = mapped_column(Boolean, server_default="false", default=False)
     workspace_id: Mapped[UUID] = _workspace()
     lead_intel_business_id: Mapped[UUID | None] = mapped_column(default=None)
     # The pipeline company they work at, when found through one.
@@ -730,6 +732,7 @@ class Email(Base):
         CheckConstraint("confidence between 0 and 100", name="confidence"),
         Index("eo_emails_workspace_status_idx", "workspace_id", "status"),
         Index("eo_emails_lead_idx", "lead_id"),
+        Index("eo_emails_analysis_cohort_idx", "workspace_id", "step", "sent_at"),
     )
 
     id: Mapped[UUID] = _uuid_pk()
@@ -787,6 +790,8 @@ class SendEvent(Base):
             _in("type", ("queued", "sent", "opened", "replied", "bounced", "unsubscribed", "failed")), name="type"
         ),
         Index("eo_send_events_email_idx", "email_id"),
+        Index("eo_send_events_analysis_lead_idx", "workspace_id", "lead_id", "occurred_at"),
+        Index("eo_send_events_analysis_email_idx", "workspace_id", "email_id", "occurred_at"),
     )
 
     id: Mapped[UUID] = _uuid_pk()
@@ -863,6 +868,7 @@ class Product(Base):
     __table_args__ = (Index("eo_products_workspace_name_key", "workspace_id", text("lower(name)"), unique=True),)
 
     id: Mapped[UUID] = _uuid_pk()
+    archived: Mapped[bool] = mapped_column(Boolean, server_default="false", default=False)
     workspace_id: Mapped[UUID] = _workspace()
     name: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, server_default="")  # what it is
@@ -871,6 +877,8 @@ class Product(Base):
     offer: Mapped[str] = mapped_column(Text, server_default="")  # pricing or the offer, e.g. "first month free"
     cta: Mapped[str] = mapped_column(Text, server_default="")  # the next step we ask for
     url: Mapped[str] = mapped_column(Text, server_default="")
+    custom_fields: Mapped[list] = mapped_column(JSONB, server_default="[]", default=list)
+    notes: Mapped[list] = mapped_column(JSONB, server_default="[]", default=list)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
 
@@ -899,3 +907,34 @@ class ExampleEmail(Base):
     source_email_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_emails.id", ondelete="SET NULL"), default=None)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
+
+
+class SavedView(Base):
+    __tablename__ = "eo_saved_views"
+    __table_args__ = (
+        CheckConstraint("visibility in ('personal', 'workspace')", name="visibility"),
+        Index("eo_saved_views_lookup_idx", "workspace_id", "page", "visibility", "user_id"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = mapped_column(ForeignKey("eo_workspaces.id", ondelete="CASCADE"))
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("eo_users.id", ondelete="CASCADE"))
+    page: Mapped[str] = mapped_column(Text)
+    visibility: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    filters: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class AnalysisReport(Base):
+    __tablename__ = "eo_analysis_reports"
+    __table_args__ = (Index("eo_analysis_reports_history_idx", "workspace_id", "created_at"),)
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    created_by: Mapped[UUID | None] = _user_ref()
+    job_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_jobs.id", ondelete="SET NULL"), unique=True, default=None)
+    range_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    filters: Mapped[dict] = mapped_column(JSONB)
+    payload: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = _created()

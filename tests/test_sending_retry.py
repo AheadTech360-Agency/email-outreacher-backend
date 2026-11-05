@@ -44,3 +44,26 @@ def test_a_write_is_never_retried() -> None:
     with pytest.raises(SendingError):
         asyncio.run(c._write("POST", "/campaigns", "k1", {}))
     assert seen == ["POST"]
+
+
+
+def test_the_client_has_no_way_to_activate_a_campaign():
+    """Starting to send is a person's decision in CheapSequencer; Coldbrew can't do it."""
+    assert not hasattr(SequencerClient, "activate")
+
+
+
+def test_new_campaign_defaults_patch_has_etag_and_preserves_other_fields():
+    import json
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"data": {"id": "c1"}})
+    c = SequencerClient("fake", transport=httpx.MockTransport(handler))
+    days = {"monday": {"enabled": True, "start_hour": 8, "end_hour": 18}}
+    asyncio.run(c.configure_new_campaign("c1", "Coldbrew: New ICP", 300, days, "etag-current", "defaults-new-icp"))
+    request = seen[0]
+    assert request.method == "PATCH" and request.url.path == "/v1/campaigns/c1"
+    assert request.headers["If-Match"] == "etag-current"
+    assert request.headers["Idempotency-Key"] == "defaults-new-icp"
+    assert json.loads(request.content) == {"name": "Coldbrew: New ICP", "daily_send_cap": 300, "sending_days": days}

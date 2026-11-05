@@ -20,7 +20,7 @@ max tokens, so a prompt's max tokens is raised to at least MIN_MAX_TOKENS.
 import asyncio
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 
 from services.apify import search_name
 from services.claude import error_message
-from services.prompts import product_variables, render
+from services.prompts import product_variables, render_product as render, render as render_template
 
 MIN_MAX_TOKENS = 4096
 DEFAULT_POSTS = 15  # when a prompt version doesn't set max_posts
@@ -376,7 +376,7 @@ class EmailWriter:
                 hook_items = ctx.items[: hook_spec.posts]
                 if _has_material(ctx, hook_items):
                     choice: HookChoice = await self._ask(
-                        hook_spec, render(hook_spec.user, variables(ctx, hook_items)), "low", HookChoice, "hook", draft
+                        replace(hook_spec, system=render_template(hook_spec.system, variables(ctx, hook_items))), render(hook_spec.user, variables(ctx, hook_items)), "low", HookChoice, "hook", draft
                     )
                     usable = []
                     for h in choice.hooks:
@@ -399,7 +399,7 @@ class EmailWriter:
                     user += "\n\n" + format_examples(ctx.examples)
                 if ctx.instruction.strip():
                     user += f"\n\nAn extra instruction from the person reviewing this email: {ctx.instruction.strip()}"
-                email: EmailDraft = await self._ask(email_spec, user, "medium", EmailDraft, "email", draft)
+                email: EmailDraft = await self._ask(replace(email_spec, system=render_template(email_spec.system, variables(ctx, ctx.items[:email_spec.posts], draft.top, draft.chosen, draft.hooks))), user, "medium", EmailDraft, "email", draft)
                 email.subject, email.body = email.subject.strip(), email.body.strip()
                 email.confidence = max(0, min(100, email.confidence))
                 draft.email = email
@@ -414,7 +414,7 @@ class EmailWriter:
                         score_spec.user,
                         variables(ctx, ctx.items[: score_spec.posts], draft.top, draft.chosen, draft.hooks, draft.email),
                     )
-                    score: EmailScore = await self._ask(score_spec, user, "low", EmailScore, "score", draft)
+                    score: EmailScore = await self._ask(replace(score_spec, system=render_template(score_spec.system, variables(ctx, ctx.items[:score_spec.posts], draft.top, draft.chosen, draft.hooks, draft.email))), user, "low", EmailScore, "score", draft)
                     score.score = max(0, min(100, score.score))
                     score.reasons = [r.strip() for r in score.reasons if r.strip()][:6]
                     draft.score = score

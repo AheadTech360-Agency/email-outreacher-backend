@@ -15,7 +15,7 @@ email is written.
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -154,6 +154,7 @@ async def gather(
     stages: list[str],
     max_posts: int,
     since: datetime,
+    instagram_since: datetime | None = None,
     apify: Any,
     claude: anthropic.AsyncAnthropic | None,
     owner_posts: Callable[[str, str], Awaitable[list[Any]]],
@@ -171,12 +172,24 @@ async def gather(
     result = FetchOutcome(list(out.values()))
     first = min(FIRST_LOOK, max_posts) if claude is not None else max_posts
 
+    def recent(post: Any, network: str) -> bool:
+        cutoff = instagram_since if network == "instagram" and instagram_since is not None else since
+        date = post.posted_at
+        if date is None:
+            return False
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=UTC)
+        return date >= cutoff
+
+    async def recent_posts(owner: str, network: str) -> list[Any]:
+        return [post for post in await owner_posts(owner, network) if recent(post, network)]
+
     async def fetch(network: str, wanted: dict[str, str], limit: int) -> bool:
         """Scrape these owners' profiles (owner -> URL) for up to `limit` posts each, and store them."""
         actor = LINKEDIN_POSTS_ACTOR if network == "linkedin" else INSTAGRAM_ACTOR
         call = apify.linkedin_posts if network == "linkedin" else apify.instagram_posts
         try:
-            fetched, run = await call(list(dict.fromkeys(wanted.values())), limit, since)
+            fetched, run = await call(list(dict.fromkeys(wanted.values())), limit, instagram_since if network == "instagram" and instagram_since is not None else since)
         except ApifyError as exc:
             await record_apify(actor, None, "failed")
             result.error = exc.message
@@ -186,6 +199,8 @@ async def gather(
         by_key = {_match_key(network, url): owner for owner, url in wanted.items()}
         grouped: dict[str, list[FetchedPost]] = {owner: [] for owner in wanted}
         for post in fetched:
+            if not recent(post, network):
+                continue
             owner = by_key.get(post.owner_key or "") or (next(iter(wanted)) if len(wanted) == 1 else None)
             if owner:
                 grouped[owner].append(post)
@@ -212,7 +227,7 @@ async def gather(
         if not owners:
             continue
         # 1. A first look, where fewer than that are stored.
-        have = {owner: len(await owner_posts(owner, network)) for owner in owners}
+        have = {owner: len(await recent_posts(owner, network)) for owner in owners}
         look = {o: u for o, u in owners.items() if have[o] < first}
         if look and not await fetch(network, look, first):
             break
@@ -221,7 +236,7 @@ async def gather(
         if claude is not None:
             for owner in owners:
                 t = speaker[owner]
-                posts = (await owner_posts(owner, network))[:max_posts]
+                posts = (await recent_posts(owner, network))[:max_posts]
                 verdict, cost, error = await judge(claude, t.lead if owner.startswith("lead:") else None, t.company, posts)
                 if cost:
                     result.claude_cost_usd += cost
@@ -233,7 +248,7 @@ async def gather(
             if result.error:
                 break
         more = {o: u for o, u in owners.items()
-                if not (verdicts.get(o) and verdicts[o].enough) and max_posts > first and len(await owner_posts(o, network)) < max_posts}  # fmt: skip
+                if not (verdicts.get(o) and verdicts[o].enough) and max_posts > first and len(await recent_posts(o, network)) < max_posts}  # fmt: skip
         if more and not await fetch(network, more, max_posts):
             break
         for t in targets:
@@ -242,7 +257,7 @@ async def gather(
                 continue
             owner, _ = src
             o = out[t.key]
-            o.counts[stage] = min(len(await owner_posts(owner, network)), max_posts)
+            o.counts[stage] = min(len(await recent_posts(owner, network)), max_posts)
             o.new += new_posts.get(owner, 0) if owner.startswith("lead:") else 0
             verdict = verdicts.get(owner)
             if verdict and verdict.enough:

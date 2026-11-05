@@ -31,6 +31,8 @@ log = logging.getLogger("coldbrew.background")
 
 # POST endpoints (under /api/v1) that only run as background jobs, with what the person sees.
 LONG_RUNNING: dict[str, str] = {
+    "/analysis/refresh": "Refreshing smart analysis",
+    "/products/suggest": "Suggesting product improvements",
     "/pipeline/find": "Finding companies",
     "/pipeline/research": "Researching companies",
     "/pipeline/stakeholders": "Finding people",

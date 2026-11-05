@@ -10,6 +10,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from schemas import CampaignReadinessOut
+from services.campaign_readiness import assess
 from crud import (
     ExampleRepo, ExclusionRepo, IcpCampaignRepo, IcpProfileRepo, ProductRepo, PromptRepo, ProviderCallRepo, SendingRepo, SettingsRepo,
 )  # fmt: skip
@@ -97,6 +99,20 @@ async def campaigns(deps: outreach.Deps = Depends(_deps)) -> list[SendingCampaig
         for c in rows
         if (c.get("name") or "").startswith(outreach.CAMPAIGN_PREFIX)
     ]
+
+
+@router.get("/campaigns/{campaign_id}/readiness", response_model=CampaignReadinessOut)
+async def campaign_readiness(campaign_id: str, deps: outreach.Deps = Depends(_deps)) -> CampaignReadinessOut:
+    """On-demand, read-only diagnostics. Never activates a campaign or runs a paid model."""
+    try:
+        summaries = await deps.sequencer.campaigns()
+        if not any(c["id"] == campaign_id and (c.get("name") or "").startswith(outreach.CAMPAIGN_PREFIX) for c in summaries):
+            raise HTTPException(status_code=404, detail="Coldbrew campaign not found")
+        campaign, _ = await deps.sequencer.campaign(campaign_id)
+        enrolled = await deps.sequencer.enrollments(campaign_id)
+    except SendingError as exc:
+        raise HTTPException(status_code=502, detail=exc.message) from exc
+    return CampaignReadinessOut.model_validate(assess(campaign, len(enrolled)))
 
 
 @router.post("/queue", response_model=QueueOut)

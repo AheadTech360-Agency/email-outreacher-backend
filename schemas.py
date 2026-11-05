@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 from models import FALLBACK_4, FALLBACK_5
@@ -647,6 +647,7 @@ class UserAdded(UserOut):
 
 
 class StakeholderOut(ApiModel):
+    archived: bool = False
     id: UUID
     company_id: UUID | None = Field(validation_alias="lead_intel_business_id")
     # The pipeline company (eo_companies) they were found at.
@@ -773,6 +774,7 @@ class PostFetchIn(ApiModel):
     # Posts fetched per source (company LinkedIn, their LinkedIn, company Instagram) when a source is read.
     max_posts: int = Field(default=3, ge=1, le=20)
     max_age_days: int = Field(default=60, ge=1, le=365)
+    instagram_max_age_days: int | None = Field(default=None, ge=1, le=365)
     # Which networks to fetch; both unless an ICP turned one off.
     sources: list[Literal["linkedin", "instagram"]] = Field(default=["linkedin", "instagram"], min_length=1)
 
@@ -799,6 +801,7 @@ class PostGatherIn(ApiModel):
     sources: list[Literal["company_linkedin", "person_linkedin", "company_instagram"]] = Field(min_length=1)
     max_posts: int = Field(default=3, ge=1, le=20)
     max_age_days: int = Field(default=60, ge=1, le=365)
+    instagram_max_age_days: int | None = Field(default=None, ge=1, le=365)
 
 
 class GatheredFor(ApiModel):
@@ -894,6 +897,7 @@ class FindCompaniesResult(ApiModel):
 
 
 class PipelineCompanyOut(ApiModel):
+    archived: bool = False
     id: UUID
     icp_id: UUID | None
     source: str
@@ -1027,7 +1031,7 @@ class UsageOut(ApiModel):
 
 # ---------- Prompts ----------
 
-PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people"]
+PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people", "product", "analysis"]
 
 
 class PromptVersionIn(ApiModel):
@@ -1346,6 +1350,37 @@ class PeopleImportResult(ApiModel):
 # ---------- Products ----------
 
 
+class ProductCustomField(ApiModel):
+    key: str = Field(min_length=1, max_length=60, pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+    label: str = Field(min_length=1, max_length=80)
+    value: str = Field(default="", max_length=4000)
+
+    @field_validator("label", "value")
+    @classmethod
+    def trim_text(cls, value):
+        return value.strip()
+
+    @field_validator("label")
+    @classmethod
+    def nonempty_label(cls, value):
+        from services.product_fields import field_key
+        if not field_key(value):
+            raise ValueError("Enter a field name using letters or numbers")
+        return value
+
+
+class ProductNote(ApiModel):
+    id: UUID
+    body: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("body")
+    @classmethod
+    def trim_body(cls, value):
+        if not value.strip():
+            raise ValueError("Notes cannot be empty")
+        return value.strip()
+
+
 class ProductIn(ApiModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=2000)
@@ -1356,7 +1391,18 @@ class ProductIn(ApiModel):
     url: str = Field(default="", max_length=500)
 
 
+    custom_fields: list[ProductCustomField] = Field(default_factory=list, max_length=30)
+    notes: list[ProductNote] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def unique_fields_and_notes(self):
+        from services.product_fields import validate_fields
+        validate_fields(self.custom_fields, self.notes)
+        return self
+
+
 class ProductOut(ProductIn):
+    archived: bool = False
     id: UUID
     created_at: datetime
     updated_at: datetime
@@ -1722,3 +1768,20 @@ class ImportRunResult(ApiModel):
     people_sorted: SortListsResult | None = None
     enriched: EnrichResult | None = None
     cost_usd: float = 0.0
+
+
+class CampaignReadinessCheck(ApiModel):
+    key: str
+    status: Literal["pass", "fail", "unknown"]
+    message: str
+
+
+class CampaignReadinessOut(ApiModel):
+    id: str
+    name: str
+    status: str
+    timezone: str | None
+    enrolled: int
+    checks: list[CampaignReadinessCheck]
+    checked_at: datetime
+    blocking: int

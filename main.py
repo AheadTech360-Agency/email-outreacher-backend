@@ -7,8 +7,8 @@ from config import get_settings
 from response_cache import ResponseCache
 from dependencies import get_current_user, refuse_inline, require_api_secret
 from routers import (
-    companies, emails, examples, exclusions, health, home, icps, improve, jobs, leads, mailboxes, pipeline, posts, products, prompts,
-    quickstart, sending, settings, smart_lists, sources, stakeholders, usage, users, webhooks, workspaces,
+    analysis, companies, emails, examples, exclusions, health, home, icps, improve, jobs, leads, mailboxes, pipeline, posts, products, prompts,
+    quickstart, records, saved_views, sending, settings, smart_lists, sources, stakeholders, usage, users, webhooks, workspaces,
 )  # fmt: skip
 
 
@@ -21,6 +21,7 @@ api_router.include_router(health.router)
 # CheapSequencer's webhooks can't sign in: each delivery is checked against its signature instead (routers/webhooks.py).
 api_router.include_router(webhooks.router)
 protected = APIRouter(dependencies=[Depends(require_api_secret), Depends(get_current_user), Depends(refuse_inline)])
+protected.include_router(analysis.router)
 protected.include_router(users.router)
 protected.include_router(icps.router)
 protected.include_router(companies.router)
@@ -44,6 +45,8 @@ protected.include_router(jobs.router)
 protected.include_router(quickstart.router)
 protected.include_router(smart_lists.router)
 protected.include_router(home.router)
+protected.include_router(records.router)
+protected.include_router(saved_views.router)
 api_router.include_router(protected)
 
 
