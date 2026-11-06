@@ -421,9 +421,9 @@ class SendingCampaignOut(ApiModel):
 
 
 class QueueIn(ApiModel):
-    email_ids: list[UUID] = Field(min_length=1, max_length=500)
+    email_ids: list[UUID] = Field(min_length=1, max_length=5000)
     # Emails to risky addresses (catch-all domains) a person confirmed. Any other risky one is left out.
-    risky_ok: list[UUID] = Field(default=[], max_length=500)
+    risky_ok: list[UUID] = Field(default=[], max_length=5000)
 
 
 class QueueOutcomeOut(ApiModel):
