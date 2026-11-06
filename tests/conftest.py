@@ -182,6 +182,14 @@ def no_real_sending(monkeypatch):
 
     monkeypatch.setattr(get_settings(), "cheapsequencer_api_key", None)
     monkeypatch.setattr(get_settings(), "cheapinboxes_api_key", None)
+    # No real email either: the reply email's SMTP is never reached, whatever .env holds.
+    import services.notify
+
+    def no_smtp(*_args, **_kwargs):
+        raise AssertionError("a test tried to send a real email")
+
+    monkeypatch.setattr(get_settings(), "smtp_host", None)
+    monkeypatch.setattr(services.notify, "_send", no_smtp)
     app.dependency_overrides[get_optional_sequencer] = lambda: None
     app.dependency_overrides[get_optional_inboxes] = lambda: None
     # Apify too: reading prices is free, but tests never reach a real account.

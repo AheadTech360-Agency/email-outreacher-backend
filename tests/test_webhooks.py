@@ -12,6 +12,7 @@ import pytest
 from config import get_settings
 from dependencies import get_optional_sequencer, get_sending_repo
 from main import app
+from services import notify
 from services.webhooks import stop_of, verify
 
 SECRET = "whsec_test"
@@ -74,6 +75,12 @@ class FakeSending:
         email.sequence_stop_reason = email.sequence_stop_reason or stop.type
         return True
 
+    async def has_event(self, email_id, kind):
+        return kind in self.events.values()
+
+    async def lead(self, lead_id):
+        return SimpleNamespace(id=lead_id, email=self.address, first_name="Ana", last_name="", company="Shop")
+
 
 class FakeSequencer:
     def __init__(self, leads: dict[str, dict]) -> None:
@@ -89,7 +96,14 @@ def hooks(client, monkeypatch):
     sending = FakeSending()
     app.dependency_overrides[get_sending_repo] = lambda: sending
     app.dependency_overrides[get_optional_sequencer] = lambda: FakeSequencer({"lead_cs_2": {"email": "Ana@Shop.com"}})
-    return SimpleNamespace(client=client, sending=sending)
+    emailed: list = []  # the reply emails sent to the team
+
+    async def reply_received(lead, campaign=None):
+        emailed.append(lead.email)
+        return True
+
+    monkeypatch.setattr(notify, "reply_received", reply_received)
+    return SimpleNamespace(client=client, sending=sending, emailed=emailed)
 
 
 def deliver(client, payload: dict, signature: str | None = "sign"):
@@ -151,3 +165,30 @@ def test_someone_else_s_lead_is_ignored(hooks) -> None:
 def test_other_events_are_ignored(hooks) -> None:
     assert deliver(hooks.client, event("message.sent")).json() == {"status": "ignored"}
     assert hooks.sending.lookups == []
+
+
+# ---------- The reply email to the team ----------
+
+
+def test_each_reply_is_emailed_once_even_when_delivered_again(hooks) -> None:
+    deliver(hooks.client, event())
+    deliver(hooks.client, event())  # the same delivery again
+    assert hooks.emailed == ["ana@shop.com"]
+
+
+def test_a_later_reply_in_the_thread_is_emailed_too(hooks) -> None:
+    deliver(hooks.client, event())
+    deliver(hooks.client, event(event_id="evt_9"))
+    assert hooks.emailed == ["ana@shop.com", "ana@shop.com"]
+
+
+def test_a_reply_the_follow_up_check_already_emailed_isnt_emailed_again(hooks) -> None:
+    hooks.sending.email.sequence_stop_reason = "replied"  # the check saw it first, and emailed it
+    assert deliver(hooks.client, event()).json() == {"status": "recorded"}
+    assert hooks.emailed == []
+
+
+def test_bounces_and_unsubscribes_arent_emailed(hooks) -> None:
+    deliver(hooks.client, event("message.bounced", event_id="evt_b"))
+    deliver(hooks.client, event("enrollment.stopped", reason="unsubscribed", event_id="evt_u"))
+    assert hooks.emailed == []

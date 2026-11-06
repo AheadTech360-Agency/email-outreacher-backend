@@ -614,6 +614,13 @@ class SendingRepo:
             return None
         return await self.session.scalar(query.order_by(Email.queued_at.desc().nulls_last()).limit(1))
 
+    async def has_event(self, email_id: UUID, kind: str) -> bool:
+        """Whether a webhook event of this kind (replied, bounced...) is already stored for this email."""
+        return bool(await self.session.scalar(select(exists().where(SendEvent.email_id == email_id, SendEvent.type == kind))))
+
+    async def lead(self, lead_id: UUID) -> Lead | None:
+        return await self.session.get(Lead, lead_id)
+
     async def record_stop(self, email: Email, stop: Any, payload: dict[str, Any]) -> bool:
         """Store a webhook's stop once (by its event id) and stop the lead's sequence here. False if it was
         already stored: CheapSequencer delivers at least once."""

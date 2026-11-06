@@ -385,6 +385,26 @@ def test_follow_ups_are_written_only_for_leads_who_have_not_replied(claude) -> N
     assert result.cost_usd > 0
 
 
+def test_a_reply_the_check_sees_first_is_emailed_to_the_team_once(claude) -> None:
+    """A reply the webhook missed is emailed when the check sees it; the next check doesn't email it again, and one
+    the webhook already recorded (stop reason set) isn't emailed by the check at all."""
+    replied, known, due = queued_pair("replied@x.com"), queued_pair("known@x.com"), queued_pair("due@x.com")
+    known[0].sequence_stop_reason = "replied"  # the webhook recorded (and emailed) this one
+    rows = [enrollment("replied@x.com", status="stopped", replied_at="2026-11-09T10:00:00Z"),
+            enrollment("known@x.com", status="stopped", replied_at="2026-11-09T09:00:00Z"), enrollment("due@x.com")]  # fmt: skip
+    emailed = []
+
+    async def note(lead):
+        emailed.append(lead.email)
+        return True
+
+    sending = Sending([replied, known, due])
+    for _ in range(2):  # two checks in a row
+        d = deps(sending, Sequencer([CAMPAIGN], rows))
+        d.notify = note
+        run(outreach.run_follow_ups(d, now=NOW))
+    assert emailed == ["replied@x.com"]
+
 def test_follow_ups_already_written_are_not_written_again(claude) -> None:
     pair = queued_pair("due@x.com")
     sending = Sending([pair])

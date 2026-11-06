@@ -8,11 +8,12 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from config import get_settings
 from crud import SendingRepo
 from dependencies import get_optional_sequencer, get_sending_repo
+from services import notify
 from services.sending import SendingError, SequencerClient
 from services.webhooks import stop_of, verify
 
@@ -25,6 +26,7 @@ MAX_BYTES = 256 * 1024
 @router.post("/cheapsequencer")
 async def cheapsequencer(
     request: Request,
+    background: BackgroundTasks,
     sending: SendingRepo = Depends(get_sending_repo),
     sequencer: SequencerClient | None = Depends(get_optional_sequencer),
 ) -> dict[str, str]:
@@ -63,7 +65,11 @@ async def cheapsequencer(
             email = await sending.first_email_for(stop.campaign_id, address=str(lead["email"]))
     if email is None:
         return {"status": "ignored"}  # not one of Coldbrew's leads
+    # A reply the follow-up check saw first (marked replied with no reply event yet) was already emailed by it.
+    seen_by_check = stop.type == "replied" and email.sequence_stop_reason == "replied" and not await sending.has_event(email.id, "replied")
     if await sending.record_stop(email, stop, event):
         log.info("%s for email %s (event %s)", stop.type, email.id, stop.event_id)
+        if stop.type == "replied" and not seen_by_check and (lead := await sending.lead(email.lead_id)) is not None:
+            background.add_task(notify.reply_received, lead)  # after the answer: CheapSequencer isn't kept waiting
         return {"status": "recorded"}
-    return {"status": "duplicate"}
+    return {"status": "duplicate"}  # a delivery seen before: stored once, emailed once

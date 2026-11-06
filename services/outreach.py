@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 
 from crud import PRODUCT_FIELDS, exclusion_note, person_keys
 from models import Email, Lead
+from services import notify
 from services.claude import cost_usd
 from services.generation import PromptVersionSpec, Sample, format_samples, write_follow_up
 from services.prompts import product_variables, render_product as render, render as render_template
@@ -162,6 +163,7 @@ class Deps:
     sequencer: Any  # SequencerClient
     writer: Any = None  # EmailWriter, for follow-ups
     links: Any = None  # IcpCampaignRepo
+    notify: Any = None  # async (lead) -> bool: the reply email; None means services.notify.reply_received
 
 
 async def campaign_for_icps(deps: Deps, icp_ids: set[UUID]) -> dict[UUID, tuple[str, str]]:
@@ -522,6 +524,7 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
 
     existing = await deps.sending.follow_ups([lead.id for _, lead in pairs])
     to_write: dict[str, list[tuple[Email, Lead, int, str, Any]]] = {}
+    newly_replied: list[Lead] = []
     for email, lead in pairs:
         row = enrollments.get(email.sequencer_campaign_id, {}).get((lead.email or "").lower())
         if row is None:
@@ -533,6 +536,10 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
             email.sequencer_inbox_id = inbox_id
             email.sequencer_inbox_email = mailboxes.get(inbox_id) or email.sequencer_inbox_email
         email.sequence_status, email.sequence_sent_count = p.status, p.sent
+        # A reply seen here first (the webhook missed it, or hasn't come yet) is emailed once, after the save below.
+        # One the webhook already recorded has its stop reason set, so it isn't emailed again.
+        if p.stop_reason == "replied" and email.sequence_stop_reason != "replied":
+            newly_replied.append(lead)
         # A stop a webhook already recorded (services/webhooks.py) stays, even before CheapSequencer's enrollment shows it.
         email.sequence_last_sent_at, email.sequence_stop_reason = p.last_sent_at, p.stop_reason or email.sequence_stop_reason
         email.sequence_synced_at, email.sequence_raw = now, row
@@ -571,6 +578,8 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
             continue
         to_write.setdefault(email.sequencer_list_id, []).append((email, lead, step, draft.body, (version.id, draft.confidence, cost)))
     await deps.sending.commit()
+    for lead in newly_replied:  # saved as replied first, so the next check can't email them again
+        await (deps.notify or notify.reply_received)(lead)
 
     for list_id, items in to_write.items():
         rows = [{"email": (lead.email or "").lower(), f"email_{step}_body": body} for _, lead, step, body, _ in items]

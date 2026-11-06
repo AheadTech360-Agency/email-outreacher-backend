@@ -72,6 +72,17 @@ class Settings(BaseSettings):
     # The page named in the website reader's User-Agent, for site owners who want to know who's reading.
     bot_info_url: str = "https://aheadtech360.com"
 
+    # An email to the team whenever a lead replies (services/notify.py). Port 465 is SSL; any other uses STARTTLS.
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    email_from_name: str = "Coldbrew"
+    # Who gets it: comma-separated addresses.
+    notify_emails: str = ""
+    # The app's address for links in those emails; empty means the first of AUTHORIZED_URLS.
+    app_url: str | None = None
+
     # Prices the cost estimator uses where Coldbrew has no source of its own, as JSON by line id, e.g.
     # {"apollo-reveal": 0.02, "linkedin-posts": 0.002, "railway": 20}. The estimator shows prices read-only.
     cost_prices: str = ""
