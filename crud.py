@@ -1265,10 +1265,20 @@ class PostRepo:
         query = select(Lead).where(Lead.workspace_id == workspace_id, Lead.id.in_(lead_ids))
         return list(await self.session.scalars(query))
 
+    async def _recent(self, workspace_id: UUID, posts: list[FetchedPost]) -> list[FetchedPost]:
+        """Only posts within the longest age limit in use (Settings', or an ICP's longer one), and none without a
+        date: an older post is never stored, whichever path read it (2026-11-06: 2,705 posts over 60 days old had
+        come in, mostly with a company's Instagram profile, and were written from)."""
+        setting = await self.session.scalar(select(Settings.max_post_age_days).where(Settings.workspace_id == workspace_id))
+        icp = await self.session.scalar(select(func.max(IcpProfile.max_post_age_days)).where(IcpProfile.workspace_id == workspace_id))
+        cutoff = datetime.now(UTC) - timedelta(days=max(setting or GENERAL_DEFAULTS["max_post_age_days"], icp or 0))
+        aware = lambda d: d if d.tzinfo else d.replace(tzinfo=UTC)  # noqa: E731
+        return [p for p in posts if p.posted_at is not None and aware(p.posted_at) >= cutoff]
+
     async def save(self, workspace_id: UUID, lead_id: UUID, posts: list[FetchedPost]) -> int:
-        """Store posts a lead doesn't have yet (same URL = same post); returns how many were new."""
+        """Store posts a lead doesn't have yet (same URL = same post), recent ones only; returns how many were new."""
         new = 0
-        for p in posts:
+        for p in await self._recent(workspace_id, posts):
             statement = (
                 insert(Post)
                 .values(
@@ -1295,9 +1305,9 @@ class PostRepo:
         await self.session.commit()
 
     async def save_company(self, workspace_id: UUID, company_id: UUID, posts: list[FetchedPost]) -> int:
-        """Store a pipeline company's own posts it doesn't have yet; returns how many were new."""
+        """Store a pipeline company's own posts it doesn't have yet, recent ones only; returns how many were new."""
         new = 0
-        for p in posts:
+        for p in await self._recent(workspace_id, posts):
             statement = (
                 insert(Post)
                 .values(
