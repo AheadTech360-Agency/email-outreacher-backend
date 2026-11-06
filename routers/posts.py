@@ -37,6 +37,14 @@ async def list_posts(
     return [PostOut.model_validate(p) for p in await posts.list(workspace_id, lead_id)]
 
 
+async def _windows(posts: PostRepo, workspace_id: UUID, days: int, instagram_days: int | None) -> tuple[datetime, datetime | None]:
+    """How far back to read: what was asked, never past the longest age limit in use (Settings', or an ICP's), so
+    Apify is never paid for posts that would only be thrown away."""
+    limit = await posts.max_age_days(workspace_id)
+    now = datetime.now(UTC)
+    return now - timedelta(days=min(days, limit)), (now - timedelta(days=min(instagram_days, limit))) if instagram_days else None
+
+
 @router.post("/fetch", response_model=PostFetchResult, dependencies=[Depends(require_manager)])
 async def fetch_posts(
     body: PostFetchIn,
@@ -50,7 +58,7 @@ async def fetch_posts(
     their own LinkedIn, then the company's Instagram, each read only for the leads Claude still finds short of
     material. Apify is paid per post (about $0.002), Claude's check is a fraction of a cent a lead."""
     leads = await posts.leads(workspace_id, list(dict.fromkeys(body.lead_ids)))
-    since = datetime.now(UTC) - timedelta(days=body.max_age_days)
+    since, instagram_since = await _windows(posts, workspace_id, body.max_age_days, body.instagram_max_age_days)
     targets = [Target(lead, await posts.company_for(workspace_id, lead)) for lead in leads]
     stages = [stage for stage, network, _ in STAGES if network in body.sources]
 
@@ -66,7 +74,7 @@ async def fetch_posts(
 
     outcome = await gather(
         targets=targets, stages=stages, max_posts=body.max_posts, since=since, apify=apify, claude=claude,
-        instagram_since=(datetime.now(UTC) - timedelta(days=body.instagram_max_age_days)) if body.instagram_max_age_days else None,
+        instagram_since=instagram_since,
         owner_posts=lambda owner, network: posts.of_owner(workspace_id, owner, network),
         save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
         record_claude=record_claude, progress=report,
@@ -136,10 +144,10 @@ async def gather_posts(
     async def record_claude(cost: float) -> None:
         await calls.record(workspace_id, "claude", "messages", "succeeded", model=JUDGE_MODEL, cost_usd=cost, action="Read posts")
 
-    since = datetime.now(UTC) - timedelta(days=body.max_age_days)
+    since, instagram_since = await _windows(posts, workspace_id, body.max_age_days, body.instagram_max_age_days)
     outcome = await gather(
         targets=targets, stages=list(body.sources), max_posts=body.max_posts, since=since, apify=apify, claude=claude,
-        instagram_since=(datetime.now(UTC) - timedelta(days=body.instagram_max_age_days)) if body.instagram_max_age_days else None,
+        instagram_since=instagram_since,
         owner_posts=lambda owner, network: posts.of_owner(workspace_id, owner, network),
         save=lambda owner, found: posts.save_for(workspace_id, owner, found), record_apify=record_apify,
         record_claude=record_claude, progress=report,

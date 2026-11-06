@@ -1,7 +1,7 @@
 """LinkedIn search, add-as-leads and post fetching, with fake Apify and fake repos. No network, no cost."""
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -17,6 +17,7 @@ from tests.test_stakeholders_api import WS, apollo_env  # noqa: F401  (fixture)
 class FakeApify:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.since: list = []  # how far back each read was asked to go
         self.error: ApifyError | None = None
         self.linkedin_items: list[FetchedPost] = []
         self.instagram_items: list[FetchedPost] = []
@@ -34,12 +35,14 @@ class FakeApify:
 
     async def linkedin_posts(self, urls, max_posts, since):
         self.calls.append(("linkedin", tuple(urls), max_posts))
+        self.since.append(since)
         return self.linkedin_items, RunResult([], 0.004, "run-li")
 
     async def instagram_posts(self, urls, max_posts, since):
         if self.error:
             raise self.error
         self.calls.append(("instagram", tuple(urls), max_posts))
+        self.since.append(since)
         return self.instagram_items, RunResult([], 0.003, "run-ig")
 
 
@@ -128,6 +131,10 @@ class FakePosts:
         self.rows = {lead.id: lead for lead in leads}
         self.companies = companies  # lead id -> company
         self.posts: list = []
+        self.limit_days = 60  # Settings' post age limit
+
+    async def max_age_days(self, ws):
+        return self.limit_days
 
     async def leads(self, ws, ids):
         return [self.rows[i] for i in ids if i in self.rows]
@@ -271,6 +278,13 @@ def test_apify_failure_is_reported_and_statuses_untouched(client, posts_env) -> 
     e.apify.error = ApifyError("Apify says the account is out of credit", 402)
     result = fetch(client, e.ava, sources=["instagram"])
     assert result["error"] == "Apify says the account is out of credit" and e.ava.status == "imported"
+
+
+def test_posts_older_than_the_age_limit_are_never_asked_for(client, posts_env) -> None:
+    """A read asked for a year of posts goes back only as far as the age limit: Apify isn't paid for older ones."""
+    e = posts_env
+    fetch(client, e.ava, sources=["instagram"], maxAgeDays=365, instagramMaxAgeDays=365)
+    assert e.apify.since and all(datetime.now(UTC) - s < timedelta(days=61) for s in e.apify.since)
 
 
 def test_fetch_limits(client, posts_env) -> None:
