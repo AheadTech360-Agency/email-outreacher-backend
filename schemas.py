@@ -1122,6 +1122,8 @@ class GenerateIn(ApiModel):
     lead_ids: list[UUID] = Field(min_length=1, max_length=25)
     # An extra instruction for the email step, e.g. "shorter, mention their new store".
     instruction: str = Field(default="", max_length=1000)
+    # Only write from posts this recent (a Quick Start run's limit); else the ICP's, else Settings'.
+    max_post_age_days: int | None = Field(default=None, ge=1, le=365)
 
 
 class GenerateOutcome(ApiModel):

@@ -27,6 +27,7 @@ class World:
         self.sites: set[str] = set()  # companies whose website was read
         self.sites_before: set[str] = set()  # ...before the run started
         self.contacted: set = set()  # people already emailed
+        self.write_ages: list[int] = []  # the post age limit each write was sent
         for name in ("Ink Co", "Tee Shop", "Big Box"):
             c = SimpleNamespace(id=uuid4(), name=name, domain=None, status="found", status_reason=None, score=None, researched_at=None)
             self.companies[c.id] = c
@@ -76,6 +77,9 @@ class World:
         if path == "/stakeholders/enrich":
             return True, {"linkedinPeople": len(body["stakeholderIds"])}, None
         if path == "/emails/generate":
+            # Written only from posts within the run's age limit, not older ones stored from an earlier read.
+            assert body["maxPostAgeDays"] == run.settings["max_post_age_days"]
+            self.write_ages.append(body["maxPostAgeDays"])
             for lid in body["leadIds"]:
                 self.emails.append(SimpleNamespace(id=uuid4(), lead_id=next(x.id for x in self.leads.values() if str(x.id) == lid)))
             return True, {"results": [{"status": "drafted"} for _ in body["leadIds"]]}, None
@@ -172,6 +176,12 @@ def run_all(run, world) -> int:
         rounds += 1
         assert rounds < 50, "the run never finished"
     return rounds
+
+
+def test_emails_are_written_only_from_posts_within_the_runs_age_limit(world) -> None:
+    run = new_run(max_post_age_days=30)
+    run_all(run, world)
+    assert world.write_ages and set(world.write_ages) == {30}
 
 
 def test_a_run_goes_from_google_maps_to_drafts_in_review(world) -> None:

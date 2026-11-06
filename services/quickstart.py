@@ -370,7 +370,8 @@ async def _write(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     todo = [lead.id for lead in leads if lead.id not in drafted and str(lead.id) not in tried][:WRITE_BATCH]
     reasons = list(run.progress.get("_skipped", []))
     if todo:
-        ok, out, detail = await _job(session, run, "/emails/generate", {"leadIds": [str(i) for i in todo]}, "Quick Start: writing emails")
+        ok, out, detail = await _job(session, run, "/emails/generate",
+                                   {"leadIds": [str(i) for i in todo], "maxPostAgeDays": run.settings.get("max_post_age_days")}, "Quick Start: writing emails")
         if not ok:
             return _fail(run, "write", detail)
         reasons += [r["reason"] for r in (out or {}).get("results", []) if r.get("status") != "drafted" and r.get("reason")]

@@ -14,7 +14,7 @@
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -226,15 +226,19 @@ async def _prepare(
     workspace_id: UUID, ids: list[UUID], instruction: str | None, overrides: dict[str, PromptVersionSpec], emails: EmailRepo,
     lead_intel: LeadIntelRepo, profiles: IcpProfileRepo, prompts: PromptRepo, feedback: FeedbackRepo, settings: SettingsRepo,
     products: ProductRepo, library: ExampleRepo, exclusions: ExclusionRepo, companies: CompanyRepo, reader: WebsiteReader,
+    max_post_age_days: int | None = None,
 ) -> tuple[dict[UUID, GenerateOutcome], list[tuple[Lead, LeadContext, PromptVersionSpec, PromptVersionSpec, PromptVersionSpec | None]], dict[UUID, list[UUID]]]:  # fmt: skip
     """Everything each lead's email is written from (the ICP, its prompts, posts, website, examples, feedback), and
-    why a lead is skipped. `overrides` swaps in a prompt version by kind ("hook", "email"), for a test."""
+    why a lead is skipped. `overrides` swaps in a prompt version by kind ("hook", "email"), for a test. Posts are
+    only those from the last `max_post_age_days` (a Quick Start run's), else the ICP's limit, else Settings'."""
     leads = {lead.id: lead for lead in await emails.leads(workspace_id, ids)}
+    general = await settings.general(workspace_id)
+    now = datetime.now(UTC)
     is_excluded = await exclusions.matcher()
     outcomes: dict[UUID, GenerateOutcome] = {}
     jobs: list[tuple[Lead, LeadContext, PromptVersionSpec, PromptVersionSpec, PromptVersionSpec | None]] = []
     # Email scoring isn't chosen per ICP: every draft is scored with the prompt picked in Settings, else the default.
-    score_version = await prompts.for_icp(workspace_id, "score", (await settings.general(workspace_id))["scoring_prompt_id"])
+    score_version = await prompts.for_icp(workspace_id, "score", general["scoring_prompt_id"])
     score_spec = _spec(score_version) if score_version else None
     icps: dict[UUID, dict[str, Any] | None] = {}
     rated: dict[UUID, list] = {}
@@ -286,9 +290,11 @@ async def _prepare(
             found = await lead_intel.get_company(business_id)
             lead_intel_fields[business_id] = found["fields"] if found else None
         fields = lead_intel_fields.get(business_id) if business_id and not has_research else None
+        max_age = max_post_age_days or getattr(profile, "max_post_age_days", None) or general["max_post_age_days"] or 60
         posts = await emails.posts_for(
-            workspace_id, lead, company, max(hook_spec.posts, email_spec.posts, score_spec.posts if score_spec else 0)
-        )
+            workspace_id, lead, company, max(hook_spec.posts, email_spec.posts, score_spec.posts if score_spec else 0),
+            since=now - timedelta(days=max_age),
+        )  # fmt: skip
         person = await emails.person_for(workspace_id, lead)
         pages = [{"url": p.url, "text": p.text} for p in await emails.pages_for(company)] if company else []
         if not pages and not (fields or {}).get("site_text") and not _researched_site(company):
@@ -356,7 +362,7 @@ async def generate(
     ids = list(dict.fromkeys(body.lead_ids))
     outcomes, jobs, examples_used = await _prepare(
         workspace_id, ids, body.instruction, {}, emails, lead_intel, profiles, prompts, feedback, settings, products, library,
-        exclusions, companies, reader,
+        exclusions, companies, reader, body.max_post_age_days,
     )  # fmt: skip
 
     drafts = await asyncio.gather(*(writer.write(ctx, hook, email, score) for _, ctx, hook, email, score in jobs))

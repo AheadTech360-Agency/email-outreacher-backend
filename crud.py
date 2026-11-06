@@ -1613,12 +1613,14 @@ class EmailRepo:
             )
         return company
 
-    async def posts_for(self, workspace_id: UUID, lead: Lead, company: Company | None, limit: int) -> list[Post]:
-        """The lead's own posts and their company's, newest first."""
+    async def posts_for(self, workspace_id: UUID, lead: Lead, company: Company | None, limit: int, since: datetime | None = None) -> list[Post]:
+        """The lead's own posts and their company's, newest first. With `since`, only posts from then on: an older
+        post stored from an earlier read is never written from (2026-11-06: 126 emails opened on posts up to a year
+        old), and nor is one with no date."""
         owners = [Post.lead_id == lead.id] + ([Post.company_id == company.id] if company else [])
         query = (
             select(Post)
-            .where(Post.workspace_id == workspace_id, or_(*owners))
+            .where(Post.workspace_id == workspace_id, or_(*owners), *([Post.posted_at >= since] if since else []))
             .order_by(Post.posted_at.desc().nulls_last(), Post.id)
             .limit(limit)
         )
