@@ -405,6 +405,19 @@ def test_a_reply_the_check_sees_first_is_emailed_to_the_team_once(claude) -> Non
         run(outreach.run_follow_ups(d, now=NOW))
     assert emailed == ["replied@x.com"]
 
+def test_a_send_failure_cheapsequencer_retried_doesnt_end_the_sequence(claude) -> None:
+    """A lead marked failed once, now active with no failure, gets its follow-up written and uploaded to
+    CheapSequencer; a bounce the webhook recorded stays, and gets none."""
+    retried, bounced = queued_pair("due@x.com"), queued_pair("gone@x.com")
+    retried[0].sequence_stop_reason, bounced[0].sequence_stop_reason = "failed", "bounced"
+    sending = Sending([retried, bounced])
+    seq = Sequencer([CAMPAIGN], [enrollment("due@x.com"), enrollment("gone@x.com")])
+    version = SimpleNamespace(id=uuid4(), system_prompt="s", user_prompt="Write email 2 for {{lead.firstName}}", model="claude-haiku-5-5", max_tokens=400)
+    result = run(outreach.run_follow_ups(deps(sending, seq, writer=object(), prompts=Repo(for_icp=version)), now=NOW))
+    assert retried[0].sequence_stop_reason is None and bounced[0].sequence_stop_reason == "bounced"
+    assert result.written == 1 and sending.added == [(retried[0].id, 2, "Hi Ana, one more thought.")]
+    assert seq.imports == [("list-1", [{"email": "due@x.com", "email_2_body": "Hi Ana, one more thought."}])]
+
 def test_follow_ups_already_written_are_not_written_again(claude) -> None:
     pair = queued_pair("due@x.com")
     sending = Sending([pair])

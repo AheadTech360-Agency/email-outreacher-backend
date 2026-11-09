@@ -540,8 +540,11 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
         # One the webhook already recorded has its stop reason set, so it isn't emailed again.
         if p.stop_reason == "replied" and email.sequence_stop_reason != "replied":
             newly_replied.append(lead)
-        # A stop a webhook already recorded (services/webhooks.py) stays, even before CheapSequencer's enrollment shows it.
-        email.sequence_last_sent_at, email.sequence_stop_reason = p.last_sent_at, p.stop_reason or email.sequence_stop_reason
+        # A reply, bounce or unsubscribe stays once recorded (a webhook may see it before the enrollment shows it). A
+        # send failure is only ever what CheapSequencer shows now: one it retried and sent doesn't end the sequence,
+        # so its follow-ups are written and uploaded like anyone's (2026-11-09: 7 leads kept a passing "failed").
+        kept = email.sequence_stop_reason if email.sequence_stop_reason in FINAL_STOPS else None
+        email.sequence_last_sent_at, email.sequence_stop_reason = p.last_sent_at, p.stop_reason or kept
         email.sequence_synced_at, email.sequence_raw = now, row
         if p.sent >= 1 and email.status == "queued":
             email.status, email.sent_at = "sent", email.sent_at or p.last_sent_at
@@ -599,6 +602,8 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
 
 
 STOPPED = {"stopped", "removed", "cancelled"}
+# Stops that never undo: the lead answered, the address doesn't exist, or they asked to stop.
+FINAL_STOPS = {"replied", "bounced", "unsubscribed"}
 
 
 def lead_state(email: Email) -> str:
