@@ -174,12 +174,21 @@ async def warm_send(
         if len(pool) < 2:
             out.notes.append(f"workspace {ws}: warming needs at least two connected warming mailboxes")
             continue
+        counted = WarmupMessage.status.in_(("sent", "dry_run"))
+        ws_today = int(await session.scalar(select(func.count()).select_from(WarmupMessage).where(
+            WarmupMessage.workspace_id == ws, WarmupMessage.sent_at >= _day_start(now), counted)) or 0)  # fmt: skip
         for account in pool:
+            if s.warmup_workspace_daily_cap is not None and ws_today >= s.warmup_workspace_daily_cap:
+                out.notes.append(f"workspace {ws}: warm-up daily cap ({s.warmup_workspace_daily_cap}) reached")
+                break
             sent_today = int(await session.scalar(select(func.count()).select_from(WarmupMessage).where(
-                WarmupMessage.from_account_id == account.id, WarmupMessage.sent_at >= _day_start(now),
-                WarmupMessage.status.in_(("sent", "dry_run")))) or 0)  # fmt: skip
+                WarmupMessage.from_account_id == account.id, WarmupMessage.sent_at >= _day_start(now), counted)) or 0)  # fmt: skip
+            last = await session.scalar(select(func.max(WarmupMessage.sent_at)).where(WarmupMessage.from_account_id == account.id, counted))
+            if last is not None and now - last < timedelta(minutes=s.warmup_min_gap_minutes):
+                continue  # this mailbox's own gap between warm-up emails
             if not send_now(sent_today, target_today(account, now, s), now, tick_minutes, rng, s.warmup_window):
                 continue
+            ws_today += 1
             to = rng.choice([a for a in pool if a.id != account.id])
             subject, body = compose(account, to, rng)
             message, message_id = build(account, to, subject, body)

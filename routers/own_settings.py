@@ -36,6 +36,8 @@ class SettingsIn(ApiModel):
     warmup_default_target: int = Field(default=20, ge=1, le=100)
     warmup_default_reply_percent: int = Field(default=30, ge=0, le=100)
     warmup_star_percent: int = Field(default=25, ge=0, le=100)
+    warmup_workspace_daily_cap: int | None = Field(default=None, ge=1, le=100000)
+    warmup_min_gap_minutes: int = Field(default=15, ge=1, le=240)
     linkedin_daily_invites: int = Field(default=20, ge=1, le=100)
     linkedin_weekly_invites: int = Field(default=100, ge=1, le=500)
     linkedin_daily_messages: int = Field(default=50, ge=1, le=250)
@@ -77,3 +79,21 @@ async def save_own_settings(body: SettingsIn, workspace_id: UUID = Depends(requi
         raise HTTPException(422, "That timezone isn't recognised.") from exc
     values = own_settings.Settings(**{**body.model_dump(), "warmup_days": window["days"]})
     return _out(await own_settings.save(session, workspace_id, values))
+
+
+class TargetIn(ApiModel):
+    warmup_daily_target: int = Field(ge=1, le=100)
+
+
+@router.post("/own-sending/settings/warmup-target-to-all")
+async def warmup_target_to_all(body: TargetIn, workspace_id: UUID = Depends(require_workspace_id),
+                               _user: CurrentUser = Depends(require_manager), session=Depends(get_session)) -> dict[str, int]:  # fmt: skip
+    """Set every warming mailbox in this workspace to this many warm-up emails a day (sending limits are untouched)."""
+    from sqlalchemy import update
+
+    from models import SenderAccount
+
+    result = await session.execute(update(SenderAccount).where(SenderAccount.workspace_id == workspace_id, SenderAccount.pool == "warming")
+                                   .values(warmup_daily_target=body.warmup_daily_target))  # fmt: skip
+    await session.commit()
+    return {"updated": result.rowcount or 0}

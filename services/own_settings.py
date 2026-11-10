@@ -30,6 +30,9 @@ class Settings:
     warmup_default_target: int = 20
     warmup_default_reply_percent: int = 30
     warmup_star_percent: int = 25
+    # Warm-up's own limits, apart from sending's
+    warmup_workspace_daily_cap: int | None = None
+    warmup_min_gap_minutes: int = 15
     # LinkedIn and Instagram: per account per day, unless the account has its own limit
     linkedin_daily_invites: int = 20
     linkedin_weekly_invites: int = 100
