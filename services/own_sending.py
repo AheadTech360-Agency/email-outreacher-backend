@@ -36,6 +36,7 @@ from models import (
     Email, Enrollment, InboundEvent, Lead, Persona, QueuedAddress, SenderAccount, SenderUsage, Sequence, SequenceStep, StepRun,
 )  # fmt: skip
 from services import mail_check, notify
+from services.own_settings import DEFAULTS as SETTINGS_DEFAULTS, load_all as load_settings
 from services.own_mail import MissingValue, Outgoing, build_message, classify, in_window, next_send_time, render, reply_subject
 from services.vault import Vault
 
@@ -297,9 +298,26 @@ async def send_due(
     vault = Vault(session)
     is_excluded = await ExclusionRepo(session).matcher()
     accounts = list(await session.scalars(select(SenderAccount).where(SenderAccount.status == "ok", SenderAccount.pool == "sending")))
+    settings = await load_settings(session)
+    sent_by_ws: dict[UUID, int] = {}
     for account in accounts:
+        s = settings.get(account.workspace_id, SETTINGS_DEFAULTS)
+        if s.sending_paused:
+            continue
         if live and await _usage_today(session, account.id, today) >= account.daily_limit:
             continue
+        if live and s.workspace_daily_cap is not None:
+            if account.workspace_id not in sent_by_ws:
+                sent_by_ws[account.workspace_id] = int(await session.scalar(
+                    select(func.coalesce(func.sum(SenderUsage.sent), 0)).join(SenderAccount, SenderAccount.id == SenderUsage.sender_account_id)
+                    .where(SenderAccount.workspace_id == account.workspace_id, SenderUsage.day == today)) or 0)  # fmt: skip
+            if sent_by_ws[account.workspace_id] >= s.workspace_daily_cap:
+                continue
+        if live:
+            # A random gap between one mailbox's sends (the workspace's min to max minutes), so it never sends in bursts.
+            last = await session.scalar(select(func.max(StepRun.ran_at)).where(StepRun.sender_account_id == account.id, StepRun.status == "sent"))
+            if last is not None and now - last < timedelta(minutes=rng.uniform(s.min_gap_minutes, s.max_gap_minutes)):
+                continue
         row = (await session.execute(
             select(Enrollment, Sequence).join(Sequence, Sequence.id == Enrollment.sequence_id)
             .where(Enrollment.sender_account_id == account.id, Enrollment.status == "active", Sequence.status == "active",
@@ -412,6 +430,8 @@ async def send_due(
             enrollment.next_step_order = following.step_order
             enrollment.next_run_at = next_send_time(sequence.schedule, now + timedelta(days=following.delay_days), rng)
         out.sent += 1
+        if account.workspace_id in sent_by_ws:
+            sent_by_ws[account.workspace_id] += 1
         await session.commit()
     return out
 

@@ -27,16 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import SenderAccount, WarmupMessage
 from services import mail_check
+from services.own_mail import in_window
+from services.own_settings import DEFAULTS, Settings, load_all
 from services.vault import Vault
 
 log = logging.getLogger("coldbrew.warmup")
 HEADER = "X-Coldbrew-Warmup"
 TIMEOUT_SECONDS = 30
-# Warm-up runs in the US working day (13:00 to 23:00 UTC is about 9 am to 7 pm Eastern), every day.
-WINDOW_UTC = (13, 23)
-START_PER_DAY = 3  # a new warming mailbox starts low...
-RAMP_PER_DAY = 2  # ...and adds this many a day up to its target
-STAR_CHANCE = 0.25
+# The window, the ramp and how often to star come from each workspace's Settings (services/own_settings.py).
 ENGAGE_DAYS = 3
 SPAM_NAMES = ("[gmail]/spam", "junk", "junk email", "junk e-mail", "spam", "bulk mail", "inbox.spam", "inbox.junk")
 
@@ -104,19 +102,25 @@ def build(sender: SenderAccount, to: SenderAccount, subject: str, body: str, in_
 # ---------- How many, and when ----------
 
 
-def target_today(account: SenderAccount, now: datetime) -> int:
-    """The day's warm-up sends: a new mailbox starts at START_PER_DAY and adds RAMP_PER_DAY a day up to its target."""
+def target_today(account: SenderAccount, now: datetime, s: Settings = DEFAULTS) -> int:
+    """The day's warm-up sends: a new mailbox starts at the workspace's start-per-day and adds its ramp each day, up to
+    the mailbox's own target."""
     started = account.warmup_started_at or now
     days = max(0, (now - started).days)
-    return min(account.warmup_daily_target, START_PER_DAY + RAMP_PER_DAY * days)
+    return min(account.warmup_daily_target, s.warmup_start_per_day + s.warmup_ramp_per_day * days)
 
 
-def send_now(sent_today: int, target: int, now: datetime, tick_minutes: int, rng: random.Random) -> bool:
-    """Whether this tick sends one: the day's remaining sends spread evenly over the window's remaining ticks."""
-    start, end = WINDOW_UTC
-    if not (start <= now.hour < end) or sent_today >= target:
+def send_now(sent_today: int, target: int, now: datetime, tick_minutes: int, rng: random.Random, window: dict | None = None) -> bool:
+    """Whether this tick sends one: inside the warm-up window, the day's remaining sends spread evenly over the
+    window's remaining ticks."""
+    from zoneinfo import ZoneInfo
+
+    window = window or DEFAULTS.warmup_window
+    if sent_today >= target or not in_window(window, now):
         return False
-    minutes_left = (end - now.hour) * 60 - now.minute
+    local = now.astimezone(ZoneInfo(window["timezone"]))
+    end_h, end_m = (int(x) for x in window["end"].split(":"))
+    minutes_left = (end_h * 60 + end_m) - (local.hour * 60 + local.minute)
     ticks_left = max(1, minutes_left // tick_minutes)
     return rng.random() < (target - sent_today) / ticks_left
 
@@ -159,10 +163,14 @@ async def warm_send(
     out = WarmSummary()
     vault = Vault(session)
     accounts = list(await session.scalars(select(SenderAccount).where(SenderAccount.pool == "warming", SenderAccount.status == "ok")))
+    settings = await load_all(session)
     by_ws: dict[UUID, list[SenderAccount]] = {}
     for a in accounts:
         by_ws.setdefault(a.workspace_id, []).append(a)
     for ws, pool in by_ws.items():
+        s = settings.get(ws, DEFAULTS)
+        if not s.warmup_enabled:
+            continue
         if len(pool) < 2:
             out.notes.append(f"workspace {ws}: warming needs at least two connected warming mailboxes")
             continue
@@ -170,7 +178,7 @@ async def warm_send(
             sent_today = int(await session.scalar(select(func.count()).select_from(WarmupMessage).where(
                 WarmupMessage.from_account_id == account.id, WarmupMessage.sent_at >= _day_start(now),
                 WarmupMessage.status.in_(("sent", "dry_run")))) or 0)  # fmt: skip
-            if not send_now(sent_today, target_today(account, now), now, tick_minutes, rng):
+            if not send_now(sent_today, target_today(account, now, s), now, tick_minutes, rng, s.warmup_window):
                 continue
             to = rng.choice([a for a in pool if a.id != account.id])
             subject, body = compose(account, to, rng)
@@ -287,7 +295,11 @@ async def warm_engage(
     vault = Vault(session)
     accounts = list(await session.scalars(select(SenderAccount).where(SenderAccount.pool == "warming", SenderAccount.status == "ok",
                                                                       SenderAccount.imap_host.is_not(None))))  # fmt: skip
+    settings = await load_all(session)
     for account in accounts:
+        s = settings.get(account.workspace_id, DEFAULTS)
+        if not s.warmup_enabled:
+            continue
         rows = {r.message_id: r for r in await session.scalars(select(WarmupMessage).where(
             WarmupMessage.to_account_id == account.id, WarmupMessage.status == "sent", WarmupMessage.opened_at.is_(None),
             WarmupMessage.sent_at >= now - timedelta(days=ENGAGE_DAYS)))}  # fmt: skip
@@ -297,7 +309,7 @@ async def warm_engage(
         if not password:
             continue
         try:
-            found = await asyncio.to_thread(engage, account, password, set(rows), STAR_CHANCE, rng)
+            found = await asyncio.to_thread(engage, account, password, set(rows), s.warmup_star_percent / 100, rng)
         except Exception as exc:  # noqa: BLE001 - one mailbox failing never stops the others
             out.notes.append(f"{account.from_email}: {exc.__class__.__name__}")
             continue

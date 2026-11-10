@@ -21,7 +21,7 @@ from database import get_session
 from dependencies import get_current_user, require_manager, require_workspace_id
 from models import Enrollment, Persona, SenderAccount, SenderUsage
 from schemas import ApiModel
-from services import mail_check, warmup
+from services import mail_check, own_settings, warmup
 from services.auth import CurrentUser
 from services.vault import Vault, secret_name
 
@@ -188,12 +188,13 @@ async def _outs(session: AsyncSession, rows: list[SenderAccount]) -> list[Sender
     names = dict((await session.execute(select(Persona.id, Persona.name).where(Persona.id.in_(persona_ids)))).all()) if persona_ids else {}
     now = datetime.now(UTC)
     warm = await warmup.stats(session, ids, now)
+    ws_settings = await own_settings.load(session, rows[0].workspace_id) if rows else own_settings.DEFAULTS
 
     def warm_fields(r: SenderAccount) -> dict:
         w = warm.get(r.id, {})
         landed = w.get("inbox_7d", 0) + w.get("spam_7d", 0)
         return {"pool": r.pool, "warmup_daily_target": r.warmup_daily_target, "warmup_reply_percent": r.warmup_reply_percent,
-                "warmup_started_at": r.warmup_started_at, "warmup_target_today": warmup.target_today(r, now) if r.pool == "warming" else 0,
+                "warmup_started_at": r.warmup_started_at, "warmup_target_today": warmup.target_today(r, now, ws_settings) if r.pool == "warming" else 0,
                 "warmup_sent_today": w.get("sent_today", 0), "warmup_received_7d": w.get("received_7d", 0),
                 "warmup_inbox_rate_7d": round(w["inbox_7d"] / landed, 3) if landed else None,
                 "warmup_rescued_7d": w.get("rescued_7d", 0), "warmup_replied_7d": w.get("replied_7d", 0)}  # fmt: skip

@@ -50,3 +50,15 @@ def test_a_warm_up_email_reads_naturally_and_is_never_taken_for_a_campaign_reply
     assert msg[warmup.HEADER] and msg["In-Reply-To"] == "<first@acme.com>" and message_id.endswith("@acme.com>")
     received = message_from_bytes(msg.as_bytes(), policy=policy.default)
     assert classify(received) is None  # the campaign reply reader drops it by its warm-up header
+
+
+def test_the_workspace_settings_set_the_ramp_and_the_window() -> None:
+    from services.own_settings import Settings
+
+    s = Settings(warmup_start_per_day=5, warmup_ramp_per_day=5, warmup_timezone="Europe/London", warmup_start="08:00", warmup_end="12:00", warmup_days=[1, 2, 3, 4, 5])
+    assert warmup.target_today(account(warmup_started_at=NOW - timedelta(days=2)), NOW, s) == 15
+    rng = random.Random(2)
+    tuesday_9am_london = datetime(2026, 11, 10, 9, 0, tzinfo=UTC)
+    assert any(warmup.send_now(0, 20, tuesday_9am_london, 5, rng, s.warmup_window) for _ in range(20))
+    assert not warmup.send_now(0, 20, tuesday_9am_london.replace(hour=13), 5, rng, s.warmup_window)  # after 12:00 London
+    assert not warmup.send_now(0, 20, datetime(2026, 11, 14, 9, 0, tzinfo=UTC), 5, rng, s.warmup_window)  # Saturday is off

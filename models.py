@@ -1147,3 +1147,35 @@ class WarmupMessage(Base):
     rescued_from_spam: Mapped[bool] = mapped_column(Boolean, server_default="false")
     replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     error: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class OwnSendingSettings(Base):
+    """A workspace's sending limits and warm-up settings (the sending dashboard's Settings). No row: the defaults.
+    Live sending stays a server switch (OWN_SENDING_LIVE, OWN_WARMUP_LIVE); these can only hold back."""
+
+    __tablename__ = "eo_own_sending_settings"
+    __table_args__ = (
+        CheckConstraint("default_daily_limit between 1 and 500", name="default_daily_limit"),
+        CheckConstraint("workspace_daily_cap is null or workspace_daily_cap between 1 and 100000", name="workspace_daily_cap"),
+        CheckConstraint("min_gap_minutes between 1 and 240 and max_gap_minutes between min_gap_minutes and 240", name="gap"),
+        CheckConstraint("warmup_start_per_day between 1 and 50 and warmup_ramp_per_day between 0 and 20", name="ramp"),
+        CheckConstraint("warmup_default_target between 1 and 100", name="warmup_default_target"),
+        CheckConstraint("warmup_default_reply_percent between 0 and 100 and warmup_star_percent between 0 and 100", name="percent"),
+    )
+    workspace_id: Mapped[UUID] = mapped_column(ForeignKey("eo_workspaces.id", ondelete="CASCADE"), primary_key=True)
+    sending_paused: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    default_daily_limit: Mapped[int] = mapped_column(SmallInteger, server_default="30")
+    workspace_daily_cap: Mapped[int | None] = mapped_column(Integer, default=None)
+    min_gap_minutes: Mapped[int] = mapped_column(SmallInteger, server_default="5")
+    max_gap_minutes: Mapped[int] = mapped_column(SmallInteger, server_default="15")
+    warmup_enabled: Mapped[bool] = mapped_column(Boolean, server_default="true")
+    warmup_timezone: Mapped[str] = mapped_column(Text, server_default="America/New_York")
+    warmup_start: Mapped[str] = mapped_column(Text, server_default="09:00")
+    warmup_end: Mapped[str] = mapped_column(Text, server_default="19:00")
+    warmup_days: Mapped[list[int]] = mapped_column(ARRAY(SmallInteger), server_default="{1,2,3,4,5,6,7}")
+    warmup_start_per_day: Mapped[int] = mapped_column(SmallInteger, server_default="3")
+    warmup_ramp_per_day: Mapped[int] = mapped_column(SmallInteger, server_default="2")
+    warmup_default_target: Mapped[int] = mapped_column(SmallInteger, server_default="20")
+    warmup_default_reply_percent: Mapped[int] = mapped_column(SmallInteger, server_default="30")
+    warmup_star_percent: Mapped[int] = mapped_column(SmallInteger, server_default="25")
+    updated_at: Mapped[datetime] = _updated()
