@@ -27,6 +27,15 @@ VARIABLES = {
 }
 # Steps {{followUp}} can be used in: Coldbrew has a follow-up prompt for each (follow-up 2 to 5).
 FOLLOW_UP_STEPS = range(2, 6)
+# What a LinkedIn or Instagram step can use: no email parts, no signature (a DM has none).
+SOCIAL_VARIABLES = {
+    "firstName": "Their first name",
+    "lastName": "Their last name",
+    "company": "Their company",
+    "title": "Their job title",
+    "senderName": "The name of the mailbox the account belongs to (or its persona's)",
+    "aiMessage": "A message Coldbrew writes for this lead with the channel's prompt (Prompts page): the connection note for a LinkedIn request, or the message",
+}
 
 
 class MissingValue(Exception):
@@ -53,9 +62,9 @@ def render(template: str, values: dict[str, str]) -> str:
     return VARIABLE.sub(one, template)
 
 
-def unknown_variables(template: str) -> list[str]:
+def unknown_variables(template: str, allowed: dict[str, str] | None = None) -> list[str]:
     """Names in {{...}} that aren't variables, so a typo is caught when the step is saved, not when it sends."""
-    return sorted({m.group(1) for m in VARIABLE.finditer(template)} - set(VARIABLES))
+    return sorted({m.group(1) for m in VARIABLE.finditer(template)} - set(VARIABLES if allowed is None else allowed))
 
 
 # ---------- The email ----------

@@ -468,7 +468,9 @@ class FollowUpRun:
     notes: list[str] = field(default_factory=list)
 
 
-async def _variables(deps: Deps, email: Email, lead: Lead, step: int, earlier: dict[int, str]) -> dict[str, str]:
+async def _variables(deps: Deps, email: Email | None, lead: Lead, step: int, earlier: dict[int, str]) -> dict[str, str]:
+    """A follow-up prompt's placeholders. With no first email (LinkedIn and Instagram campaigns), its parts are empty,
+    and social.earlier holds what this campaign already sent them."""
     icp_id = lead.lead_intel_icp_id
     icp = (await deps.lead_intel.get_icp(icp_id)) if icp_id else None
     profile = (await deps.profiles.get_many(deps.workspace_id, [icp_id])).get(icp_id) if icp_id else None
@@ -484,11 +486,12 @@ async def _variables(deps: Deps, email: Email, lead: Lead, step: int, earlier: d
         "icp.cta": getattr(profile, "cta", "") or "", "icp.tone": getattr(profile, "tone", "") or "",
         "icp.wordsToAvoid": getattr(profile, "words_to_avoid", "") or "",
         "hooks": "\n".join(f"{h.rank}. {h.hook or h.point} ({h.source})" for h in hooks) or "(none)",
-        "hook.text": email.hook or "",
+        "hook.text": (email.hook if email else "") or "",
         "examples.samples": format_samples(samples),
-        "email1.subject": email.subject, "email1.body": email.edited_body or email.body,
+        "email1.subject": email.subject if email else "", "email1.body": (email.edited_body or email.body) if email else "",
         "email2.body": earlier.get(2, ""), "email3.body": earlier.get(3, ""), "email4.body": earlier.get(4, ""),
-        "followup.step": str(step),
+        "followup.step": str(step), "social.step": str(step),
+        "social.earlier": "\n\n".join(f"Message {n}:\n{text}" for n, text in sorted(earlier.items())) or "(nothing yet: this is the first)",
     }  # fmt: skip
     out.update(product_variables(None if product is None else {k: getattr(product, k, [] if k in ("custom_fields", "notes") else "") for k in PRODUCT_FIELDS}))
     return out

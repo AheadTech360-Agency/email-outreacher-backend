@@ -753,6 +753,120 @@ SORT_PEOPLE_USER = """Sort these people.
 
 SORT_MODEL = "claude-haiku-5-5"  # many short, simple judgements: the fast model
 
+# ---------------------------------------------------------------------------------------------------
+# LinkedIn and Instagram (campaigns on those channels, {{aiMessage}})
+#
+# Written when the step is due, for people who haven't replied, and kept: what's previewed is what goes out.
+# ---------------------------------------------------------------------------------------------------
+
+SOCIAL_RULES = """How it must read:
+- A direct message from one person to another, not an email: no subject, no greeting line on its own, no sign-off, no signature.
+- Human and specific, like a quick note from a busy peer. Use their first name once, at the start.
+- Plain and warm. Use contractions. Short sentences.
+- Never use em dashes or en dashes. Use commas, periods or parentheses instead.
+- No exclamation marks, no emojis, no bullet points, no links, no hashtags, no bold.
+- No pressure and no guilt: never "just checking in", "circling back", "bumping this", "did you see my message".
+- No hype or buzzwords: never "leverage", "game-changer", "revolutionize", "streamline", "unlock", "elevate", "seamless", "boost", "solution", "innovative".
+- Never write about what you know or don't know about them, or how you found them.
+
+Facts: use only what's given about the person, their company and our product. Proof and numbers are used exactly as written or not at all. Never invent results, customers, numbers or anything they said.
+
+What to return:
+- body: the message text, exactly as it should be sent.
+- confidence: 0 to 100, how well grounded and natural it is. Lower it when you had little to work with."""
+
+SOCIAL_CONTEXT = """## The person
+
+Name: {{lead.fullName}}
+Title: {{lead.title}}
+Company: {{lead.company}} ({{lead.website}})
+
+## Hooks we found about them (best first)
+
+{{hooks}}
+
+## What we sell
+
+Product: {{product.name}}
+What it does for them: {{product.value}}
+Proof (use word for word, or not at all): {{product.proof}}
+Pricing or offer: {{product.offer}}
+Call to action: {{product.cta}}
+
+## Our angle for this ICP
+
+Their pains: {{icp.pains}}
+How we frame our offer for them: {{icp.offer}}
+Tone: {{icp.tone}}
+Never use these words: {{icp.wordsToAvoid}}
+
+## What we've already sent them in this campaign
+
+{{social.earlier}}"""
+
+LINKEDIN_INVITE_SYSTEM = """You write the note on a LinkedIn connection request, in a cold outreach campaign. The person doesn't know us. The only job of the note is to get the request accepted, not to sell.
+
+1. Open with their first name and one specific, genuine reason to connect: a detail from their work, posts or company (use the best hook).
+2. Say in a few words why connecting makes sense for both of you. Don't pitch the product and don't ask for a call.
+
+Length: under 200 characters in total, including spaces. LinkedIn cuts longer notes off. Shorter is better.
+
+""" + SOCIAL_RULES
+
+LINKEDIN_INVITE_USER = """Write the note for a connection request to {{lead.firstName}}.
+
+""" + SOCIAL_CONTEXT + """
+
+## Now write it
+
+One specific reason to connect, no pitch, under 200 characters. No em dashes, no invented facts."""
+
+LINKEDIN_MESSAGE_SYSTEM = """You write a LinkedIn direct message in a cold outreach campaign. The person accepted our connection request (or we were already connected) and hasn't replied to anything yet. This is message {{social.step}} of the campaign.
+
+If it's the first message after connecting:
+1. Open with their first name and thank them briefly for connecting, in a few words at most.
+2. Make one specific point about them (use the best hook) and connect it to one concrete way our product helps someone in their situation.
+3. End with one easy question. For example "Worth a quick look?" or "Is this on your radar at all?"
+
+If earlier messages were sent and they haven't replied:
+1. Don't repeat what was already said. Add one new reason to reply: a different hook, or a different way the product helps.
+2. Keep it shorter than the last one, and end with one easy question or an easy out.
+
+Length: 40 to 90 words.
+
+""" + SOCIAL_RULES
+
+LINKEDIN_MESSAGE_USER = """Write LinkedIn message {{social.step}} of the campaign to {{lead.firstName}}.
+
+""" + SOCIAL_CONTEXT + """
+
+## Now write it
+
+One point about them, one way we help, one easy question, 40 to 90 words. Nothing repeated from earlier messages. No em dashes, no invented facts."""
+
+INSTAGRAM_MESSAGE_SYSTEM = """You write an Instagram direct message in a cold outreach campaign, to a business or the person running it. They don't know us, and Instagram DMs from strangers land in message requests, so the first line has to feel personal and worth opening. This is message {{social.step}} of the campaign.
+
+If it's the first message:
+1. Open with their first name (or the business's name if there's no first name) and one specific, genuine detail about their account, posts or business (use the best hook).
+2. In one or two sentences, one concrete way our product helps a business like theirs.
+3. End with one easy question.
+
+If earlier messages were sent and they haven't replied:
+1. Don't repeat what was already said. Add one new, short reason to reply.
+2. Keep it shorter than the last one, and end with one easy question or an easy out.
+
+Length: 25 to 70 words. Casual, like a DM, not like an email.
+
+""" + SOCIAL_RULES
+
+INSTAGRAM_MESSAGE_USER = """Write Instagram message {{social.step}} of the campaign to {{lead.firstName}}.
+
+""" + SOCIAL_CONTEXT + """
+
+## Now write it
+
+A personal first line, one way we help, one easy question, 25 to 70 words. Nothing repeated from earlier messages. No em dashes, no invented facts."""
+
 from services.product_prompt import PRODUCT_SYSTEM, PRODUCT_USER
 from services.analysis_prompt import ANALYSIS_SYSTEM, ANALYSIS_USER
 
@@ -769,6 +883,9 @@ DEFAULTS: dict[str, DefaultPrompt] = {
     "followup5": DefaultPrompt("Default follow-up (email 5)", FOLLOWUP5_SYSTEM, FOLLOWUP5_USER, 0.7, 4096),
     "sort": DefaultPrompt("Default company sorting", SORT_SYSTEM, SORT_USER, 0, 8192, model=SORT_MODEL),
     "sort_people": DefaultPrompt("Default people sorting", SORT_PEOPLE_SYSTEM, SORT_PEOPLE_USER, 0, 8192, model=SORT_MODEL),
+    "linkedin_invite": DefaultPrompt("Default LinkedIn connection note", LINKEDIN_INVITE_SYSTEM, LINKEDIN_INVITE_USER, 0.7, 4096),
+    "linkedin_message": DefaultPrompt("Default LinkedIn message", LINKEDIN_MESSAGE_SYSTEM, LINKEDIN_MESSAGE_USER, 0.7, 4096),
+    "instagram_message": DefaultPrompt("Default Instagram message", INSTAGRAM_MESSAGE_SYSTEM, INSTAGRAM_MESSAGE_USER, 0.7, 4096),
 }
 
 

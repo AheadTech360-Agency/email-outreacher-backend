@@ -18,7 +18,7 @@ from config import get_settings
 from database import get_session
 from dependencies import get_lead_intel_repo, get_optional_writer, require_manager, require_workspace_id
 from lead_intel import LeadIntelRepo
-from models import Email, Enrollment, InboundEvent, Lead, Persona, QueuedAddress, SenderAccount, Sequence, SequenceStep, StepRun
+from models import Email, Enrollment, InboundEvent, Lead, Persona, QueuedAddress, SenderAccount, Sequence, SequenceStep, SocialAccount, StepRun
 from schemas import ApiModel
 from services.auth import CurrentUser
 from services.generation import EmailWriter
@@ -28,6 +28,8 @@ from services.own_sending import coldbrew_writer, enroll, ensure_icp_campaigns, 
 router = APIRouter(tags=["own sending"])
 
 Status = Literal["draft", "active", "paused", "archived"]
+Channel = Literal["email", "linkedin", "instagram"]
+NETWORK = {"linkedin": "LinkedIn", "instagram": "Instagram"}
 
 
 # ---------- Shapes ----------
@@ -42,6 +44,8 @@ class ScheduleIn(ApiModel):
 
 class StepIn(ApiModel):
     delay_days: int = Field(default=0, ge=0, le=90)
+    # email (email campaigns), invite (a LinkedIn connection request, first step only) or message (LinkedIn, Instagram).
+    action: Literal["email", "invite", "message"] = "email"
     thread_mode: Literal["new", "reply"] = "reply"
     subject: str = Field(default="", max_length=300)
     body: str = Field(min_length=1, max_length=20000)
@@ -49,6 +53,8 @@ class StepIn(ApiModel):
 
 class CampaignIn(ApiModel):
     name: str = Field(min_length=1, max_length=120)
+    # Set when it's made; editing keeps it.
+    channel: Channel = "email"
     schedule: ScheduleIn = ScheduleIn()
     steps: list[StepIn] = Field(min_length=1, max_length=10)
 
@@ -68,6 +74,7 @@ class StepOut(ApiModel):
     id: UUID
     step_order: int
     delay_days: int
+    action: str
     thread_mode: str
     subject: str
     body: str
@@ -92,6 +99,7 @@ class CampaignOut(ApiModel):
     # The ICP this is the campaign of (one per ICP, made for every enabled ICP), or None for one made by hand.
     icp_id: UUID | None = None
     icp_name: str | None = None
+    channel: str
     status: str
     schedule: dict
     steps: list[StepOut]
@@ -114,7 +122,10 @@ class EnrollmentOut(ApiModel):
     lead_id: UUID
     name: str
     email: str | None
+    # LinkedIn and Instagram campaigns: their profile there.
+    profile_url: str | None = None
     company: str
+    # The mailbox (email) or the LinkedIn or Instagram account it sends from.
     sender: str | None
     status: str
     stop_reason: str | None
@@ -135,6 +146,7 @@ class CandidateOut(ApiModel):
     email: str
     company: str
     has_first_email: bool
+    profile_url: str | None = None
 
 
 class ActivityOut(ApiModel):
@@ -154,7 +166,12 @@ class ActivityOut(ApiModel):
 class SendingStatusOut(ApiModel):
     live: bool
     warmup_live: bool = False
+    # LinkedIn and Instagram (OWN_SOCIAL_LIVE): off, their steps are only logged.
+    social_live: bool = False
     variables: dict[str, str]
+    social_variables: dict[str, str] = {}
+    # A new LinkedIn or Instagram campaign's steps.
+    social_steps: dict[str, list[dict]] = {}
 
 
 # ---------- Helpers ----------
@@ -172,8 +189,12 @@ async def _campaign(session: AsyncSession, workspace_id: UUID, campaign_id: UUID
     return row
 
 
-def _check_steps(steps: list[StepIn]) -> None:
+def _check_steps(steps: list[StepIn], channel: str = "email") -> None:
+    if channel != "email":
+        return _check_social_steps(steps, channel)
     for i, step in enumerate(steps, 1):
+        if step.action != "email":
+            raise HTTPException(422, "An email campaign's steps are emails.")
         if i == 1 and not step.subject.strip():
             raise HTTPException(422, "The first email needs a subject.")
         if step.thread_mode == "new" and not step.subject.strip():
@@ -183,6 +204,34 @@ def _check_steps(steps: list[StepIn]) -> None:
         if bad := unknown_variables(step.subject + step.body):
             raise HTTPException(422, f"Email {i} uses {', '.join('{{' + b + '}}' for b in bad)}, which isn't a variable. Use one of: "
                                      + ", ".join("{{" + v + "}}" for v in VARIABLES) + ".")  # fmt: skip
+
+
+LINKEDIN_NOTE_MAX = 300  # LinkedIn's longest connection note (200 on free accounts)
+
+
+def _check_social_steps(steps: list[StepIn], channel: str) -> None:
+    """LinkedIn: a connection request can only be the first step, then messages. Instagram: messages only. No
+    subjects, and only the variables a direct message can use."""
+    from services.own_mail import SOCIAL_VARIABLES
+
+    name = NETWORK[channel]
+    for i, step in enumerate(steps, 1):
+        if step.action == "email":
+            raise HTTPException(422, f"A {name} campaign's steps are {'connection requests and ' if channel == 'linkedin' else ''}messages, not emails.")
+        if step.action == "invite" and (channel != "linkedin" or i != 1):
+            raise HTTPException(422, "A connection request is LinkedIn only, and only as the first step." if channel == "linkedin" else "Instagram has no connection requests: its steps are messages.")
+        if bad := unknown_variables(step.body, SOCIAL_VARIABLES):
+            raise HTTPException(422, f"Step {i} uses {', '.join('{{' + b + '}}' for b in bad)}, which a {name} step can't use. Use one of: "
+                                     + ", ".join("{{" + v + "}}" for v in SOCIAL_VARIABLES) + ".")  # fmt: skip
+        if step.action == "invite" and "aiMessage" not in step.body and len(step.body.strip()) > LINKEDIN_NOTE_MAX:
+            raise HTTPException(422, f"A connection note can be at most {LINKEDIN_NOTE_MAX} characters (LinkedIn cuts it off).")
+
+
+def _step_fields(i: int, s: StepIn, channel: str) -> dict:
+    if channel == "email":
+        return {"delay_days": 0 if i == 1 else s.delay_days, "action": "email", "thread_mode": "new" if i == 1 else s.thread_mode,
+                "subject": s.subject.strip(), "body": s.body}  # fmt: skip
+    return {"delay_days": 0 if i == 1 else s.delay_days, "action": s.action, "thread_mode": "reply", "subject": "", "body": s.body}
 
 
 def _schedule(body: ScheduleIn) -> dict:
@@ -230,6 +279,14 @@ async def _stats(session: AsyncSession, ids: list[UUID]) -> dict[UUID, Stats]:
     return out
 
 
+async def _social_names(session: AsyncSession, ids: set) -> dict[UUID, str]:
+    """A LinkedIn or Instagram account as the dashboard shows it: its name, or @username."""
+    if not ids:
+        return {}
+    rows = await session.execute(select(SocialAccount.id, SocialAccount.name, SocialAccount.username).where(SocialAccount.id.in_(ids)))
+    return {i: name or (f"@{username}" if username else "Social account") for i, name, username in rows}
+
+
 async def _icp_names(lead_intel: LeadIntelRepo) -> dict[UUID, str]:
     return {i["id"]: i["name"] for i in await lead_intel.icp_names()}
 
@@ -242,8 +299,8 @@ async def _out(session: AsyncSession, rows: list[Sequence], icp_names: dict[UUID
     for s in (await session.scalars(select(SequenceStep).where(SequenceStep.sequence_id.in_(ids)).order_by(SequenceStep.step_order))) if ids else []:
         steps[s.sequence_id].append(s)
     return [
-        CampaignOut(id=r.id, name=r.name, icp_id=r.lead_intel_icp_id, icp_name=icp_names.get(r.lead_intel_icp_id), status=r.status, schedule=r.schedule, stats=stats[r.id], created_at=r.created_at, updated_at=r.updated_at,
-                    steps=[StepOut(id=s.id, step_order=s.step_order, delay_days=s.delay_days, thread_mode=s.thread_mode, subject=s.subject, body=s.body)
+        CampaignOut(id=r.id, name=r.name, icp_id=r.lead_intel_icp_id, icp_name=icp_names.get(r.lead_intel_icp_id), channel=r.channel, status=r.status, schedule=r.schedule, stats=stats[r.id], created_at=r.created_at, updated_at=r.updated_at,
+                    steps=[StepOut(id=s.id, step_order=s.step_order, delay_days=s.delay_days, action=s.action, thread_mode=s.thread_mode, subject=s.subject, body=s.body)
                            for s in steps[r.id]])  # fmt: skip
         for r in rows
     ]
@@ -254,8 +311,13 @@ async def _out(session: AsyncSession, rows: list[Sequence], icp_names: dict[UUID
 
 @router.get("/own-sending/status", response_model=SendingStatusOut)
 async def sending_status():
-    """Whether the scheduler really sends (OWN_SENDING_LIVE), and the variables a step can use."""
-    return SendingStatusOut(live=get_settings().own_sending_live, warmup_live=get_settings().own_warmup_live, variables=VARIABLES)
+    """Whether the scheduler really sends (OWN_SENDING_LIVE, OWN_SOCIAL_LIVE), and the variables a step can use."""
+    from services.own_mail import SOCIAL_VARIABLES
+    from services.own_social import DEFAULT_STEPS
+
+    s = get_settings()
+    return SendingStatusOut(live=s.own_sending_live, warmup_live=s.own_warmup_live, social_live=s.own_social_live, variables=VARIABLES,
+                            social_variables=SOCIAL_VARIABLES, social_steps=DEFAULT_STEPS)  # fmt: skip
 
 
 @router.get("/campaigns", response_model=list[CampaignOut])
@@ -281,13 +343,12 @@ async def get_campaign(campaign_id: UUID, workspace_id: UUID = Depends(require_w
 async def add_campaign(body: CampaignIn, workspace_id: UUID = Depends(require_workspace_id),
                        user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session)):  # fmt: skip
     """A new campaign starts as a draft: nothing is sent from it until it's started."""
-    _check_steps(body.steps)
-    row = Sequence(workspace_id=workspace_id, name=body.name, status="draft", schedule=_schedule(body.schedule), created_by=user.id)
+    _check_steps(body.steps, body.channel)
+    row = Sequence(workspace_id=workspace_id, name=body.name, channel=body.channel, status="draft", schedule=_schedule(body.schedule), created_by=user.id)
     session.add(row)
     await session.flush()
     for i, s in enumerate(body.steps, 1):
-        session.add(SequenceStep(sequence_id=row.id, step_order=i, delay_days=0 if i == 1 else s.delay_days,
-                                 thread_mode="new" if i == 1 else s.thread_mode, subject=s.subject.strip(), body=s.body))  # fmt: skip
+        session.add(SequenceStep(sequence_id=row.id, step_order=i, **_step_fields(i, s, body.channel)))
     await session.commit()
     await session.refresh(row)
     return (await _out(session, [row]))[0]
@@ -300,14 +361,16 @@ async def edit_campaign(campaign_id: UUID, body: CampaignIn, workspace_id: UUID 
     """Name, window and steps. Steps already sent stay as they went; leads part-way through carry on with the new text
     from their next step. A step can't be removed once a lead has received it."""
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
-    _check_steps(body.steps)
+    if body.channel != row.channel:
+        raise HTTPException(409, "A campaign's channel can't change. Make a new campaign for another channel.")
+    _check_steps(body.steps, row.channel)
     current = list(await session.scalars(select(SequenceStep).where(SequenceStep.sequence_id == row.id).order_by(SequenceStep.step_order)))
     used = set(await session.scalars(select(StepRun.step_id).where(StepRun.step_id.in_([s.id for s in current]), StepRun.status == "sent"))) if current else set()
     if any(s.id in used for s in current[len(body.steps):]):
-        raise HTTPException(409, "A removed email was already sent to some leads. Keep it, or start a new campaign.")
+        raise HTTPException(409, "A removed step was already sent to some leads. Keep it, or start a new campaign.")
     row.name, row.schedule = body.name, _schedule(body.schedule)
     for i, s in enumerate(body.steps, 1):
-        fields = {"delay_days": 0 if i == 1 else s.delay_days, "thread_mode": "new" if i == 1 else s.thread_mode, "subject": s.subject.strip(), "body": s.body}
+        fields = _step_fields(i, s, row.channel)
         if i <= len(current):
             for k, v in fields.items():
                 setattr(current[i - 1], k, v)
@@ -328,7 +391,11 @@ async def set_status(campaign_id: UUID, body: StatusIn, workspace_id: UUID = Dep
     inside the window."""
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
     if body.status == "active":
-        if not await session.scalar(select(SenderAccount.id).where(SenderAccount.workspace_id == workspace_id, SenderAccount.status == "ok", SenderAccount.pool == "sending").limit(1)):
+        if row.channel != "email":
+            if not await session.scalar(select(SocialAccount.id).where(SocialAccount.workspace_id == workspace_id, SocialAccount.provider == row.channel,
+                                                                       SocialAccount.status == "ok").limit(1)):  # fmt: skip
+                raise HTTPException(409, f"No connected {NETWORK[row.channel]} account yet. Connect one under Social accounts first.")
+        elif not await session.scalar(select(SenderAccount.id).where(SenderAccount.workspace_id == workspace_id, SenderAccount.status == "ok", SenderAccount.pool == "sending").limit(1)):
             raise HTTPException(409, "No connected sending mailbox yet. Add one under Sending accounts and test it first.")
         now = datetime.now(UTC)
         for e in await session.scalars(select(Enrollment).where(Enrollment.sequence_id == row.id, Enrollment.status == "active")):
@@ -384,7 +451,10 @@ async def candidates(campaign_id: UUID, q: str = Query(default="", max_length=20
     those with an approved Coldbrew first email (what step 1's {{email1Body}} sends). With icpOnly, an ICP's campaign
     offers that ICP's leads."""
     campaign = await _campaign(session, workspace_id, campaign_id)
-    running = select(Enrollment.lead_id).where(Enrollment.status.in_(("active", "paused")))
+    if campaign.channel != "email":
+        return await _social_candidates(session, workspace_id, campaign, q, icp_only)
+    running = select(Enrollment.lead_id).where(Enrollment.status.in_(("active", "paused")),
+                                               Enrollment.sequence_id.in_(select(Sequence.id).where(Sequence.channel == "email")))  # fmt: skip
     approved = select(Email.lead_id).where(Email.step == 1, Email.status == "approved")
     query = select(Lead).where(Lead.workspace_id == workspace_id, Lead.email.is_not(None), Lead.email != "",
                                Lead.id.not_in(running), func.lower(Lead.email).not_in(select(QueuedAddress.email)))  # fmt: skip
@@ -400,20 +470,44 @@ async def candidates(campaign_id: UUID, q: str = Query(default="", max_length=20
     return [CandidateOut(id=lead.id, name=_name(lead), email=lead.email, company=lead.company, has_first_email=lead.id in with_email) for lead in leads]
 
 
+async def _social_candidates(session: AsyncSession, workspace_id: UUID, campaign: Sequence, q: str, icp_only: bool) -> list[CandidateOut]:
+    """Leads with a profile on the campaign's network, not in a running campaign on it and never messaged there."""
+    from services.own_social import profile_url
+    from services.unipile import profile_identifier
+
+    column = Lead.linkedin_url if campaign.channel == "linkedin" else Lead.instagram_url
+    same = select(Sequence.id).where(Sequence.workspace_id == workspace_id, Sequence.channel == campaign.channel)
+    taken = select(Enrollment.lead_id).where(Enrollment.sequence_id.in_(same), or_(Enrollment.status.in_(("active", "paused")),
+                                             Enrollment.id.in_(select(StepRun.enrollment_id).where(StepRun.status == "sent"))))  # fmt: skip
+    query = select(Lead).where(Lead.workspace_id == workspace_id, column.is_not(None), column != "", Lead.id.not_in(taken))
+    if icp_only and campaign.lead_intel_icp_id is not None:
+        query = query.where(Lead.lead_intel_icp_id == campaign.lead_intel_icp_id)
+    if q.strip():
+        like = f"%{q.strip()}%"
+        query = query.where(or_(func.concat(Lead.first_name, " ", Lead.last_name).ilike(like), Lead.email.ilike(like), Lead.company.ilike(like), column.ilike(like)))
+    leads = [lead for lead in await session.scalars(query.order_by(Lead.created_at.desc()).limit(500))
+             if profile_identifier(campaign.channel, profile_url(lead, campaign.channel))]  # fmt: skip
+    return [CandidateOut(id=lead.id, name=_name(lead), email=lead.email or "", company=lead.company, has_first_email=False,
+                         profile_url=profile_url(lead, campaign.channel)) for lead in leads]  # fmt: skip
+
+
 @router.post("/campaigns/{campaign_id}/enrollments", response_model=EnrollOut)
 async def add_leads(campaign_id: UUID, body: EnrollIn, workspace_id: UUID = Depends(require_workspace_id),
                     _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session)):  # fmt: skip
+    from services.own_social import enroll_social
+
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
     if row.status == "archived":
         raise HTTPException(409, "This campaign is archived.")
-    outcome = await enroll(session, workspace_id, row, list(dict.fromkeys(body.lead_ids)))
+    put_in = enroll if row.channel == "email" else enroll_social
+    outcome = await put_in(session, workspace_id, row, list(dict.fromkeys(body.lead_ids)))
     return EnrollOut(added=outcome.added, skipped=outcome.skipped)
 
 
 @router.get("/campaigns/{campaign_id}/enrollments", response_model=list[EnrollmentOut])
 async def list_enrollments(campaign_id: UUID, status: str = Query(default="", pattern="^(|active|paused|completed|stopped)$"),
                            workspace_id: UUID = Depends(require_workspace_id), session: AsyncSession = Depends(get_session)):  # fmt: skip
-    await _campaign(session, workspace_id, campaign_id)
+    campaign = await _campaign(session, workspace_id, campaign_id)
     query = select(Enrollment, Lead).join(Lead, Lead.id == Enrollment.lead_id).where(Enrollment.sequence_id == campaign_id)
     if status:
         query = query.where(Enrollment.status == status)
@@ -427,8 +521,12 @@ async def list_enrollments(campaign_id: UUID, status: str = Query(default="", pa
                                           .group_by(InboundEvent.enrollment_id))).all()) if ids else {}  # fmt: skip
     senders = dict((await session.execute(select(SenderAccount.id, SenderAccount.from_email).where(
         SenderAccount.id.in_({e.sender_account_id for e, _ in rows if e.sender_account_id})))).all()) if rows else {}  # fmt: skip
+    socials = await _social_names(session, {e.social_account_id for e, _ in rows if e.social_account_id})
+    social = campaign.channel != "email"
     return [
-        EnrollmentOut(id=e.id, lead_id=lead.id, name=_name(lead), email=lead.email, company=lead.company, sender=senders.get(e.sender_account_id),
+        EnrollmentOut(id=e.id, lead_id=lead.id, name=_name(lead), email=lead.email, company=lead.company,
+                      profile_url=(lead.linkedin_url if campaign.channel == "linkedin" else lead.instagram_url) if social else None,
+                      sender=socials.get(e.social_account_id) if social else senders.get(e.sender_account_id),
                       status=e.status, stop_reason=e.stop_reason, next_step_order=e.next_step_order, next_run_at=e.next_run_at,
                       sent=int(sent.get(e.id, 0)), last_activity_at=max(filter(None, (last_run.get(e.id), last_in.get(e.id))), default=None),
                       created_at=e.created_at)  # fmt: skip
@@ -491,6 +589,9 @@ async def preview(
     e = await session.scalar(select(Enrollment).where(Enrollment.workspace_id == workspace_id, Enrollment.id == enrollment_id))
     if e is None:
         raise HTTPException(404, "Lead not found in a campaign")
+    sequence = await session.get(Sequence, e.sequence_id)
+    if sequence.channel != "email":
+        return await _social_preview(session, e, sequence, write, writer, lead_intel)
     lead = await session.get(Lead, e.lead_id)
     account = await session.get(SenderAccount, e.sender_account_id) if e.sender_account_id else None
     persona = await session.get(Persona, account.persona_id) if account and account.persona_id else None
@@ -538,6 +639,45 @@ async def preview(
     return PreviewOut(lead_name=_name(lead), lead_email=lead.email, sender=account.from_email if account else None, emails=out)
 
 
+async def _social_preview(session: AsyncSession, e: Enrollment, sequence: Sequence, write: bool, writer: EmailWriter | None,
+                          lead_intel: LeadIntelRepo) -> PreviewOut:  # fmt: skip
+    """Every LinkedIn or Instagram step as this lead would get it. An {{aiMessage}} already written is shown; with
+    write=true Coldbrew writes the missing ones now (Claude, logged to Usage) and keeps them, so the same text goes
+    out. Nothing is sent."""
+    from services.own_social import ai_message, social_writer, step_values, written_text
+
+    lead = await session.get(Lead, e.lead_id)
+    account = await session.get(SocialAccount, e.social_account_id) if e.social_account_id else None
+    if write and writer is None:
+        raise HTTPException(503, "ANTHROPIC_API_KEY isn't set, so Coldbrew can't write LinkedIn and Instagram messages.")
+    write_one = social_writer(writer, lead_intel) if write and writer else None
+    values = await step_values(session, lead, account)
+    out: list[PreviewEmail] = []
+    for step in await session.scalars(select(SequenceStep).where(SequenceStep.sequence_id == sequence.id).order_by(SequenceStep.step_order)):
+        state, note = "ready", None
+        if "aiMessage" in step.body:
+            done = await written_text(session, e.id, step.id)
+            if done is not None:
+                values["aiMessage"] = done
+            elif write_one is not None:
+                text, note = await ai_message(session, e, lead, sequence.channel, step, write_one, keep=True)
+                values["aiMessage"], state = (text or ""), ("ready" if text else "problem")
+            else:
+                values["aiMessage"] = ""
+                state, note = "to_write", "Coldbrew writes this for the lead when it's due. Write it now to read it first."
+        try:
+            body = render(step.body, values) if state != "to_write" else step.body
+        except MissingValue as missing:
+            state, note, body = "problem", f"{{{{{missing.name}}}}} is empty for this lead. Add a fallback, like {{{{{missing.name}|...}}}}.", step.body
+        if step.action == "invite" and state == "ready" and len(body) > LINKEDIN_NOTE_MAX:
+            state, note = "problem", f"It's {len(body)} characters; LinkedIn allows {LINKEDIN_NOTE_MAX} (200 on free accounts). Write it again or shorten the prompt's limit."
+        label = "Connection request" if step.action == "invite" else f"{NETWORK[sequence.channel]} message"
+        out.append(PreviewEmail(step_order=step.step_order, delay_days=step.delay_days, thread_mode=step.action, subject=label, body=body, state=state, note=note))
+    await session.commit()  # keeps what was written
+    sender = (account.name or (f"@{account.username}" if account.username else None)) if account else None
+    return PreviewOut(lead_name=_name(lead), lead_email=lead.linkedin_url if sequence.channel == "linkedin" else lead.instagram_url, sender=sender, emails=out)
+
+
 # ---------- What happened ----------
 
 
@@ -548,18 +688,21 @@ async def activity(campaign_id: UUID | None = Query(default=None, alias="campaig
     """Every send and every incoming reply, bounce, unsubscribe or out-of-office, newest first."""
     names = dict((await session.execute(select(Sequence.id, Sequence.name).where(Sequence.workspace_id == workspace_id))).all())
     mailboxes = dict((await session.execute(select(SenderAccount.id, SenderAccount.from_email).where(SenderAccount.workspace_id == workspace_id))).all())
+    socials = await _social_names(session, set(await session.scalars(select(SocialAccount.id).where(SocialAccount.workspace_id == workspace_id))))
     items: list[ActivityOut] = []
     if kind in ("", "sends", "problems"):
         q = (select(StepRun, Enrollment, Lead).join(Enrollment, Enrollment.id == StepRun.enrollment_id).join(Lead, Lead.id == Enrollment.lead_id)
-             .where(StepRun.workspace_id == workspace_id))  # fmt: skip
+             .where(StepRun.workspace_id == workspace_id, StepRun.status != "written"))  # fmt: skip
         if campaign_id:
             q = q.where(Enrollment.sequence_id == campaign_id)
         if kind == "problems":
             q = q.where(StepRun.status.in_(("failed", "skipped")))
         for run, e, lead in await session.execute(q.order_by(StepRun.ran_at.desc()).limit(limit)):
             items.append(ActivityOut(id=run.id, kind=run.status, at=run.ran_at, campaign_id=e.sequence_id, campaign=names.get(e.sequence_id),
-                                     lead_id=lead.id, lead_name=_name(lead), lead_email=lead.email or "", mailbox=mailboxes.get(run.sender_account_id),
-                                     subject=run.subject, detail=run.error or ""))  # fmt: skip
+                                     lead_id=lead.id, lead_name=_name(lead), lead_email=lead.email or "",
+                                     mailbox=socials.get(run.social_account_id) if run.social_account_id else mailboxes.get(run.sender_account_id),
+                                     subject=run.subject or {"invite": "Connection request", "message": "Message"}.get(run.action or "", ""),
+                                     detail=run.error or ""))  # fmt: skip
     if kind in ("", "replies", "problems"):
         q = (select(InboundEvent, Lead, Enrollment).join(Lead, Lead.id == InboundEvent.lead_id, isouter=True)
              .join(Enrollment, Enrollment.id == InboundEvent.enrollment_id, isouter=True).where(InboundEvent.workspace_id == workspace_id))  # fmt: skip

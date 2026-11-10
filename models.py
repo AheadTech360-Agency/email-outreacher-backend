@@ -319,7 +319,8 @@ class Prompt(Base):
     __tablename__ = "eo_prompts"
     __table_args__ = (
         # verify: company verification, hook: hook selection, email: email generation, score: email scoring.
-        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people", "product", "analysis")), name="kind"),
+        CheckConstraint(_in("kind", ("verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people", "product", "analysis",
+                                    "linkedin_invite", "linkedin_message", "instagram_message")), name="kind"),  # fmt: skip
         # At most one default per kind in a workspace.
         Index(
             "eo_prompts_one_default_idx",
@@ -1028,6 +1029,8 @@ class Sequence(Base):
     workspace_id: Mapped[UUID] = _workspace()
     name: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, server_default="draft")
+    # email | linkedin | instagram (migration 0041): what it sends and from which accounts.
+    channel: Mapped[str] = mapped_column(Text, server_default="email")
     lead_intel_icp_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
     schedule: Mapped[dict] = mapped_column(JSONB)
     created_by: Mapped[UUID | None] = _user_ref()
@@ -1047,6 +1050,8 @@ class SequenceStep(Base):
     step_order: Mapped[int] = mapped_column(SmallInteger)
     delay_days: Mapped[int] = mapped_column(SmallInteger, server_default="0")
     thread_mode: Mapped[str] = mapped_column(Text, server_default="reply")
+    # email (email campaigns), invite (a LinkedIn connection request) or message (LinkedIn or Instagram).
+    action: Mapped[str] = mapped_column(Text, server_default="email")
     subject: Mapped[str] = mapped_column(Text, server_default="")
     body: Mapped[str] = mapped_column(Text, server_default="")
     created_at: Mapped[datetime] = _created()
@@ -1067,6 +1072,10 @@ class Enrollment(Base):
     sequence_id: Mapped[UUID] = mapped_column(ForeignKey("eo_sequences.id", ondelete="CASCADE"))
     lead_id: Mapped[UUID] = mapped_column(ForeignKey("eo_leads.id", ondelete="CASCADE"), index=True)
     sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None)
+    # LinkedIn and Instagram campaigns: the account it sends from, the lead's id there, and the chat (migration 0041).
+    social_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_social_accounts.id", ondelete="SET NULL"), default=None, index=True)
+    provider_id: Mapped[str | None] = mapped_column(Text, default=None)
+    chat_id: Mapped[str | None] = mapped_column(Text, default=None)
     email_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_emails.id", ondelete="SET NULL"), default=None)
     status: Mapped[str] = mapped_column(Text, server_default="active")
     stop_reason: Mapped[str | None] = mapped_column(Text, default=None)
@@ -1081,12 +1090,15 @@ class StepRun(Base):
     """One attempt to send a step: sent (with its Message-ID), failed, skipped, or a dry run that only logged."""
 
     __tablename__ = "eo_step_runs"
-    __table_args__ = (CheckConstraint(_in("status", ("sent", "failed", "skipped", "dry_run")), name="status"),)
+    # written: a LinkedIn or Instagram message Coldbrew wrote ahead (a preview), kept so the same text goes out (0041).
+    __table_args__ = (CheckConstraint(_in("status", ("sent", "failed", "skipped", "dry_run", "written")), name="status"),)
     id: Mapped[UUID] = _uuid_pk()
     workspace_id: Mapped[UUID] = _workspace()
     enrollment_id: Mapped[UUID] = mapped_column(ForeignKey("eo_enrollments.id", ondelete="CASCADE"), index=True)
     step_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sequence_steps.id", ondelete="SET NULL"), default=None)
     sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None)
+    social_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_social_accounts.id", ondelete="SET NULL"), default=None)
+    action: Mapped[str | None] = mapped_column(Text, default=None)  # invite | message, for LinkedIn and Instagram limits
     status: Mapped[str] = mapped_column(Text)
     message_id: Mapped[str | None] = mapped_column(Text, default=None, index=True)
     subject: Mapped[str] = mapped_column(Text, server_default="")

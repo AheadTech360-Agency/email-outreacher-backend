@@ -122,3 +122,54 @@ class UnipileClient:
 
     async def disconnect(self, account_id: str) -> None:
         await self._call("DELETE", f"/api/v1/accounts/{quote(account_id, safe='')}")
+
+    # ---------- Reaching people (LinkedIn and Instagram campaigns) ----------
+
+    async def provider_id(self, account_id: str, identifier: str) -> str:
+        """The person's id on LinkedIn or Instagram, which invites and chats need: GET /api/v1/users/{identifier}."""
+        data = await self._call("GET", f"/api/v1/users/{quote(identifier, safe='')}", params={"account_id": account_id})
+        if not data.get("provider_id"):
+            raise UnipileError("Unipile couldn't find that profile.", 404)
+        return str(data["provider_id"])
+
+    async def invite(self, account_id: str, provider_id: str, note: str) -> None:
+        """A LinkedIn connection request, with its note: POST /api/v1/users/invite."""
+        body: dict[str, Any] = {"account_id": account_id, "provider_id": provider_id}
+        if note.strip():
+            body["message"] = note.strip()
+        await self._call("POST", "/api/v1/users/invite", json=body)
+
+    async def start_chat(self, account_id: str, provider_id: str, text: str) -> tuple[str | None, str | None]:
+        """A first direct message (it opens the chat): POST /api/v1/chats, as a form. (chat_id, message_id)."""
+        data = await self._call("POST", "/api/v1/chats", data={"account_id": account_id, "attendees_ids": provider_id, "text": text})
+        return data.get("chat_id"), data.get("message_id")
+
+    async def send_in_chat(self, chat_id: str, text: str) -> str | None:
+        """Another message in a chat we have: POST /api/v1/chats/{chat_id}/messages, as a form."""
+        data = await self._call("POST", f"/api/v1/chats/{quote(chat_id, safe='')}/messages", data={"text": text})
+        return data.get("message_id")
+
+    async def they_replied(self, chat_id: str, provider_id: str) -> bool:
+        """Whether the person wrote anything in the chat: GET /api/v1/chats/{chat_id}/messages (newest first)."""
+        data = await self._call("GET", f"/api/v1/chats/{quote(chat_id, safe='')}/messages", params={"limit": 50})
+        for m in data.get("items") or []:
+            if m.get("is_sender") in (0, False) or (provider_id and m.get("sender_id") == provider_id):
+                return True
+        return False
+
+
+def profile_identifier(provider: str, url: str | None) -> str | None:
+    """The handle in a LinkedIn or Instagram profile address (linkedin.com/in/maya-lane -> maya-lane), or None."""
+    import re
+
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if provider == "linkedin":
+        m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#]+)", raw, re.I)
+    else:
+        m = re.search(r"instagram\.com/([A-Za-z0-9._]+)", raw, re.I) or re.fullmatch(r"@?([A-Za-z0-9._]{1,30})", raw)
+    if not m:
+        return None
+    handle = m.group(1).strip().lstrip("@")
+    return None if handle.lower() in ("p", "reel", "explore", "stories", "accounts") else handle

@@ -1031,7 +1031,8 @@ class UsageOut(ApiModel):
 
 # ---------- Prompts ----------
 
-PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people", "product", "analysis"]
+PromptKind = Literal["verify", "hook", "email", "score", "followup2", "followup3", "followup4", "followup5", "sort", "sort_people", "product", "analysis",
+                     "linkedin_invite", "linkedin_message", "instagram_message"]  # fmt: skip
 
 
 class PromptVersionIn(ApiModel):

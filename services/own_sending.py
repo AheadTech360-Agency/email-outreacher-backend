@@ -125,7 +125,10 @@ async def enroll(session: AsyncSession, workspace_id: UUID, sequence: Sequence, 
     if not out.skipped["Not in this workspace"]:
         del out.skipped["Not in this workspace"]
     ids = [lead.id for lead in leads]
-    running = set(await session.scalars(select(Enrollment.lead_id).where(Enrollment.lead_id.in_(ids), Enrollment.status.in_(("active", "paused"))))) if ids else set()
+    # Another running email campaign (LinkedIn and Instagram campaigns run alongside).
+    email_campaigns = select(Sequence.id).where(Sequence.channel == "email")
+    running = set(await session.scalars(select(Enrollment.lead_id).where(Enrollment.lead_id.in_(ids), Enrollment.status.in_(("active", "paused")),
+                                                                           Enrollment.sequence_id.in_(email_campaigns)))) if ids else set()  # fmt: skip
     here = set(await session.scalars(select(Enrollment.lead_id).where(Enrollment.sequence_id == sequence.id, Enrollment.lead_id.in_(ids)))) if ids else set()
     answered = set(await session.scalars(select(InboundEvent.lead_id).where(InboundEvent.lead_id.in_(ids), InboundEvent.type.in_(("reply", "bounce", "unsubscribe"))))) if ids else set()
     firsts: dict[UUID, Email] = {}

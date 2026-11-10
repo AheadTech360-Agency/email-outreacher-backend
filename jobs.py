@@ -139,6 +139,7 @@ async def own_send() -> dict:
 
     settings = get_settings()
     writer = EmailWriter(settings.anthropic_api_key, base_url=settings.anthropic_base_url) if settings.anthropic_api_key else None
+    unipile = None
     try:
         async with get_sessionmaker()() as session, get_engine().connect() as conn:
             await conn.execution_options(postgresql_readonly=True)  # Lead Intel is only ever read
@@ -150,13 +151,25 @@ async def own_send() -> dict:
                     await ensure_icp_campaigns(session, workspace_id, icps)
                 write = coldbrew_writer(writer, lead_intel) if writer else None
                 summary = await send_due(session, live=settings.own_sending_live, write_follow_up=write)
+                # LinkedIn and Instagram campaigns, through Unipile (dry run unless OWN_SOCIAL_LIVE).
+                from services.own_social import send_social_due, social_writer
+                from services.unipile import UnipileClient
+
+                if settings.unipile_dsn and settings.unipile_api_key:
+                    unipile = UnipileClient(settings.unipile_dsn, settings.unipile_api_key)
+                social = await send_social_due(session, live=settings.own_social_live, unipile=unipile,
+                                               write=social_writer(writer, lead_intel) if writer else None)  # fmt: skip
             finally:
                 await conn.rollback()
         return {"live": settings.own_sending_live, "sent": summary.sent, "dry_run": summary.dry_run,
-                "failed": summary.failed, "skipped": summary.skipped}  # fmt: skip
+                "failed": summary.failed, "skipped": summary.skipped,
+                "social": {"live": settings.own_social_live, "sent": social.sent, "dry_run": social.dry_run, "failed": social.failed,
+                           "skipped": social.skipped, "replies": social.replies, "notes": social.notes}}  # fmt: skip
     finally:
         if writer:
             await writer.aclose()
+        if unipile:
+            await unipile.aclose()
         await get_engine().dispose()
 
 
