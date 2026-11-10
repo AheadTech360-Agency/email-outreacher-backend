@@ -23,7 +23,10 @@ VARIABLES = {
     "email1Body": "The body of the first email Coldbrew wrote for them",
     "senderName": "The sending mailbox's name (or its persona's)",
     "signature": "The persona's signature",
+    "followUp": "A follow-up Coldbrew writes for this lead with your follow-up prompts (emails 2 to 5 only)",
 }
+# Steps {{followUp}} can be used in: Coldbrew has a follow-up prompt for each (follow-up 2 to 5).
+FOLLOW_UP_STEPS = range(2, 6)
 
 
 class MissingValue(Exception):
@@ -219,8 +222,21 @@ def _references(msg: Message) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
-def classify(msg: Message, fallback_time: datetime | None = None) -> Inbound | None:
-    """What an incoming email is. None when it has no Message-ID (it can't be stored once)."""
+def is_warmup(msg: Message, markers: list[str]) -> bool:
+    """Warm-up mail (mailboxes trading emails to build their reputation): a warm-up header ("X-Warmup", "X-Lemwarm"...)
+    or one of the workspace's markers (OWN_WARMUP_MARKERS) in the subject or body. Never a reply, whoever sent it."""
+    if any("warmup" in name.lower().replace("-", "") or name.lower().startswith(("x-lemwarm", "x-mailwarm")) for name in msg.keys()):
+        return True
+    if not markers:
+        return False
+    haystack = f"{msg.get('Subject') or ''}\n{_text_of(msg)}".lower()
+    return any(m.lower() in haystack for m in markers if m.strip())
+
+
+def classify(msg: Message, fallback_time: datetime | None = None, warmup_markers: list[str] | None = None) -> Inbound | None:
+    """What an incoming email is. None when it has no Message-ID (it can't be stored once), or when it's warm-up mail."""
+    if is_warmup(msg, warmup_markers or []):
+        return None
     message_id = (MESSAGE_ID.findall(msg.get("Message-ID") or "") or [None])[0]
     if not message_id:
         return None

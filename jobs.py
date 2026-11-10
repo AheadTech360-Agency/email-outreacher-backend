@@ -134,14 +134,23 @@ async def settle_apify_costs() -> dict[str, int]:
 
 async def own_send() -> dict:
     """One scheduler tick across every workspace: dry run unless OWN_SENDING_LIVE is on. Fresh event loop each time."""
-    from services.own_sending import send_due
+    from services.own_sending import coldbrew_writer, send_due
 
+    settings = get_settings()
+    writer = EmailWriter(settings.anthropic_api_key, base_url=settings.anthropic_base_url) if settings.anthropic_api_key else None
     try:
-        async with get_sessionmaker()() as session:
-            summary = await send_due(session, live=get_settings().own_sending_live)
-        return {"live": get_settings().own_sending_live, "sent": summary.sent, "dry_run": summary.dry_run,
+        async with get_sessionmaker()() as session, get_engine().connect() as conn:
+            await conn.execution_options(postgresql_readonly=True)  # Lead Intel is only ever read
+            try:
+                write = coldbrew_writer(writer, LeadIntelRepo(conn)) if writer else None
+                summary = await send_due(session, live=settings.own_sending_live, write_follow_up=write)
+            finally:
+                await conn.rollback()
+        return {"live": settings.own_sending_live, "sent": summary.sent, "dry_run": summary.dry_run,
                 "failed": summary.failed, "skipped": summary.skipped}  # fmt: skip
     finally:
+        if writer:
+            await writer.aclose()
         await get_engine().dispose()
 
 
@@ -151,7 +160,7 @@ async def own_read() -> dict:
 
     try:
         async with get_sessionmaker()() as session:
-            summary = await read_inboxes(session)
+            summary = await read_inboxes(session, warmup_markers=get_settings().warmup_marker_list)
         return {"read": summary.read, "recorded": summary.recorded, "failed": summary.failed}
     finally:
         await get_engine().dispose()

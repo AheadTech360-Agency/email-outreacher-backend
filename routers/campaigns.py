@@ -16,12 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
 from database import get_session
-from dependencies import require_manager, require_workspace_id
-from models import Email, Enrollment, InboundEvent, Lead, QueuedAddress, SenderAccount, Sequence, SequenceStep, StepRun
+from dependencies import get_lead_intel_repo, get_optional_writer, require_manager, require_workspace_id
+from lead_intel import LeadIntelRepo
+from models import Email, Enrollment, InboundEvent, Lead, Persona, QueuedAddress, SenderAccount, Sequence, SequenceStep, StepRun
 from schemas import ApiModel
 from services.auth import CurrentUser
-from services.own_mail import VARIABLES, clean_schedule, next_send_time, unknown_variables
-from services.own_sending import enroll
+from services.generation import EmailWriter
+from services.own_mail import FOLLOW_UP_STEPS, VARIABLES, MissingValue, clean_schedule, next_send_time, render, reply_subject, unknown_variables
+from services.own_sending import coldbrew_writer, enroll, stored_follow_up
 
 router = APIRouter(tags=["own sending"])
 
@@ -172,6 +174,8 @@ def _check_steps(steps: list[StepIn]) -> None:
             raise HTTPException(422, "The first email needs a subject.")
         if step.thread_mode == "new" and not step.subject.strip():
             raise HTTPException(422, f"Email {i} starts a new thread, so it needs a subject.")
+        if "followUp" in step.subject or ("followUp" in step.body and i not in FOLLOW_UP_STEPS):
+            raise HTTPException(422, f"{{{{followUp}}}} goes in the body of emails 2 to 5 only (Coldbrew has a follow-up prompt for each). Email {i} can't use it.")
         if bad := unknown_variables(step.subject + step.body):
             raise HTTPException(422, f"Email {i} uses {', '.join('{{' + b + '}}' for b in bad)}, which isn't a variable. Use one of: "
                                      + ", ".join("{{" + v + "}}" for v in VARIABLES) + ".")  # fmt: skip
@@ -427,6 +431,86 @@ async def act_on_enrollment(enrollment_id: UUID, body: EnrollmentActionIn, works
     await session.commit()
     rows = await list_enrollments(e.sequence_id, "", workspace_id, session)
     return next(r for r in rows if r.id == e.id)
+
+
+class PreviewEmail(ApiModel):
+    step_order: int
+    delay_days: int
+    thread_mode: str
+    subject: str
+    body: str
+    state: Literal["ready", "to_write", "problem"]
+    note: str | None = None
+
+
+class PreviewOut(ApiModel):
+    lead_name: str
+    lead_email: str | None
+    sender: str | None
+    emails: list[PreviewEmail]
+
+
+@router.post("/enrollments/{enrollment_id}/preview", response_model=PreviewOut)
+async def preview(
+    enrollment_id: UUID,
+    write: bool = Query(default=False),
+    workspace_id: UUID = Depends(require_workspace_id),
+    _user: CurrentUser = Depends(require_manager),
+    session: AsyncSession = Depends(get_session),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    writer: EmailWriter | None = Depends(get_optional_writer),
+):
+    """Every email of the campaign as this lead would get it: variables filled, the signature under it, follow-ups
+    threaded as "Re:". A {{followUp}} already written is shown as written; with write=true, Coldbrew writes the missing
+    ones now (Claude, logged to Usage) and they're kept, so the same text goes out later. Nothing is sent."""
+    e = await session.scalar(select(Enrollment).where(Enrollment.workspace_id == workspace_id, Enrollment.id == enrollment_id))
+    if e is None:
+        raise HTTPException(404, "Lead not found in a campaign")
+    lead = await session.get(Lead, e.lead_id)
+    account = await session.get(SenderAccount, e.sender_account_id) if e.sender_account_id else None
+    persona = await session.get(Persona, account.persona_id) if account and account.persona_id else None
+    steps = list(await session.scalars(select(SequenceStep).where(SequenceStep.sequence_id == e.sequence_id).order_by(SequenceStep.step_order)))
+    first = await session.get(Email, e.email_id) if e.email_id else None
+    values = {
+        "firstName": lead.first_name, "lastName": lead.last_name, "company": lead.company, "title": lead.title,
+        "email1Subject": first.subject if first else "", "email1Body": (first.edited_body or first.body) if first else "",
+        "senderName": (account.from_name if account else "") or (persona.name if persona else ""), "signature": persona.signature if persona else "",
+    }  # fmt: skip
+    if write and writer is None:
+        raise HTTPException(503, "ANTHROPIC_API_KEY isn't set, so Coldbrew can't write follow-ups.")
+    write_one = coldbrew_writer(writer, lead_intel) if write and writer else None
+    out: list[PreviewEmail] = []
+    first_subject = ""
+    earlier: dict[int, str] = {}
+    for step in steps:
+        state, note = "ready", None
+        if "followUp" in step.body:
+            done = await stored_follow_up(session, lead.id, step.step_order)
+            if done is not None:
+                values["followUp"] = done.edited_body or done.body
+            elif first is None:
+                state, note = "problem", "This lead has no Coldbrew first email, which a follow-up is written from."
+            elif write_one is not None:
+                text, why = await write_one(session, lead, first, step.step_order, earlier)
+                values["followUp"], state, note = (text or ""), ("ready" if text else "problem"), why
+            else:
+                values["followUp"] = ""
+                state, note = "to_write", "Coldbrew writes this follow-up for the lead when it's due. Write it now to read it first."
+        try:
+            body = render(step.body, values) if state != "to_write" else step.body
+            subject = render(step.subject, values) if (step.step_order == 1 or step.thread_mode == "new") else reply_subject(first_subject)
+        except MissingValue as missing:
+            state, note = "problem", f"{{{{{missing.name}}}}} is empty for this lead. Add a fallback, like {{{{{missing.name}|...}}}}."
+            body, subject = step.body, step.subject
+        if step.step_order == 1 or step.thread_mode == "new":
+            first_subject = subject
+        if state == "ready":
+            earlier[step.step_order] = body
+            if values["signature"].strip():
+                body = f"{body.rstrip()}\n\n{values['signature'].strip()}"
+        out.append(PreviewEmail(step_order=step.step_order, delay_days=step.delay_days, thread_mode=step.thread_mode,
+                                subject=subject, body=body, state=state, note=note))  # fmt: skip
+    return PreviewOut(lead_name=_name(lead), lead_email=lead.email, sender=account.from_email if account else None, emails=out)
 
 
 # ---------- What happened ----------

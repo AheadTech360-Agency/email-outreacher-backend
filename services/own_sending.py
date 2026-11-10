@@ -24,7 +24,7 @@ import smtplib
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 from sqlalchemy import func, select, update
@@ -138,6 +138,55 @@ async def enroll(session: AsyncSession, workspace_id: UUID, sequence: Sequence, 
     return out
 
 
+# ---------- Follow-ups Coldbrew writes ({{followUp}}) ----------
+
+# (session, lead, their first email, step 2 to 5, earlier follow-ups' text by step) -> (the follow-up, or why not)
+FollowUpWriter = Callable[[AsyncSession, Lead, Email, int, dict[int, str]], Awaitable[tuple[str | None, str | None]]]
+
+
+async def stored_follow_up(session: AsyncSession, lead_id: UUID, step: int) -> Email | None:
+    """A follow-up already written for this lead and step: written once, then reused (a dry run's text is what goes out
+    live)."""
+    return await session.scalar(select(Email).where(Email.lead_id == lead_id, Email.step == step).order_by(Email.created_at.desc()).limit(1))
+
+
+def coldbrew_writer(writer: Any, lead_intel: Any) -> FollowUpWriter:
+    """Writes a lead's follow-up the way Coldbrew writes CheapSequencer follow-ups: the workspace's follow-up prompt for
+    that step (Prompts page), filled with the lead, their ICP, product, hooks, the first email and earlier follow-ups.
+    Logged to Usage, and kept on the lead (eo_emails, step 2 to 5) like every follow-up."""
+    from dataclasses import replace
+
+    from crud import ExampleRepo, IcpProfileRepo, ProductRepo, PromptRepo, ProviderCallRepo, SendingRepo
+    from services.claude import cost_usd
+    from services.generation import PromptVersionSpec, write_follow_up
+    from services.outreach import Deps, _variables
+    from services.prompts import render as render_template, render_product
+
+    async def write(session: AsyncSession, lead: Lead, first: Email, step: int, earlier: dict[int, str]) -> tuple[str | None, str | None]:
+        prompts = PromptRepo(session)
+        version = await prompts.for_icp(lead.workspace_id, f"followup{step}", None)
+        if version is None:
+            return None, f"There's no follow-up {step} prompt. Add one on the Prompts page."
+        deps = Deps(lead.workspace_id, SendingRepo(session), None, IcpProfileRepo(session), prompts, ProductRepo(session),
+                    ExampleRepo(session), None, None, lead_intel, None, writer)  # fmt: skip
+        variables = await _variables(deps, first, lead, step, earlier)
+        spec = PromptVersionSpec(version.id, version.system_prompt, version.user_prompt, version.model, version.max_tokens)
+        draft, calls, error = await write_follow_up(writer, replace(spec, system=render_template(spec.system, variables)), render_product(spec.user, variables))
+        cost = sum(cost_usd(c.model, c.input_tokens, c.output_tokens) for c in calls)
+        if calls:
+            await ProviderCallRepo(session).record(
+                lead.workspace_id, "claude", "messages", "failed" if error else "succeeded", cost_usd=round(cost, 4),
+                action="Write follow-ups (own sending)", model=calls[-1].model, lead_id=lead.id,
+                input_tokens=sum(c.input_tokens for c in calls), output_tokens=sum(c.output_tokens for c in calls),
+            )  # fmt: skip
+        if error or draft is None:
+            return None, f"Coldbrew couldn't write follow-up {step}: {error or 'no text came back'}"
+        await SendingRepo(session).add_follow_up(first, step, draft.body, version.id, draft.confidence, cost)
+        return draft.body, None
+
+    return write
+
+
 # ---------- Sending ----------
 
 
@@ -173,6 +222,24 @@ async def _values(session: AsyncSession, lead: Lead, enrollment: Enrollment, acc
     }  # fmt: skip
 
 
+async def _follow_up(session: AsyncSession, enrollment: Enrollment, lead: Lead, step: SequenceStep,
+                     write: FollowUpWriter | None) -> tuple[str | None, str | None]:  # fmt: skip
+    """This lead's follow-up for a {{followUp}} step: the one already written, else Coldbrew writes it now."""
+    if enrollment.email_id is None or (first := await session.get(Email, enrollment.email_id)) is None:
+        return None, "{{followUp}} needs the lead's Coldbrew first email, and this lead has none."
+    if (done := await stored_follow_up(session, lead.id, step.step_order)) is not None:
+        return done.edited_body or done.body, None
+    if write is None:
+        return None, "ANTHROPIC_API_KEY isn't set, so Coldbrew can't write follow-ups."
+    earlier: dict[int, str] = {}
+    for order, body in await session.execute(
+        select(SequenceStep.step_order, StepRun.body).join(SequenceStep, SequenceStep.id == StepRun.step_id)
+        .where(StepRun.enrollment_id == enrollment.id, StepRun.status.in_(("sent", "dry_run")), SequenceStep.step_order < step.step_order)
+    ):  # fmt: skip
+        earlier.setdefault(order, body)
+    return await write(session, lead, first, step.step_order, earlier)
+
+
 async def _usage_today(session: AsyncSession, account_id: UUID, today) -> int:
     return int(await session.scalar(select(SenderUsage.sent).where(SenderUsage.sender_account_id == account_id, SenderUsage.day == today)) or 0)
 
@@ -183,6 +250,7 @@ async def send_due(
     now: datetime | None = None,
     deliver: Callable[[SenderAccount, str, Any], None] = smtp_send,
     rng: random.Random | None = None,
+    write_follow_up: FollowUpWriter | None = None,
 ) -> TickSummary:
     """One scheduler tick: for each connected mailbox under its daily limit, the next due step of an active campaign,
     inside its window. Live, it's sent; otherwise it's logged once as a dry run."""
@@ -224,6 +292,20 @@ async def send_due(
             continue
         persona = await session.get(Persona, account.persona_id) if account.persona_id else None
         values = await _values(session, lead, enrollment, account, persona)
+        if "followUp" in step.body:
+            text, why = await _follow_up(session, enrollment, lead, step, write_follow_up)
+            if text is None:
+                # Tried again in the next window; noted once per reason, so the activity doesn't fill up.
+                said = await session.scalar(select(StepRun.id).where(StepRun.enrollment_id == enrollment.id, StepRun.step_id == step.id,
+                                                                     StepRun.status == "skipped", StepRun.error == why))  # fmt: skip
+                if said is None:
+                    session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id,
+                                        sender_account_id=account.id, status="skipped", error=why))  # fmt: skip
+                enrollment.next_run_at = next_send_time(sequence.schedule, now + timedelta(hours=1), rng)
+                out.skipped += 1
+                await session.commit()
+                continue
+            values["followUp"] = text
         first_run = await session.scalar(
             select(StepRun).where(StepRun.enrollment_id == enrollment.id, StepRun.status.in_(("sent", "dry_run")))
             .order_by(StepRun.ran_at).limit(1)
@@ -379,6 +461,7 @@ async def read_inboxes(
     now: datetime | None = None,
     fetch: Callable[[SenderAccount, str, datetime], list[tuple[str, bytes]]] = fetch_recent,
     alert: Callable[[Lead], Any] | None = None,
+    warmup_markers: list[str] | None = None,
 ) -> ReadSummary:
     """One inbox tick: every mailbox with IMAP, inbox and spam. Each matched email is stored once (by mailbox and
     Message-ID); the database trigger stops the lead's campaigns on a reply, bounce or unsubscribe, and a new reply
@@ -400,7 +483,7 @@ async def read_inboxes(
         for folder, data in raw:
             out.read += 1
             msg = email.message_from_bytes(data, policy=email.policy.default)
-            inbound = classify(msg, now)
+            inbound = classify(msg, now, warmup_markers)  # warm-up mail comes back as None
             if inbound is None or inbound.from_email == account.from_email.lower():
                 continue
             enrollment, lead = await _match(session, account, inbound)

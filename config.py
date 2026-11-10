@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     own_sending_live: bool = False
     # How often the scheduler sends (one email per mailbox each time) and the inbox reader checks for replies.
     own_sending_tick_seconds: int = Field(default=300, ge=60)
+    # Warm-up mail the inbox reader drops, besides any email with a warm-up header: comma-separated markers your
+    # warm-up tool puts in the subject or body (its tag or code). Warm-up mail never counts as a reply.
+    own_warmup_markers: str = ""
+
+    @property
+    def warmup_marker_list(self) -> list[str]:
+        return [m.strip() for m in self.own_warmup_markers.split(",") if m.strip()]
 
     # Prices the cost estimator uses where Coldbrew has no source of its own, as JSON by line id, e.g.
     # {"apollo-reveal": 0.02, "linkedin-posts": 0.002, "railway": 20}. The estimator shows prices read-only.

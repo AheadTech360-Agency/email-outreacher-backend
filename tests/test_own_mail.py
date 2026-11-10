@@ -111,3 +111,31 @@ Address not found.
 
 def test_own_words_drops_the_quoted_email() -> None:
     assert own_words("Yes please\n\n> earlier\n> text") == "Yes please"
+
+
+# ---------- Warm-up mail and {{followUp}} ----------
+
+
+def test_warm_up_mail_is_never_a_reply() -> None:
+    by_header = parse("Message-ID: <w1@x.com>\nFrom: bot@warm.io\nSubject: Re: quick question\nX-Warmup-Id: 81723\nIn-Reply-To: <first@acme.com>\n\nThanks!\n")
+    assert classify(by_header) is None
+    by_marker = parse("Message-ID: <w2@x.com>\nFrom: bot@warm.io\nSubject: Re: catching up W4RM-7Q\n\nSounds good.\n")
+    assert classify(by_marker, warmup_markers=["w4rm-7q"]) is None
+    assert classify(by_marker).type == "reply"  # without the marker set, it reads as a reply
+    real = parse("Message-ID: <r9@shop.com>\nFrom: ana@shop.com\nSubject: Re: idea\n\nWe warm up our inboxes too, but yes, let's talk.\n")
+    assert classify(real, warmup_markers=["W4RM-7Q"]).type == "reply"
+
+
+def test_followup_goes_only_in_emails_2_to_5() -> None:
+    from fastapi import HTTPException
+
+    from routers.campaigns import StepIn, _check_steps
+
+    ok = [StepIn(subject="Hi", body="{{email1Body}}")] + [StepIn(body="{{followUp}}") for _ in range(4)]
+    _check_steps(ok)
+    with pytest.raises(HTTPException):
+        _check_steps([StepIn(subject="Hi", body="{{followUp}}")])  # email 1
+    with pytest.raises(HTTPException):
+        _check_steps(ok + [StepIn(body="{{followUp}}")])  # email 6
+    with pytest.raises(HTTPException):
+        _check_steps([StepIn(subject="{{followUp}}", body="x")])  # in a subject
