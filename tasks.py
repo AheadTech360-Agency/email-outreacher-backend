@@ -72,3 +72,42 @@ def run_job(job_id: str) -> None:
 def quickstart_step(run_id: str) -> None:
     if asyncio.run(quickstart.advance(UUID(run_id))):
         quickstart_step.apply_async(args=[run_id], retry=False)
+
+
+def _own_lock(name: str):
+    """One own-sending tick of each kind at a time: a slow one never overlaps the next (two would send twice)."""
+    settings = get_settings()
+    if not settings.broker_url.startswith(("redis://", "rediss://")):
+        return None
+    import redis
+
+    return redis.Redis.from_url(settings.broker_url).lock(f"coldbrew:own:{name}", timeout=settings.own_sending_tick_seconds * 3, blocking=False)
+
+
+def _locked(name: str, run) -> dict:
+    lock = _own_lock(name)
+    if lock is not None and not lock.acquire():
+        log.info("own %s skipped: another one is still running", name)
+        return {"skipped": True}
+    try:
+        summary = asyncio.run(run())
+        log.info("own %s: %s", name, summary)
+        return summary
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:  # noqa: BLE001 - it expired already
+                pass
+
+
+@app.task(name="coldbrew.own_send", acks_late=False)
+def own_send() -> dict:
+    """Coldbrew's own sending: the next due step per mailbox (jobs.own_send). Dry run unless OWN_SENDING_LIVE."""
+    return _locked("send", jobs.own_send)
+
+
+@app.task(name="coldbrew.own_read")
+def own_read() -> dict:
+    """Coldbrew's own sending: replies, bounces and unsubscribes in each mailbox (jobs.own_read)."""
+    return _locked("read", jobs.own_read)

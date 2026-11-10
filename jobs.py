@@ -127,3 +127,31 @@ async def settle_apify_costs() -> dict[str, int]:
         await apify.aclose()
         await get_engine().dispose()
     return out
+
+
+# ---------- Coldbrew's own sending (services/own_sending.py) ----------
+
+
+async def own_send() -> dict:
+    """One scheduler tick across every workspace: dry run unless OWN_SENDING_LIVE is on. Fresh event loop each time."""
+    from services.own_sending import send_due
+
+    try:
+        async with get_sessionmaker()() as session:
+            summary = await send_due(session, live=get_settings().own_sending_live)
+        return {"live": get_settings().own_sending_live, "sent": summary.sent, "dry_run": summary.dry_run,
+                "failed": summary.failed, "skipped": summary.skipped}  # fmt: skip
+    finally:
+        await get_engine().dispose()
+
+
+async def own_read() -> dict:
+    """One inbox tick: replies, bounces and unsubscribes in every mailbox with IMAP. Fresh event loop each time."""
+    from services.own_sending import read_inboxes
+
+    try:
+        async with get_sessionmaker()() as session:
+            summary = await read_inboxes(session)
+        return {"read": summary.read, "recorded": summary.recorded, "failed": summary.failed}
+    finally:
+        await get_engine().dispose()

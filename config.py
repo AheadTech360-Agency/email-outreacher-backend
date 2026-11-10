@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     # The app's address for links in those emails; empty means the first of AUTHORIZED_URLS.
     app_url: str | None = None
 
+    # Coldbrew's own sending (services/own_sending.py). Off: the scheduler only logs what it would send ("dry run").
+    # Turn on to send for real, once a campaign has been checked in dry run.
+    own_sending_live: bool = False
+    # How often the scheduler sends (one email per mailbox each time) and the inbox reader checks for replies.
+    own_sending_tick_seconds: int = Field(default=300, ge=60)
+
     # Prices the cost estimator uses where Coldbrew has no source of its own, as JSON by line id, e.g.
     # {"apollo-reveal": 0.02, "linkedin-posts": 0.002, "railway": 20}. The estimator shows prices read-only.
     cost_prices: str = ""
