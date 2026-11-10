@@ -189,6 +189,9 @@ def no_real_sending(monkeypatch):
         raise AssertionError("a test tried to send a real email")
 
     monkeypatch.setattr(get_settings(), "smtp_host", None)
+    # Nor Unipile: no LinkedIn or Instagram account is ever reached from a test.
+    monkeypatch.setattr(get_settings(), "unipile_api_key", None)
+    monkeypatch.setattr(get_settings(), "unipile_dsn", None)
     monkeypatch.setattr(services.notify, "_send", no_smtp)
     app.dependency_overrides[get_optional_sequencer] = lambda: None
     app.dependency_overrides[get_optional_inboxes] = lambda: None

@@ -12,6 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from config import get_settings
 from crud import SendingRepo
+from database import get_session
 from dependencies import get_optional_sequencer, get_sending_repo
 from services import notify
 from services.sending import SendingError, SequencerClient
@@ -21,6 +22,49 @@ log = logging.getLogger("coldbrew.webhooks")
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 MAX_BYTES = 256 * 1024
+
+
+@router.post("/unipile")
+async def unipile(request: Request, token: str = "", session=Depends(get_session)) -> dict[str, str]:
+    """Unipile's hosted sign-in reporting an account: {"status": "CREATION_SUCCESS" | "RECONNECTED", "account_id",
+    "name"}. Trusted only with the token our notify_url carried for that name (services/unipile.notify_token); the
+    name says which workspace started it. The account itself is read from Unipile, not taken from the call."""
+    import hmac as _hmac
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from routers.social import upsert
+    from services.unipile import UnipileClient, UnipileError, notify_token
+
+    settings = get_settings()
+    if not settings.unipile_api_key or not settings.unipile_dsn:
+        return {"status": "ignored"}
+    try:
+        event = json.loads(await request.body())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Not JSON") from exc
+    name = str((event or {}).get("name") or "")
+    if not name or not _hmac.compare_digest(token, notify_token(settings.unipile_api_key, name)):
+        raise HTTPException(status_code=401, detail="Bad token")
+    if event.get("status") not in ("CREATION_SUCCESS", "RECONNECTED") or not event.get("account_id"):
+        return {"status": "ignored"}
+    try:
+        workspace_id = UUID(name.split(":", 1)[0])
+    except ValueError:
+        return {"status": "ignored"}
+    client = UnipileClient(settings.unipile_dsn, settings.unipile_api_key)
+    try:
+        account = next((a for a in await client.accounts() if a.id == str(event["account_id"])), None)
+    except UnipileError as exc:
+        log.warning("couldn't read Unipile account %s: %s", event.get("account_id"), exc.message)
+        return {"status": "retry later"}
+    finally:
+        await client.aclose()
+    if account is None:
+        return {"status": "ignored"}  # not LinkedIn or Instagram
+    await upsert(session, workspace_id, account, datetime.now(UTC))
+    await session.commit()
+    return {"status": "recorded"}
 
 
 @router.post("/cheapsequencer")

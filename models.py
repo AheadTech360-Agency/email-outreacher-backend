@@ -1179,3 +1179,26 @@ class OwnSendingSettings(Base):
     warmup_default_reply_percent: Mapped[int] = mapped_column(SmallInteger, server_default="30")
     warmup_star_percent: Mapped[int] = mapped_column(SmallInteger, server_default="25")
     updated_at: Mapped[datetime] = _updated()
+
+
+class SocialAccount(Base):
+    """A LinkedIn or Instagram account connected through Unipile, and the mailbox it belongs to (migration 0038).
+    Unipile holds the login; this keeps its account id, what to show and its status."""
+
+    __tablename__ = "eo_social_accounts"
+    __table_args__ = (
+        CheckConstraint(_in("provider", ("linkedin", "instagram")), name="provider"),
+        CheckConstraint(_in("status", ("ok", "connecting", "credentials", "permissions", "error", "stopped")), name="status"),
+        UniqueConstraint("unipile_account_id"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    provider: Mapped[str] = mapped_column(Text)
+    unipile_account_id: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text, server_default="")
+    username: Mapped[str] = mapped_column(Text, server_default="")
+    status: Mapped[str] = mapped_column(Text, server_default="ok")
+    sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None, index=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()

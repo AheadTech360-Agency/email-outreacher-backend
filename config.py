@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     def warmup_marker_list(self) -> list[str]:
         return [m.strip() for m in self.own_warmup_markers.split(",") if m.strip()]
 
+    # Unipile (LinkedIn and Instagram accounts, connected from the sending dashboard; services/unipile.py). The DSN is
+    # the account's API address, like https://api8.unipile.com:13851. Unset: the dashboard says so and connects nothing.
+    unipile_dsn: str | None = None
+    unipile_api_key: str | None = None
+    # This backend's public address (like https://coldbrew-api.up.railway.app), so Unipile can say which account was
+    # connected. Without it, "Sync from Unipile" in the dashboard picks new accounts up instead.
+    public_api_url: str | None = None
+
     # Prices the cost estimator uses where Coldbrew has no source of its own, as JSON by line id, e.g.
     # {"apollo-reveal": 0.02, "linkedin-posts": 0.002, "railway": 20}. The estimator shows prices read-only.
     cost_prices: str = ""
