@@ -18,6 +18,7 @@ from database import get_session
 from dependencies import require_manager, require_workspace_id
 from models import SenderAccount, SocialAccount, SocialConnect
 from schemas import ApiModel
+from services import own_settings
 from services.auth import CurrentUser
 from services.unipile import Account, UnipileClient, UnipileError, notify_token
 
@@ -44,6 +45,12 @@ class SocialOut(ApiModel):
     status: str
     sender_account_id: UUID | None
     sender_email: str | None
+    # Its own limits (None: the workspace's for this network), and what applies to it after that.
+    daily_invite_limit: int | None
+    daily_message_limit: int | None
+    invites_per_day: int
+    invites_per_week: int
+    messages_per_day: int
     last_synced_at: datetime | None
     created_at: datetime
 
@@ -66,14 +73,21 @@ class LinkOut(ApiModel):
 
 
 class SocialEditIn(ApiModel):
+    """Only what's sent changes. A limit of null goes back to the workspace's for that network."""
+
     sender_account_id: UUID | None = None
+    daily_invite_limit: int | None = Field(default=None, ge=1, le=100)
+    daily_message_limit: int | None = Field(default=None, ge=1, le=250)
 
 
 async def _outs(session: AsyncSession, rows: list[SocialAccount]) -> list[SocialOut]:
     ids = {r.sender_account_id for r in rows if r.sender_account_id}
     emails = dict((await session.execute(select(SenderAccount.id, SenderAccount.from_email).where(SenderAccount.id.in_(ids))))) if ids else {}
+    by_ws = {ws: await own_settings.load(session, ws) for ws in {r.workspace_id for r in rows}}
     return [SocialOut(id=r.id, provider=r.provider, name=r.name, username=r.username, status=r.status, sender_account_id=r.sender_account_id,
-                      sender_email=emails.get(r.sender_account_id), last_synced_at=r.last_synced_at, created_at=r.created_at) for r in rows]  # fmt: skip
+                      sender_email=emails.get(r.sender_account_id), daily_invite_limit=r.daily_invite_limit, daily_message_limit=r.daily_message_limit,
+                      **by_ws[r.workspace_id].social_limits(r.provider, r.daily_invite_limit, r.daily_message_limit),
+                      last_synced_at=r.last_synced_at, created_at=r.created_at) for r in rows]  # fmt: skip
 
 
 async def upsert(session: AsyncSession, workspace_id: UUID, account: Account, now: datetime) -> SocialAccount | None:
@@ -198,13 +212,21 @@ async def _social(session: AsyncSession, workspace_id: UUID, social_id: UUID) ->
 @router.patch("/social-accounts/{social_id}", response_model=SocialOut)
 async def edit(social_id: UUID, body: SocialEditIn, workspace_id: UUID = Depends(require_workspace_id),
                _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session)):  # fmt: skip
-    """Which mailbox it belongs to (or none)."""
+    """Which mailbox it belongs to (or none), and its own daily limits."""
     row = await _social(session, workspace_id, social_id)
-    if body.sender_account_id is not None and await session.scalar(
-        select(SenderAccount.id).where(SenderAccount.workspace_id == workspace_id, SenderAccount.id == body.sender_account_id)
-    ) is None:
-        raise HTTPException(422, "That mailbox isn't in this workspace.")
-    row.sender_account_id = body.sender_account_id
+    sent = body.model_fields_set
+    if "sender_account_id" in sent:
+        if body.sender_account_id is not None and await session.scalar(
+            select(SenderAccount.id).where(SenderAccount.workspace_id == workspace_id, SenderAccount.id == body.sender_account_id)
+        ) is None:
+            raise HTTPException(422, "That mailbox isn't in this workspace.")
+        row.sender_account_id = body.sender_account_id
+    if "daily_invite_limit" in sent:
+        if body.daily_invite_limit is not None and row.provider != "linkedin":
+            raise HTTPException(422, "Instagram has no connection requests.")
+        row.daily_invite_limit = body.daily_invite_limit
+    if "daily_message_limit" in sent:
+        row.daily_message_limit = body.daily_message_limit
     await session.commit()
     await session.refresh(row)
     return (await _outs(session, [row]))[0]

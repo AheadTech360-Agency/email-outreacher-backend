@@ -1178,6 +1178,13 @@ class OwnSendingSettings(Base):
     warmup_default_target: Mapped[int] = mapped_column(SmallInteger, server_default="20")
     warmup_default_reply_percent: Mapped[int] = mapped_column(SmallInteger, server_default="30")
     warmup_star_percent: Mapped[int] = mapped_column(SmallInteger, server_default="25")
+    # LinkedIn and Instagram, per account per day unless the account has its own (migration 0039)
+    linkedin_daily_invites: Mapped[int] = mapped_column(SmallInteger, server_default="20")
+    linkedin_weekly_invites: Mapped[int] = mapped_column(SmallInteger, server_default="100")
+    linkedin_daily_messages: Mapped[int] = mapped_column(SmallInteger, server_default="50")
+    instagram_daily_messages: Mapped[int] = mapped_column(SmallInteger, server_default="30")
+    social_min_gap_minutes: Mapped[int] = mapped_column(SmallInteger, server_default="3")
+    social_max_gap_minutes: Mapped[int] = mapped_column(SmallInteger, server_default="10")
     updated_at: Mapped[datetime] = _updated()
 
 
@@ -1199,6 +1206,9 @@ class SocialAccount(Base):
     username: Mapped[str] = mapped_column(Text, server_default="")
     status: Mapped[str] = mapped_column(Text, server_default="ok")
     sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None, index=True)
+    # Its own daily limits; None uses the workspace's for that network (migration 0039). Invites are LinkedIn only.
+    daily_invite_limit: Mapped[int | None] = mapped_column(SmallInteger, default=None)
+    daily_message_limit: Mapped[int | None] = mapped_column(SmallInteger, default=None)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()

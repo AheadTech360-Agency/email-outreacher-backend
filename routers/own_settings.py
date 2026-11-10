@@ -36,6 +36,12 @@ class SettingsIn(ApiModel):
     warmup_default_target: int = Field(default=20, ge=1, le=100)
     warmup_default_reply_percent: int = Field(default=30, ge=0, le=100)
     warmup_star_percent: int = Field(default=25, ge=0, le=100)
+    linkedin_daily_invites: int = Field(default=20, ge=1, le=100)
+    linkedin_weekly_invites: int = Field(default=100, ge=1, le=500)
+    linkedin_daily_messages: int = Field(default=50, ge=1, le=250)
+    instagram_daily_messages: int = Field(default=30, ge=1, le=200)
+    social_min_gap_minutes: int = Field(default=3, ge=1, le=240)
+    social_max_gap_minutes: int = Field(default=10, ge=1, le=240)
 
 
 class SettingsOut(SettingsIn):
@@ -59,6 +65,10 @@ async def save_own_settings(body: SettingsIn, workspace_id: UUID = Depends(requi
                             _user: CurrentUser = Depends(require_manager), session=Depends(get_session)):  # fmt: skip
     if body.min_gap_minutes > body.max_gap_minutes:
         raise HTTPException(422, "The shortest gap between sends can't be longer than the longest.")
+    if body.social_min_gap_minutes > body.social_max_gap_minutes:
+        raise HTTPException(422, "The shortest gap between LinkedIn and Instagram actions can't be longer than the longest.")
+    if body.linkedin_daily_invites > body.linkedin_weekly_invites:
+        raise HTTPException(422, "LinkedIn connection requests per day can't be more than per week.")
     try:
         window = clean_schedule({"timezone": body.warmup_timezone, "start": body.warmup_start, "end": body.warmup_end, "days": body.warmup_days})
     except ValueError as exc:

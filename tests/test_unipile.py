@@ -82,3 +82,27 @@ def test_without_unipile_set_up_the_page_says_so(client) -> None:
 
     r = client.post("/api/v1/social-accounts/connect", json={"provider": "linkedin"}, headers={"X-Workspace-Id": str(WORKSPACE_ID)})
     assert r.status_code == 503 and "UNIPILE_DSN" in r.json()["detail"]
+
+
+def test_an_account_uses_its_own_limits_or_its_networks() -> None:
+    from services.own_settings import Settings
+
+    s = Settings(linkedin_daily_invites=20, linkedin_weekly_invites=100, linkedin_daily_messages=50, instagram_daily_messages=30)
+    assert s.social_limits("linkedin") == {"invites_per_day": 20, "invites_per_week": 100, "messages_per_day": 50}
+    assert s.social_limits("linkedin", 35, 80) == {"invites_per_day": 35, "invites_per_week": 100, "messages_per_day": 80}
+    assert s.social_limits("instagram") == {"invites_per_day": 0, "invites_per_week": 0, "messages_per_day": 30}
+    assert s.social_limits("instagram", None, 12)["messages_per_day"] == 12
+    # Its own daily invites never go past the week's.
+    assert Settings(linkedin_weekly_invites=25).social_limits("linkedin", 40)["invites_per_day"] == 25
+
+
+def test_social_limits_that_contradict_each_other_are_refused(client) -> None:
+    from tests.conftest import WORKSPACE_ID
+
+    h = {"X-Workspace-Id": str(WORKSPACE_ID)}
+    r = client.put("/api/v1/own-sending/settings", json={"linkedinDailyInvites": 50, "linkedinWeeklyInvites": 30}, headers=h)
+    assert r.status_code == 422 and "per week" in r.json()["detail"]
+    r = client.put("/api/v1/own-sending/settings", json={"socialMinGapMinutes": 20, "socialMaxGapMinutes": 5}, headers=h)
+    assert r.status_code == 422 and "LinkedIn and Instagram" in r.json()["detail"]
+    r = client.put("/api/v1/own-sending/settings", json={"instagramDailyMessages": 999}, headers=h)
+    assert r.status_code == 422

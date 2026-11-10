@@ -30,6 +30,21 @@ class Settings:
     warmup_default_target: int = 20
     warmup_default_reply_percent: int = 30
     warmup_star_percent: int = 25
+    # LinkedIn and Instagram: per account per day, unless the account has its own limit
+    linkedin_daily_invites: int = 20
+    linkedin_weekly_invites: int = 100
+    linkedin_daily_messages: int = 50
+    instagram_daily_messages: int = 30
+    social_min_gap_minutes: int = 3
+    social_max_gap_minutes: int = 10
+
+    def social_limits(self, provider: str, daily_invite_limit: int | None = None, daily_message_limit: int | None = None) -> dict:
+        """What one account may do: its own limits where it has them, this workspace's for its network otherwise.
+        Instagram has no connection requests (invites 0)."""
+        if provider == "linkedin":
+            return {"invites_per_day": min(daily_invite_limit or self.linkedin_daily_invites, self.linkedin_weekly_invites),
+                    "invites_per_week": self.linkedin_weekly_invites, "messages_per_day": daily_message_limit or self.linkedin_daily_messages}  # fmt: skip
+        return {"invites_per_day": 0, "invites_per_week": 0, "messages_per_day": daily_message_limit or self.instagram_daily_messages}
 
     @property
     def warmup_window(self) -> dict:
