@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     own_sending_live: bool = False
     # How often the scheduler sends (one email per mailbox each time) and the inbox reader checks for replies.
     own_sending_tick_seconds: int = Field(default=300, ge=60)
+    # The email warmer (services/warmup.py). Off: warm-up emails are only logged ("dry run"), and nothing is opened.
+    own_warmup_live: bool = False
     # Warm-up mail the inbox reader drops, besides any email with a warm-up header: comma-separated markers your
     # warm-up tool puts in the subject or body (its tag or code). Warm-up mail never counts as a reply.
     own_warmup_markers: str = ""

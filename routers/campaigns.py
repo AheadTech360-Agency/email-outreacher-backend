@@ -153,6 +153,7 @@ class ActivityOut(ApiModel):
 
 class SendingStatusOut(ApiModel):
     live: bool
+    warmup_live: bool = False
     variables: dict[str, str]
 
 
@@ -254,7 +255,7 @@ async def _out(session: AsyncSession, rows: list[Sequence], icp_names: dict[UUID
 @router.get("/own-sending/status", response_model=SendingStatusOut)
 async def sending_status():
     """Whether the scheduler really sends (OWN_SENDING_LIVE), and the variables a step can use."""
-    return SendingStatusOut(live=get_settings().own_sending_live, variables=VARIABLES)
+    return SendingStatusOut(live=get_settings().own_sending_live, warmup_live=get_settings().own_warmup_live, variables=VARIABLES)
 
 
 @router.get("/campaigns", response_model=list[CampaignOut])
@@ -327,8 +328,8 @@ async def set_status(campaign_id: UUID, body: StatusIn, workspace_id: UUID = Dep
     inside the window."""
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
     if body.status == "active":
-        if not await session.scalar(select(SenderAccount.id).where(SenderAccount.workspace_id == workspace_id, SenderAccount.status == "ok").limit(1)):
-            raise HTTPException(409, "No connected mailbox yet. Add one under Sender accounts and test it first.")
+        if not await session.scalar(select(SenderAccount.id).where(SenderAccount.workspace_id == workspace_id, SenderAccount.status == "ok", SenderAccount.pool == "sending").limit(1)):
+            raise HTTPException(409, "No connected sending mailbox yet. Add one under Sending accounts and test it first.")
         now = datetime.now(UTC)
         for e in await session.scalars(select(Enrollment).where(Enrollment.sequence_id == row.id, Enrollment.status == "active")):
             if e.next_run_at is None or e.next_run_at < now:

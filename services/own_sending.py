@@ -99,8 +99,9 @@ def needs_first_email(steps: list[SequenceStep]) -> bool:
 
 
 async def pick_sender(session: AsyncSession, workspace_id: UUID) -> SenderAccount | None:
-    """The connected mailbox with the most room: fewest active leads for its daily limit."""
-    senders = list(await session.scalars(select(SenderAccount).where(SenderAccount.workspace_id == workspace_id, SenderAccount.status == "ok")))
+    """The connected sending mailbox (never a warming one) with the most room: fewest active leads for its daily limit."""
+    senders = list(await session.scalars(select(SenderAccount).where(SenderAccount.workspace_id == workspace_id, SenderAccount.status == "ok",
+                                                                       SenderAccount.pool == "sending")))  # fmt: skip
     if not senders:
         return None
     load = dict((await session.execute(
@@ -295,7 +296,7 @@ async def send_due(
     today = now.date()
     vault = Vault(session)
     is_excluded = await ExclusionRepo(session).matcher()
-    accounts = list(await session.scalars(select(SenderAccount).where(SenderAccount.status == "ok")))
+    accounts = list(await session.scalars(select(SenderAccount).where(SenderAccount.status == "ok", SenderAccount.pool == "sending")))
     for account in accounts:
         if live and await _usage_today(session, account.id, today) >= account.daily_limit:
             continue

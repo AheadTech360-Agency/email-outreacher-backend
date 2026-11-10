@@ -170,3 +170,19 @@ async def own_read() -> dict:
         return {"read": summary.read, "recorded": summary.recorded, "failed": summary.failed}
     finally:
         await get_engine().dispose()
+
+
+async def own_warm() -> dict:
+    """One email-warmer tick: warming mailboxes send to each other, then open, rescue, star and reply to what they got
+    (services/warmup.py). Dry run unless OWN_WARMUP_LIVE. Fresh event loop each time."""
+    from services.warmup import warm_engage, warm_send
+
+    settings = get_settings()
+    try:
+        async with get_sessionmaker()() as session:
+            sent = await warm_send(session, live=settings.own_warmup_live, tick_minutes=max(1, settings.own_sending_tick_seconds // 60))
+            engaged = await warm_engage(session, live=settings.own_warmup_live)
+        return {"live": settings.own_warmup_live, "sent": sent.sent, "dry_run": sent.dry_run, "failed": sent.failed,
+                "opened": engaged.opened, "rescued": engaged.rescued, "replied": engaged.replied, "notes": sent.notes + engaged.notes}  # fmt: skip
+    finally:
+        await get_engine().dispose()

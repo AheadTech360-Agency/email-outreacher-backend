@@ -41,6 +41,11 @@ app.conf.update(
             "schedule": float(settings.own_sending_tick_seconds),
             "options": {"expires": float(settings.own_sending_tick_seconds)},
         },
+        "own-warm": {
+            "task": "coldbrew.own_warm",
+            "schedule": float(settings.own_sending_tick_seconds),
+            "options": {"expires": float(settings.own_sending_tick_seconds)},
+        },
         "own-read": {
             "task": "coldbrew.own_read",
             "schedule": float(settings.own_sending_tick_seconds),

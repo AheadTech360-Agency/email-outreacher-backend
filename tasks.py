@@ -111,3 +111,9 @@ def own_send() -> dict:
 def own_read() -> dict:
     """Coldbrew's own sending: replies, bounces and unsubscribes in each mailbox (jobs.own_read)."""
     return _locked("read", jobs.own_read)
+
+
+@app.task(name="coldbrew.own_warm", acks_late=False)
+def own_warm() -> dict:
+    """The email warmer (jobs.own_warm). Dry run unless OWN_WARMUP_LIVE."""
+    return _locked("warm", jobs.own_warm)

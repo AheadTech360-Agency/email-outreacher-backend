@@ -973,6 +973,9 @@ class SenderAccount(Base):
         CheckConstraint(f"imap_security is null or {_in('imap_security', SECURITY)}", name="imap_security"),
         CheckConstraint(_in("status", SENDER_STATUSES), name="status"),
         CheckConstraint("daily_limit between 1 and 500", name="daily_limit"),
+        CheckConstraint(_in("pool", ("sending", "warming")), name="pool"),
+        CheckConstraint("warmup_daily_target between 1 and 100", name="warmup_daily_target"),
+        CheckConstraint("warmup_reply_percent between 0 and 100", name="warmup_reply_percent"),
         UniqueConstraint("workspace_id", "from_email"),
     )
     id: Mapped[UUID] = _uuid_pk()
@@ -994,6 +997,11 @@ class SenderAccount(Base):
     imap_username: Mapped[str | None] = mapped_column(Text, default=None)
     imap_secret_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
     daily_limit: Mapped[int] = mapped_column(Integer, server_default="30")
+    # sending: campaigns send from it. warming: it only trades warm-up emails with the other warming mailboxes.
+    pool: Mapped[str] = mapped_column(Text, server_default="sending")
+    warmup_daily_target: Mapped[int] = mapped_column(SmallInteger, server_default="10")
+    warmup_reply_percent: Mapped[int] = mapped_column(SmallInteger, server_default="30")
+    warmup_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     status: Mapped[str] = mapped_column(Text, server_default="untested")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
@@ -1111,3 +1119,31 @@ class InboundEvent(Base):
     raw: Mapped[dict | None] = mapped_column(JSONB, default=None)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
+
+
+class WarmupMessage(Base):
+    """One warm-up email between two warming mailboxes, and what the receiving one did with it (migration 0037)."""
+
+    __tablename__ = "eo_warmup_messages"
+    __table_args__ = (
+        CheckConstraint(_in("status", ("sent", "dry_run", "failed")), name="status"),
+        CheckConstraint("landed_in is null or landed_in in ('inbox', 'spam')", name="landed_in"),
+        UniqueConstraint("message_id"),
+        Index("eo_warmup_messages_from_idx", "from_account_id", "sent_at"),
+        Index("eo_warmup_messages_to_idx", "to_account_id", "sent_at"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    from_account_id: Mapped[UUID] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="CASCADE"))
+    to_account_id: Mapped[UUID] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="CASCADE"))
+    message_id: Mapped[str] = mapped_column(Text)
+    reply_to_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_warmup_messages.id", ondelete="SET NULL"), default=None)
+    subject: Mapped[str] = mapped_column(Text, server_default="")
+    status: Mapped[str] = mapped_column(Text, server_default="sent")
+    sent_at: Mapped[datetime] = _created()
+    landed_in: Mapped[str | None] = mapped_column(Text, default=None)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    starred: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    rescued_from_spam: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
