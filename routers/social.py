@@ -4,7 +4,7 @@ and disconnecting is for Management and admins. Nothing here messages anyone.
 """
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import get_settings
 from database import get_session
 from dependencies import require_manager, require_workspace_id
-from models import SenderAccount, SocialAccount
+from models import SenderAccount, SocialAccount, SocialConnect
 from schemas import ApiModel
 from services.auth import CurrentUser
 from services.unipile import Account, UnipileClient, UnipileError, notify_token
@@ -76,14 +76,33 @@ async def _outs(session: AsyncSession, rows: list[SocialAccount]) -> list[Social
                       sender_email=emails.get(r.sender_account_id), last_synced_at=r.last_synced_at, created_at=r.created_at) for r in rows]  # fmt: skip
 
 
-async def upsert(session: AsyncSession, workspace_id: UUID, account: Account, now: datetime) -> SocialAccount:
-    """Keep Unipile's account: update the one we have (in whichever workspace it was connected), or add it here."""
+async def upsert(session: AsyncSession, workspace_id: UUID, account: Account, now: datetime) -> SocialAccount | None:
+    """Keep Unipile's account: refresh it, or add it to this workspace when it's new. An account another workspace
+    already has stays there, untouched (None)."""
     row = await session.scalar(select(SocialAccount).where(SocialAccount.unipile_account_id == account.id))
+    if row is not None and row.workspace_id != workspace_id:
+        return None
     if row is None:
         row = SocialAccount(workspace_id=workspace_id, provider=account.provider, unipile_account_id=account.id)
         session.add(row)
     row.name, row.username, row.status, row.last_synced_at = account.name, account.username, account.status, now
     return row
+
+
+# How long a started sign-in lets Sync adopt the new account it makes.
+CONNECT_WINDOW = timedelta(hours=1)
+
+
+async def _claimable(session: AsyncSession, workspace_id: UUID, provider: str, now: datetime, admin: bool) -> SocialConnect | None | bool:
+    """Whether Sync may add a new, unclaimed account to this workspace: an admin may (they open every workspace),
+    anyone else only when this workspace is the one sign-in for that network started in the last hour (two
+    workspaces at once: neither guesses, the signed Unipile callback settles it). The pending sign-in, or True."""
+    pending = list(await session.scalars(select(SocialConnect).where(SocialConnect.provider == provider,
+                                                                     SocialConnect.started_at >= now - CONNECT_WINDOW)))  # fmt: skip
+    mine = [p for p in pending if p.workspace_id == workspace_id]
+    if mine and len({p.workspace_id for p in pending}) == 1:
+        return mine[0]
+    return True if admin else None
 
 
 def _return_url(raw: str | None) -> str | None:
@@ -112,16 +131,19 @@ async def list_social(workspace_id: UUID = Depends(require_workspace_id), sessio
 
 @router.post("/social-accounts/connect", response_model=LinkOut)
 async def connect(body: ConnectIn, workspace_id: UUID = Depends(require_workspace_id), _user: CurrentUser = Depends(require_manager),
-                  unipile: UnipileClient | None = Depends(get_unipile)):  # fmt: skip
+                  session: AsyncSession = Depends(get_session), unipile: UnipileClient | None = Depends(get_unipile)):  # fmt: skip
     """A Unipile sign-in page for a new LinkedIn or Instagram account. Opened in a new tab; the account shows here once
     Unipile reports it (or after Sync)."""
     if unipile is None:
         raise HTTPException(503, NOT_SET)
     name = f"{workspace_id}:{body.provider}"
     try:
-        return LinkOut(url=await unipile.sign_in_link(body.provider, name, _notify_url(name), _return_url(body.return_url)))
+        url = await unipile.sign_in_link(body.provider, name, _notify_url(name), _return_url(body.return_url))
     except UnipileError as exc:
         raise HTTPException(502, exc.message) from exc
+    session.add(SocialConnect(workspace_id=workspace_id, provider=body.provider))
+    await session.commit()
+    return LinkOut(url=url)
 
 
 @router.post("/social-accounts/{social_id}/reconnect", response_model=LinkOut)
@@ -140,10 +162,11 @@ async def reconnect(social_id: UUID, return_url: str | None = Query(default=None
 
 
 @router.post("/social-accounts/sync", response_model=SocialListOut)
-async def sync(workspace_id: UUID = Depends(require_workspace_id), _user: CurrentUser = Depends(require_manager),
+async def sync(workspace_id: UUID = Depends(require_workspace_id), user: CurrentUser = Depends(require_manager),
                session: AsyncSession = Depends(get_session), unipile: UnipileClient | None = Depends(get_unipile)):  # fmt: skip
-    """Read every LinkedIn and Instagram account from Unipile: statuses are refreshed, and any not here yet is added to
-    this workspace. Free (a read)."""
+    """Read every LinkedIn and Instagram account from Unipile and refresh this workspace's. A new one is added here
+    only when this workspace started its sign-in (or an admin syncs); accounts in other workspaces are left alone.
+    Free (a read)."""
     if unipile is None:
         raise HTTPException(503, NOT_SET)
     try:
@@ -151,7 +174,15 @@ async def sync(workspace_id: UUID = Depends(require_workspace_id), _user: Curren
     except UnipileError as exc:
         raise HTTPException(502, exc.message) from exc
     now = datetime.now(UTC)
+    known = set(await session.scalars(select(SocialAccount.unipile_account_id).where(SocialAccount.unipile_account_id.in_([a.id for a in accounts]))))
     for account in accounts:
+        if account.id not in known:
+            claim = await _claimable(session, workspace_id, account.provider, now, user.role == "admin")
+            if claim is None:
+                continue
+            if isinstance(claim, SocialConnect):
+                await session.delete(claim)  # one sign-in, one account
+                await session.flush()
         await upsert(session, workspace_id, account, now)
     await session.commit()
     return await list_social(workspace_id, session)

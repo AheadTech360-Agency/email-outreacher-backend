@@ -1202,3 +1202,15 @@ class SocialAccount(Base):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
+
+
+class SocialConnect(Base):
+    """A Unipile sign-in started from a workspace (migration 0038). Sync adopts a new account only for the workspace
+    that asked for one, so no workspace can pick up an account another one is connecting."""
+
+    __tablename__ = "eo_social_connects"
+    __table_args__ = (CheckConstraint(_in("provider", ("linkedin", "instagram")), name="provider"),)
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    provider: Mapped[str] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

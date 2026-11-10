@@ -62,7 +62,13 @@ async def unipile(request: Request, token: str = "", session=Depends(get_session
         await client.aclose()
     if account is None:
         return {"status": "ignored"}  # not LinkedIn or Instagram
-    await upsert(session, workspace_id, account, datetime.now(UTC))
+    from sqlalchemy import delete
+
+    from models import SocialConnect
+
+    if await upsert(session, workspace_id, account, datetime.now(UTC)) is not None:
+        # This sign-in is settled: it can't make Sync adopt some other account later.
+        await session.execute(delete(SocialConnect).where(SocialConnect.workspace_id == workspace_id, SocialConnect.provider == account.provider))
     await session.commit()
     return {"status": "recorded"}
 

@@ -36,7 +36,19 @@ def upgrade():
     )  # fmt: skip
     op.create_index("eo_social_accounts_workspace_id_idx", "eo_social_accounts", ["workspace_id"], schema=S)
     op.create_index("eo_social_accounts_sender_account_id_idx", "eo_social_accounts", ["sender_account_id"], schema=S)
+    # A sign-in someone started from a workspace: Sync only adopts a new account for the workspace that asked for it.
+    op.create_table(
+        "eo_social_connects",
+        sa.Column("id", sa.Uuid(), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column("workspace_id", sa.Uuid(), sa.ForeignKey(f"{S}.eo_workspaces.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("provider", sa.Text(), nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.CheckConstraint("provider in ('linkedin', 'instagram')", name="eo_social_connects_provider_check"),
+        schema=S,
+    )  # fmt: skip
+    op.create_index("eo_social_connects_provider_idx", "eo_social_connects", ["provider", "started_at"], schema=S)
 
 
 def downgrade():
+    op.drop_table("eo_social_connects", schema=S)
     op.drop_table("eo_social_accounts", schema=S)
