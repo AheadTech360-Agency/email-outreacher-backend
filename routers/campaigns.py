@@ -23,7 +23,7 @@ from schemas import ApiModel
 from services.auth import CurrentUser
 from services.generation import EmailWriter
 from services.own_mail import FOLLOW_UP_STEPS, VARIABLES, MissingValue, clean_schedule, next_send_time, render, reply_subject, unknown_variables
-from services.own_sending import coldbrew_writer, enroll, stored_follow_up
+from services.own_sending import coldbrew_writer, enroll, ensure_icp_campaigns, stored_follow_up
 
 router = APIRouter(tags=["own sending"])
 
@@ -89,6 +89,9 @@ class Stats(ApiModel):
 class CampaignOut(ApiModel):
     id: UUID
     name: str
+    # The ICP this is the campaign of (one per ICP, made for every enabled ICP), or None for one made by hand.
+    icp_id: UUID | None = None
+    icp_name: str | None = None
     status: str
     schedule: dict
     steps: list[StepOut]
@@ -226,14 +229,19 @@ async def _stats(session: AsyncSession, ids: list[UUID]) -> dict[UUID, Stats]:
     return out
 
 
-async def _out(session: AsyncSession, rows: list[Sequence]) -> list[CampaignOut]:
+async def _icp_names(lead_intel: LeadIntelRepo) -> dict[UUID, str]:
+    return {i["id"]: i["name"] for i in await lead_intel.icp_names()}
+
+
+async def _out(session: AsyncSession, rows: list[Sequence], icp_names: dict[UUID, str] | None = None) -> list[CampaignOut]:
+    icp_names = icp_names or {}
     ids = [r.id for r in rows]
     stats = await _stats(session, ids)
     steps: dict[UUID, list[SequenceStep]] = {i: [] for i in ids}
     for s in (await session.scalars(select(SequenceStep).where(SequenceStep.sequence_id.in_(ids)).order_by(SequenceStep.step_order))) if ids else []:
         steps[s.sequence_id].append(s)
     return [
-        CampaignOut(id=r.id, name=r.name, status=r.status, schedule=r.schedule, stats=stats[r.id], created_at=r.created_at, updated_at=r.updated_at,
+        CampaignOut(id=r.id, name=r.name, icp_id=r.lead_intel_icp_id, icp_name=icp_names.get(r.lead_intel_icp_id), status=r.status, schedule=r.schedule, stats=stats[r.id], created_at=r.created_at, updated_at=r.updated_at,
                     steps=[StepOut(id=s.id, step_order=s.step_order, delay_days=s.delay_days, thread_mode=s.thread_mode, subject=s.subject, body=s.body)
                            for s in steps[r.id]])  # fmt: skip
         for r in rows
@@ -250,14 +258,22 @@ async def sending_status():
 
 
 @router.get("/campaigns", response_model=list[CampaignOut])
-async def list_campaigns(workspace_id: UUID = Depends(require_workspace_id), session: AsyncSession = Depends(get_session)):
+async def list_campaigns(workspace_id: UUID = Depends(require_workspace_id), session: AsyncSession = Depends(get_session),
+                         lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo)):  # fmt: skip
+    """The workspace's campaigns: one for every enabled ICP (any missing is made now, as a draft), then the ones made
+    by hand. ICP campaigns come first, in the ICPs' order."""
+    icps = await lead_intel.icp_names()
+    await ensure_icp_campaigns(session, workspace_id, icps)
+    order = {i["id"]: n for n, i in enumerate(icps)}
     rows = list(await session.scalars(select(Sequence).where(Sequence.workspace_id == workspace_id).order_by(Sequence.created_at.desc())))
-    return await _out(session, rows)
+    rows.sort(key=lambda r: (r.lead_intel_icp_id is None, order.get(r.lead_intel_icp_id, len(order))))
+    return await _out(session, rows, {i["id"]: i["name"] for i in icps})
 
 
 @router.get("/campaigns/{campaign_id}", response_model=CampaignOut)
-async def get_campaign(campaign_id: UUID, workspace_id: UUID = Depends(require_workspace_id), session: AsyncSession = Depends(get_session)):
-    return (await _out(session, [await _campaign(session, workspace_id, campaign_id)]))[0]
+async def get_campaign(campaign_id: UUID, workspace_id: UUID = Depends(require_workspace_id), session: AsyncSession = Depends(get_session),
+                       lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo)):  # fmt: skip
+    return (await _out(session, [await _campaign(session, workspace_id, campaign_id)], await _icp_names(lead_intel)))[0]
 
 
 @router.post("/campaigns", response_model=CampaignOut, status_code=201)
@@ -278,7 +294,8 @@ async def add_campaign(body: CampaignIn, workspace_id: UUID = Depends(require_wo
 
 @router.put("/campaigns/{campaign_id}", response_model=CampaignOut)
 async def edit_campaign(campaign_id: UUID, body: CampaignIn, workspace_id: UUID = Depends(require_workspace_id),
-                        _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session)):  # fmt: skip
+                        _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session),
+                        lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo)):  # fmt: skip
     """Name, window and steps. Steps already sent stay as they went; leads part-way through carry on with the new text
     from their next step. A step can't be removed once a lead has received it."""
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
@@ -299,12 +316,13 @@ async def edit_campaign(campaign_id: UUID, body: CampaignIn, workspace_id: UUID 
         await session.delete(s)
     await session.commit()
     await session.refresh(row)
-    return (await _out(session, [row]))[0]
+    return (await _out(session, [row], await _icp_names(lead_intel)))[0]
 
 
 @router.patch("/campaigns/{campaign_id}/status", response_model=CampaignOut)
 async def set_status(campaign_id: UUID, body: StatusIn, workspace_id: UUID = Depends(require_workspace_id),
-                     _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session)):  # fmt: skip
+                     _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session),
+                     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo)):  # fmt: skip
     """Start (active), pause, or archive. Starting needs a connected mailbox; each lead's next email is timed again
     inside the window."""
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
@@ -318,7 +336,7 @@ async def set_status(campaign_id: UUID, body: StatusIn, workspace_id: UUID = Dep
     row.status = body.status
     await session.commit()
     await session.refresh(row)
-    return (await _out(session, [row]))[0]
+    return (await _out(session, [row], await _icp_names(lead_intel)))[0]
 
 
 @router.delete("/campaigns/{campaign_id}", status_code=204)
@@ -326,6 +344,8 @@ async def delete_campaign(campaign_id: UUID, workspace_id: UUID = Depends(requir
                           _user: CurrentUser = Depends(require_manager), session: AsyncSession = Depends(get_session)):  # fmt: skip
     """Only one that has sent nothing: its leads are freed to be added elsewhere. Archive a campaign that has sent."""
     row = await _campaign(session, workspace_id, campaign_id, lock=True)
+    if row.lead_intel_icp_id is not None:
+        raise HTTPException(409, "Every ICP keeps its campaign, so it can't be deleted. Archive it to stop it for good.")
     sent = await session.scalar(select(StepRun.id).join(Enrollment, Enrollment.id == StepRun.enrollment_id)
                                 .where(Enrollment.sequence_id == row.id, StepRun.status == "sent").limit(1))  # fmt: skip
     if sent is not None:
@@ -357,16 +377,20 @@ async def _release(session: AsyncSession, campaign_id: UUID, lead_ids: list[UUID
 
 @router.get("/campaigns/{campaign_id}/candidates", response_model=list[CandidateOut])
 async def candidates(campaign_id: UUID, q: str = Query(default="", max_length=200), approved_only: bool = Query(default=True, alias="approvedOnly"),
+                     icp_only: bool = Query(default=True, alias="icpOnly"),
                      workspace_id: UUID = Depends(require_workspace_id), session: AsyncSession = Depends(get_session)):  # fmt: skip
     """Leads that could be added: an email address, not in a running campaign, never queued. With approvedOnly, only
-    those with an approved Coldbrew first email (what step 1's {{email1Body}} sends)."""
-    await _campaign(session, workspace_id, campaign_id)
+    those with an approved Coldbrew first email (what step 1's {{email1Body}} sends). With icpOnly, an ICP's campaign
+    offers that ICP's leads."""
+    campaign = await _campaign(session, workspace_id, campaign_id)
     running = select(Enrollment.lead_id).where(Enrollment.status.in_(("active", "paused")))
     approved = select(Email.lead_id).where(Email.step == 1, Email.status == "approved")
     query = select(Lead).where(Lead.workspace_id == workspace_id, Lead.email.is_not(None), Lead.email != "",
                                Lead.id.not_in(running), func.lower(Lead.email).not_in(select(QueuedAddress.email)))  # fmt: skip
     if approved_only:
         query = query.where(Lead.id.in_(approved))
+    if icp_only and campaign.lead_intel_icp_id is not None:
+        query = query.where(Lead.lead_intel_icp_id == campaign.lead_intel_icp_id)
     if q.strip():
         like = f"%{q.strip()}%"
         query = query.where(or_(func.concat(Lead.first_name, " ", Lead.last_name).ilike(like), Lead.email.ilike(like), Lead.company.ilike(like)))

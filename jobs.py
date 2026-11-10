@@ -134,7 +134,8 @@ async def settle_apify_costs() -> dict[str, int]:
 
 async def own_send() -> dict:
     """One scheduler tick across every workspace: dry run unless OWN_SENDING_LIVE is on. Fresh event loop each time."""
-    from services.own_sending import coldbrew_writer, send_due
+    from models import Workspace
+    from services.own_sending import coldbrew_writer, ensure_icp_campaigns, send_due
 
     settings = get_settings()
     writer = EmailWriter(settings.anthropic_api_key, base_url=settings.anthropic_base_url) if settings.anthropic_api_key else None
@@ -142,7 +143,12 @@ async def own_send() -> dict:
         async with get_sessionmaker()() as session, get_engine().connect() as conn:
             await conn.execution_options(postgresql_readonly=True)  # Lead Intel is only ever read
             try:
-                write = coldbrew_writer(writer, LeadIntelRepo(conn)) if writer else None
+                lead_intel = LeadIntelRepo(conn)
+                # Every enabled ICP keeps a campaign in every workspace, whether or not anyone opens the dashboard.
+                icps = await lead_intel.icp_names()
+                for workspace_id in await session.scalars(select(Workspace.id)):
+                    await ensure_icp_campaigns(session, workspace_id, icps)
+                write = coldbrew_writer(writer, lead_intel) if writer else None
                 summary = await send_due(session, live=settings.own_sending_live, write_follow_up=write)
             finally:
                 await conn.rollback()

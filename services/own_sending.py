@@ -47,6 +47,41 @@ READ_DAYS = 3  # how far back each inbox read looks (each email is stored once, 
 READ_LIMIT = 300  # emails read per folder per tick
 
 
+# ---------- One campaign per ICP ----------
+
+# A new ICP campaign: the email Coldbrew wrote and approved, then two follow-ups Coldbrew writes for each lead.
+ICP_CAMPAIGN_STEPS = [
+    {"step_order": 1, "delay_days": 0, "thread_mode": "new", "subject": "{{email1Subject}}", "body": "{{email1Body}}"},
+    {"step_order": 2, "delay_days": 2, "thread_mode": "reply", "subject": "", "body": "{{followUp}}"},
+    {"step_order": 3, "delay_days": 3, "thread_mode": "reply", "subject": "", "body": "{{followUp}}"},
+]
+
+
+async def ensure_icp_campaigns(session: AsyncSession, workspace_id: UUID, icps: list[dict[str, Any]]) -> int:
+    """Every enabled ICP has a campaign in this workspace, like CheapSequencer's "Coldbrew: <ICP name>" ones: any
+    missing is made, as a draft (nothing starts on its own). Matched by the ICP's id, so renaming either keeps them
+    together. Returns how many were made. Serialised per workspace, so two pages loading at once never make two."""
+    from sqlalchemy import text
+
+    from services.own_mail import DEFAULT_SCHEDULE
+
+    await session.execute(text("select pg_advisory_xact_lock(hashtext(:key))"), {"key": f"coldbrew:icp-campaigns:{workspace_id}"})
+    have = set(await session.scalars(select(Sequence.lead_intel_icp_id).where(Sequence.workspace_id == workspace_id,
+                                                                               Sequence.lead_intel_icp_id.is_not(None))))  # fmt: skip
+    made = 0
+    for icp in icps:
+        if not icp.get("enabled", True) or icp["id"] in have:
+            continue
+        row = Sequence(workspace_id=workspace_id, name=(icp.get("name") or "ICP").strip(), status="draft",
+                       lead_intel_icp_id=icp["id"], schedule=dict(DEFAULT_SCHEDULE))  # fmt: skip
+        session.add(row)
+        await session.flush()
+        session.add_all([SequenceStep(sequence_id=row.id, **step) for step in ICP_CAMPAIGN_STEPS])
+        made += 1
+    await session.commit()
+    return made
+
+
 # ---------- Putting leads in ----------
 
 

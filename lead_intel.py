@@ -119,6 +119,11 @@ class LeadIntelRepo:
     def __init__(self, conn: AsyncConnection) -> None:
         self.conn = conn
 
+    async def icp_names(self) -> list[dict[str, Any]]:
+        """Every ICP's id, name and whether it's enabled, without the company counts list_icps adds."""
+        query = select(icps.c.id, icps.c.name, icps.c.enabled).order_by(icps.c.priority, icps.c.created_at)
+        return [dict(row) for row in (await self.conn.execute(query)).mappings()]
+
     async def list_icps(self) -> list[dict[str, Any]]:
         counts = (
             select(businesses.c.icp_id, func.count().label("company_count"))
