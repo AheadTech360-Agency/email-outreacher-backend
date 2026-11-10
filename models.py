@@ -16,6 +16,7 @@ from sqlalchemy import (
     ARRAY,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -937,4 +938,176 @@ class AnalysisReport(Base):
     range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     filters: Mapped[dict] = mapped_column(JSONB)
     payload: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = _created()
+
+
+# ---------- Coldbrew's own sending (replacing CheapSequencer step by step; migration 0036) ----------
+
+
+class Persona(Base):
+    """Who an email is from: the display name and signature a reader sees."""
+
+    __tablename__ = "eo_personas"
+    __table_args__ = (UniqueConstraint("workspace_id", "name"),)
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    name: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(Text, server_default="")
+    signature: Mapped[str] = mapped_column(Text, server_default="")
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+SECURITY = ("ssl", "starttls")
+SENDER_STATUSES = ("untested", "ok", "failed", "paused")
+
+
+class SenderAccount(Base):
+    """A mailbox Coldbrew sends from and reads replies in. Its passwords are in Supabase Vault (services/vault.py);
+    only the secret ids are here, and neither ever leaves the server."""
+
+    __tablename__ = "eo_sender_accounts"
+    __table_args__ = (
+        CheckConstraint("channel in ('email')", name="channel"),
+        CheckConstraint(_in("smtp_security", SECURITY), name="smtp_security"),
+        CheckConstraint(f"imap_security is null or {_in('imap_security', SECURITY)}", name="imap_security"),
+        CheckConstraint(_in("status", SENDER_STATUSES), name="status"),
+        CheckConstraint("daily_limit between 1 and 500", name="daily_limit"),
+        UniqueConstraint("workspace_id", "from_email"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    persona_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_personas.id", ondelete="SET NULL"), default=None)
+    channel: Mapped[str] = mapped_column(Text, server_default="email")
+    label: Mapped[str] = mapped_column(Text, server_default="")
+    from_name: Mapped[str] = mapped_column(Text, server_default="")
+    from_email: Mapped[str] = mapped_column(Text)
+    provider: Mapped[str] = mapped_column(Text, server_default="custom")
+    smtp_host: Mapped[str] = mapped_column(Text)
+    smtp_port: Mapped[int] = mapped_column(Integer)
+    smtp_security: Mapped[str] = mapped_column(Text)
+    smtp_username: Mapped[str] = mapped_column(Text)
+    smtp_secret_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
+    imap_host: Mapped[str | None] = mapped_column(Text, default=None)
+    imap_port: Mapped[int | None] = mapped_column(Integer, default=None)
+    imap_security: Mapped[str | None] = mapped_column(Text, default=None)
+    imap_username: Mapped[str | None] = mapped_column(Text, default=None)
+    imap_secret_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
+    daily_limit: Mapped[int] = mapped_column(Integer, server_default="30")
+    status: Mapped[str] = mapped_column(Text, server_default="untested")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_by: Mapped[UUID | None] = _user_ref()
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class SenderUsage(Base):
+    """How many an account sent on a day, so its daily limit holds across restarts."""
+
+    __tablename__ = "eo_sender_usage"
+    sender_account_id: Mapped[UUID] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="CASCADE"), primary_key=True)
+    day: Mapped[Any] = mapped_column(Date, primary_key=True)
+    sent: Mapped[int] = mapped_column(Integer, server_default="0")
+
+
+class Sequence(Base):
+    """A campaign: its steps, sending window and status."""
+
+    __tablename__ = "eo_sequences"
+    __table_args__ = (CheckConstraint(_in("status", ("draft", "active", "paused", "archived")), name="status"),)
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    name: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default="draft")
+    lead_intel_icp_id: Mapped[UUID | None] = mapped_column(Uuid, default=None)
+    schedule: Mapped[dict] = mapped_column(JSONB)
+    created_by: Mapped[UUID | None] = _user_ref()
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class SequenceStep(Base):
+    __tablename__ = "eo_sequence_steps"
+    __table_args__ = (
+        CheckConstraint(_in("thread_mode", ("new", "reply")), name="thread_mode"),
+        CheckConstraint("delay_days between 0 and 90", name="delay_days"),
+        UniqueConstraint("sequence_id", "step_order"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    sequence_id: Mapped[UUID] = mapped_column(ForeignKey("eo_sequences.id", ondelete="CASCADE"))
+    step_order: Mapped[int] = mapped_column(SmallInteger)
+    delay_days: Mapped[int] = mapped_column(SmallInteger, server_default="0")
+    thread_mode: Mapped[str] = mapped_column(Text, server_default="reply")
+    subject: Mapped[str] = mapped_column(Text, server_default="")
+    body: Mapped[str] = mapped_column(Text, server_default="")
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class Enrollment(Base):
+    """A lead in a sequence: the account that sends to them, the next step and when, and why it stopped."""
+
+    __tablename__ = "eo_enrollments"
+    __table_args__ = (
+        CheckConstraint(_in("status", ("active", "paused", "completed", "stopped")), name="status"),
+        UniqueConstraint("sequence_id", "lead_id"),
+        Index("eo_enrollments_due_idx", "status", "next_run_at"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    sequence_id: Mapped[UUID] = mapped_column(ForeignKey("eo_sequences.id", ondelete="CASCADE"))
+    lead_id: Mapped[UUID] = mapped_column(ForeignKey("eo_leads.id", ondelete="CASCADE"), index=True)
+    sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None)
+    email_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_emails.id", ondelete="SET NULL"), default=None)
+    status: Mapped[str] = mapped_column(Text, server_default="active")
+    stop_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    next_step_order: Mapped[int] = mapped_column(SmallInteger, server_default="1")
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    thread_message_id: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = _created()
+    updated_at: Mapped[datetime] = _updated()
+
+
+class StepRun(Base):
+    """One attempt to send a step: sent (with its Message-ID), failed, skipped, or a dry run that only logged."""
+
+    __tablename__ = "eo_step_runs"
+    __table_args__ = (CheckConstraint(_in("status", ("sent", "failed", "skipped", "dry_run")), name="status"),)
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    enrollment_id: Mapped[UUID] = mapped_column(ForeignKey("eo_enrollments.id", ondelete="CASCADE"), index=True)
+    step_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sequence_steps.id", ondelete="SET NULL"), default=None)
+    sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None)
+    status: Mapped[str] = mapped_column(Text)
+    message_id: Mapped[str | None] = mapped_column(Text, default=None, index=True)
+    subject: Mapped[str] = mapped_column(Text, server_default="")
+    body: Mapped[str] = mapped_column(Text, server_default="")
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    ran_at: Mapped[datetime] = _created()
+
+
+class InboundEvent(Base):
+    """A reply, bounce, unsubscribe or auto-reply the inbox reader found. A database trigger stops every enrollment
+    of the lead on a reply, bounce or unsubscribe (migration 0036)."""
+
+    __tablename__ = "eo_inbound_events"
+    __table_args__ = (
+        CheckConstraint(_in("type", ("reply", "bounce", "unsubscribe", "auto_reply")), name="type"),
+        UniqueConstraint("sender_account_id", "message_id"),
+    )
+    id: Mapped[UUID] = _uuid_pk()
+    workspace_id: Mapped[UUID] = _workspace()
+    sender_account_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_sender_accounts.id", ondelete="SET NULL"), default=None)
+    enrollment_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_enrollments.id", ondelete="SET NULL"), default=None)
+    lead_id: Mapped[UUID | None] = mapped_column(ForeignKey("eo_leads.id", ondelete="SET NULL"), default=None, index=True)
+    type: Mapped[str] = mapped_column(Text)
+    message_id: Mapped[str] = mapped_column(Text)
+    in_reply_to: Mapped[str | None] = mapped_column(Text, default=None)
+    from_email: Mapped[str] = mapped_column(Text, server_default="")
+    subject: Mapped[str] = mapped_column(Text, server_default="")
+    snippet: Mapped[str] = mapped_column(Text, server_default="")
+    folder: Mapped[str] = mapped_column(Text, server_default="INBOX")
+    raw: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created()
