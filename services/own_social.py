@@ -310,7 +310,7 @@ async def send_social_due(
             continue
         if hit := is_excluded(person_keys(lead.email, lead.domain)):
             enrollment.status, enrollment.stop_reason, enrollment.next_run_at = "stopped", "do_not_contact", None
-            session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id,
+            session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, ran_at=now,
                                 action=step.action, status="skipped", error=exclusion_note(hit)))  # fmt: skip
             out.skipped += 1
             await session.commit()
@@ -349,7 +349,7 @@ async def send_social_due(
             body = render(step.body, values).strip()
         except MissingValue as missing:
             enrollment.status, enrollment.next_run_at = "paused", None
-            session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, action=step.action,
+            session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, ran_at=now, action=step.action,
                                 status="skipped", error=f"Step {step.step_order} uses {{{{{missing.name}}}}}, which is empty for this lead. Add a fallback like {{{{{missing.name}|...}}}}."))  # fmt: skip
             out.skipped += 1
             await session.commit()
@@ -358,7 +358,7 @@ async def send_social_due(
         if not live:
             logged = await session.scalar(select(StepRun.id).where(StepRun.enrollment_id == enrollment.id, StepRun.step_id == step.id, StepRun.status == "dry_run"))
             if logged is None:
-                session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id,
+                session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, ran_at=now,
                                     action=step.action, status="dry_run", body=body))  # fmt: skip
                 out.dry_run += 1
             enrollment.next_run_at = next_send_time(sequence.schedule, now + timedelta(hours=1), rng)
@@ -378,7 +378,7 @@ async def send_social_due(
         except UnipileError as exc:
             if exc.status == 404 and enrollment.provider_id is None:
                 enrollment.status, enrollment.stop_reason, enrollment.next_run_at = "stopped", "no_profile", None
-                session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id,
+                session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, ran_at=now,
                                     action=step.action, status="failed", body=body, error=f"Their profile wasn't found: {exc.message}"))  # fmt: skip
                 out.failed += 1
                 await session.commit()
@@ -395,7 +395,7 @@ async def send_social_due(
                 out.skipped += 1
                 await session.commit()
                 continue
-            session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id,
+            session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, ran_at=now,
                                 action=step.action, status="failed", body=body, error=exc.message))  # fmt: skip
             failures = int(await session.scalar(select(func.count()).select_from(StepRun).where(
                 StepRun.enrollment_id == enrollment.id, StepRun.step_id == step.id, StepRun.status == "failed")) or 0) + 1  # fmt: skip
@@ -407,7 +407,7 @@ async def send_social_due(
             await session.commit()
             continue
 
-        session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id,
+        session.add(StepRun(workspace_id=enrollment.workspace_id, enrollment_id=enrollment.id, step_id=step.id, social_account_id=account.id, ran_at=now,
                             action=step.action, status="sent", message_id=message_id, body=body))  # fmt: skip
         following = await session.scalar(select(SequenceStep).where(SequenceStep.sequence_id == sequence.id, SequenceStep.step_order > step.step_order)
                                          .order_by(SequenceStep.step_order).limit(1))  # fmt: skip
