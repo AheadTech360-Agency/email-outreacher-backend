@@ -54,6 +54,7 @@ from schemas import (
     RereadResult,
     FindCompaniesIn,
     FindCompaniesResult,
+    PipelineCompanyListOut,
     PipelineCompanyOut,
     PipelineStakeholdersIn,
     ResearchIn,
@@ -89,14 +90,14 @@ async def _workspace(companies: CompanyRepo, workspace_id: UUID) -> None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
-@router.get("/companies", response_model=list[PipelineCompanyOut])
+@router.get("/companies", response_model=list[PipelineCompanyListOut])
 async def list_companies(
     icp_id: UUID | None = Query(default=None, alias="icpId"),
     status: str | None = Query(default=None, pattern="^(found|review|qualified|not_fit|error)$"),
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
-) -> list[PipelineCompanyOut]:
-    return [PipelineCompanyOut.model_validate(c) for c in await companies.list(workspace_id, icp_id, status)]
+) -> list[PipelineCompanyListOut]:
+    return [PipelineCompanyListOut.model_validate(c) for c in await companies.list(workspace_id, icp_id, status, light=True)]
 
 
 @router.get("/companies.csv", response_class=Response)

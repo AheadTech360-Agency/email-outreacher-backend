@@ -53,6 +53,7 @@ from schemas import (
     AddAsLeadsIn,
     EmailLeadOut,
     EmailOut,
+    Page,
     EmailPointOut,
     EmailPostOut,
     EmailUpdateIn,
@@ -463,16 +464,53 @@ async def _out(emails: EmailRepo, rows: list[tuple[Email, Lead]], feedback: Feed
     return out
 
 
+STATUSES = "^(draft|edited|approved|queued|sent|skipped)(,(draft|edited|approved|queued|sent|skipped))*$"
+ICP = "^(none|[0-9a-fA-F-]{36})$"
+
+
 @router.get("", response_model=list[EmailOut])
 async def list_emails(
     status: str | None = Query(default=None, pattern="^(draft|edited|approved|queued|sent|skipped)$"),
+    statuses: str | None = Query(default=None, pattern=STATUSES, description="Comma-separated statuses"),
     lead_id: UUID | None = Query(default=None, alias="leadId"),
+    icp_id: str | None = Query(default=None, alias="icpId", pattern=ICP),
     workspace_id: UUID = Depends(require_workspace_id),
     emails: EmailRepo = Depends(get_email_repo),
     feedback: FeedbackRepo = Depends(get_feedback_repo),
 ) -> list[EmailOut]:
-    """Every generated email, with its rating if it has one."""
-    return await _out(emails, await emails.list(workspace_id, status, lead_id), feedback)
+    """Generated first emails, with their ratings, newest first. Narrow it (statuses, a lead, an ICP): every email
+    read is database egress."""
+    rows = await emails.list(workspace_id, status, lead_id, statuses=statuses.split(",") if statuses else None, icp_id=icp_id)
+    return await _out(emails, rows, feedback)
+
+
+@router.get("/page", response_model=Page[EmailOut])
+async def page_emails(
+    statuses: str | None = Query(default=None, pattern=STATUSES, description="Comma-separated statuses"),
+    lead_id: UUID | None = Query(default=None, alias="leadId"),
+    icp_id: str | None = Query(default=None, alias="icpId", pattern=ICP),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+    feedback: FeedbackRepo = Depends(get_feedback_repo),
+) -> Page[EmailOut]:
+    """One page of first emails, newest first, and how many there are in all."""
+    wanted = statuses.split(",") if statuses else None
+    rows = await emails.list(workspace_id, None, lead_id, statuses=wanted, icp_id=icp_id, limit=limit, offset=offset)
+    total = await emails.count(workspace_id, wanted, lead_id, icp_id)
+    return Page[EmailOut](items=await _out(emails, rows, feedback), total=total, limit=limit, offset=offset)
+
+
+@router.get("/counts", response_model=dict[str, int])
+async def email_counts(
+    icp_id: str | None = Query(default=None, alias="icpId", pattern=ICP),
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+) -> dict[str, int]:
+    """How many first emails are in each status ({"draft": 12, "sent": 340, ...}): for badges and tabs, without
+    reading the emails."""
+    return await emails.counts(workspace_id, icp_id)
 
 
 @router.get("/feedback/stats", response_model=list[FeedbackStat])

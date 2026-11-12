@@ -4,10 +4,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Uuid, case, cast, delete, exists, func, or_, select, tuple_, update
+from sqlalchemy import Uuid, case, cast, delete, exists, func, inspect, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, array, insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, defer, load_only
 
 from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
@@ -21,6 +21,12 @@ from services.identity import identity_keys
 from services.leads import Existing, LeadInput, clean_lead
 from services.prompts import DEFAULTS
 from services.smart_lists import company_key, person_key
+
+
+def _skip(*columns: Any) -> list[Any]:
+    """Leave these columns out of a read (they're most of the row, and every byte read is database egress). Reading
+    one afterwards raises instead of quietly loading it, so a list that starts needing it fails loudly in tests."""
+    return [defer(c, raiseload=True) for c in columns]
 
 
 class IcpCampaignRepo:
@@ -574,7 +580,8 @@ class SendingRepo:
         await self.session.commit()
 
     async def in_sequence(self, workspace_id: UUID) -> list[tuple[Email, Lead]]:
-        """First emails queued into a campaign whose sequence hasn't ended."""
+        """First emails queued into a campaign whose sequence hasn't ended: only the columns the follow-up check reads
+        for each of them (it runs every half hour over every one). `load_full` reads the rest for the few that need it."""
         query = (
             select(Email, Lead)
             .join(Lead, Lead.id == Email.lead_id)
@@ -582,8 +589,21 @@ class SendingRepo:
                 Email.workspace_id == workspace_id, Email.step == 1, Email.sequencer_campaign_id.is_not(None),
                 or_(Email.sequence_status.is_(None), Email.sequence_status.in_(("queued", "active"))),
             )
+            .options(
+                load_only(Email.id, Email.workspace_id, Email.lead_id, Email.step, Email.status, Email.sent_at,
+                          Email.sequencer_campaign_id, Email.sequencer_list_id, Email.sequencer_lead_id, Email.sequencer_inbox_id,
+                          Email.sequencer_inbox_email, Email.sequence_status, Email.sequence_sent_count,
+                          Email.sequence_stop_reason, Email.sequence_last_sent_at, Email.sequence_synced_at, raiseload=True),
+                load_only(Lead.id, Lead.workspace_id, Lead.email, raiseload=True),
+            )
         )  # fmt: skip
         return [(e, lead) for e, lead in await self.session.execute(query)]
+
+    async def load_full(self, *rows: Any) -> None:
+        """Read every column of rows `in_sequence` loaded only in part (keeping what was already changed on them)."""
+        for row in rows:
+            await self.session.refresh(row, attribute_names=[a.key for a in inspect(row).mapper.column_attrs
+                                                             if a.key in inspect(row).unloaded])  # fmt: skip
 
     async def follow_ups(self, lead_ids: list[UUID]) -> dict[tuple[UUID, int], Email]:
         rows = await self.session.scalars(select(Email).where(Email.lead_id.in_(lead_ids), Email.step > 1))
@@ -786,9 +806,12 @@ class StakeholderRepo:
         self.session = session
 
     async def list(
-        self, workspace_id: UUID, company_id: UUID | None = None, icp_id: UUID | None = None
+        self, workspace_id: UUID, company_id: UUID | None = None, icp_id: UUID | None = None, light: bool = False
     ) -> list[Stakeholder]:
+        """With `light`, without the raw provider record (most of the row): what list pages show."""
         query = select(Stakeholder).where(Stakeholder.workspace_id == workspace_id)
+        if light:
+            query = query.options(*_skip(Stakeholder.raw))
         if company_id:
             query = query.where(Stakeholder.lead_intel_business_id == company_id)
         if icp_id:
@@ -1426,8 +1449,11 @@ class CompanyRepo:
         query = select(CompanyPage).where(CompanyPage.workspace_id == workspace_id, CompanyPage.company_id == company_id)
         return list(await self.session.scalars(query.order_by(CompanyPage.fetched_at, CompanyPage.url)))
 
-    async def list(self, workspace_id: UUID, icp_id: UUID | None, status: str | None) -> list[Company]:
+    async def list(self, workspace_id: UUID, icp_id: UUID | None, status: str | None, light: bool = False) -> list[Company]:
+        """With `light`, without research, raw provider data and the score and rule breakdowns: what list pages show."""
         query = select(Company).where(Company.workspace_id == workspace_id)
+        if light:
+            query = query.options(*_skip(Company.research, Company.raw, Company.score_detail, Company.rule_detail))
         if icp_id:
             query = query.where(Company.icp_id == icp_id)
         if status:
@@ -1689,20 +1715,40 @@ class EmailRepo:
         await self.session.refresh(row)
         return row
 
-    async def list(
-        self, workspace_id: UUID, status: str | None = None, lead_id: UUID | None = None
-    ) -> list[tuple[Email, Lead]]:
-        # First emails only: follow-ups are written and queued on their own, never reviewed here.
-        query = (
-            select(Email, Lead)
-            .join(Lead, Lead.id == Email.lead_id)
-            .where(Email.workspace_id == workspace_id, Email.step == 1)
-        )
-        if status:
-            query = query.where(Email.status == status)
+    @staticmethod
+    def _first_emails(workspace_id: UUID, statuses: list[str] | None, lead_id: UUID | None, icp_id: str | None) -> list[Any]:
+        where: list[Any] = [Email.workspace_id == workspace_id, Email.step == 1]
+        if statuses:
+            where.append(Email.status.in_(statuses))
         if lead_id:
-            query = query.where(Email.lead_id == lead_id)
-        return [(e, lead) for e, lead in await self.session.execute(query.order_by(Email.created_at.desc()))]
+            where.append(Email.lead_id == lead_id)
+        if icp_id == "none":
+            where.append(Lead.lead_intel_icp_id.is_(None))
+        elif icp_id:
+            where.append(Lead.lead_intel_icp_id == UUID(icp_id))
+        return where
+
+    async def list(
+        self, workspace_id: UUID, status: str | None = None, lead_id: UUID | None = None, *,
+        statuses: list[str] | None = None, icp_id: str | None = None, limit: int | None = None, offset: int = 0,
+    ) -> list[tuple[Email, Lead]]:
+        """First emails only: follow-ups are written and queued on their own, never reviewed here. Newest first.
+        `icp_id` "none" is the leads with no ICP."""
+        where = self._first_emails(workspace_id, ([status] if status else []) + (statuses or []), lead_id, icp_id)
+        query = select(Email, Lead).join(Lead, Lead.id == Email.lead_id).where(*where).order_by(Email.created_at.desc(), Email.id)
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        return [(e, lead) for e, lead in await self.session.execute(query)]
+
+    async def count(self, workspace_id: UUID, statuses: list[str] | None, lead_id: UUID | None, icp_id: str | None) -> int:
+        where = self._first_emails(workspace_id, statuses, lead_id, icp_id)
+        return (await self.session.execute(select(func.count()).select_from(Email).join(Lead, Lead.id == Email.lead_id).where(*where))).scalar_one()
+
+    async def counts(self, workspace_id: UUID, icp_id: str | None = None) -> dict[str, int]:
+        """How many first emails are in each status: one small row per status, not the emails."""
+        where = self._first_emails(workspace_id, None, None, icp_id)
+        query = select(Email.status, func.count()).join(Lead, Lead.id == Email.lead_id).where(*where).group_by(Email.status)
+        return {s: n for s, n in await self.session.execute(query)}
 
     async def get(self, workspace_id: UUID, email_id: UUID) -> tuple[Email, Lead] | None:
         row = (
@@ -1725,7 +1771,7 @@ class EmailRepo:
     async def posts(self, post_ids: list[UUID]) -> dict[UUID, Post]:
         if not post_ids:
             return {}
-        return {p.id: p for p in await self.session.scalars(select(Post).where(Post.id.in_(post_ids)))}
+        return {p.id: p for p in await self.session.scalars(select(Post).where(Post.id.in_(post_ids)).options(*_skip(Post.raw)))}
 
     async def commit_refresh(self, *rows: Any) -> None:
         await self.session.commit()
@@ -2082,8 +2128,12 @@ class QuickstartRepo:
     async def save(self, run: QuickstartRun) -> None:
         await self.session.commit()
 
-    async def companies(self, ids: list[UUID]) -> list[Company]:
+    async def companies(self, ids: list[UUID], brief: bool = False) -> list[Company]:
+        """With `brief`, only what the run page shows (it's polled every few seconds while a run works)."""
         fresh = select(Company).where(Company.id.in_(ids)).execution_options(populate_existing=True)
+        if brief:
+            fresh = fresh.options(load_only(Company.id, Company.name, Company.domain, Company.status, Company.status_reason,
+                                            Company.score, raiseload=True))  # fmt: skip
         return list(await self.session.scalars(fresh)) if ids else []
 
     async def new_companies(self, workspace_id: UUID, icp_id: UUID, limit: int) -> list[UUID]:
@@ -2173,8 +2223,10 @@ class QuickstartRepo:
         query = select(Stakeholder).where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(company_ids))
         return list(await self.session.scalars(query.order_by(Stakeholder.found_at).execution_options(populate_existing=True)))
 
-    async def leads(self, ids: list[UUID]) -> list[Lead]:
+    async def leads(self, ids: list[UUID], brief: bool = False) -> list[Lead]:
         fresh = select(Lead).where(Lead.id.in_(ids)).execution_options(populate_existing=True)
+        if brief:
+            fresh = fresh.options(*_skip(Lead.score_reasons))
         return list(await self.session.scalars(fresh)) if ids else []
 
     async def first_emails(self, lead_ids: list[UUID]) -> list[Email]:

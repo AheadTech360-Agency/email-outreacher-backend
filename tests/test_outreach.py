@@ -145,6 +145,9 @@ class Sending:
     async def commit(self):
         pass
 
+    async def load_full(self, *rows):
+        self.loaded = getattr(self, "loaded", []) + list(rows)
+
 
 class Sequencer:
     def __init__(self, campaigns, enrollments=None, fail=None):

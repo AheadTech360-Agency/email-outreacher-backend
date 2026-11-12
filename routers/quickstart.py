@@ -127,8 +127,9 @@ async def get_run(
 ) -> QuickstartDetailOut:
     """A run with what it made so far: companies and their verdicts, leads and their emails, and the drafts."""
     run = await _run(runs, workspace_id, run_id)
-    companies = await runs.companies(list(run.company_ids))
-    leads = await runs.leads(list(run.lead_ids))
+    # Polled every few seconds while a run works: only the columns shown here are read.
+    companies = await runs.companies(list(run.company_ids), brief=True)
+    leads = await runs.leads(list(run.lead_ids), brief=True)
     by_lead = {lead.id: lead for lead in leads}
     posts = await runs.post_counts(list(run.lead_ids))
 

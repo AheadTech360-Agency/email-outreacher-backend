@@ -776,7 +776,9 @@ class Email(Base):
     sequence_last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     sequence_stop_reason: Mapped[str | None] = mapped_column(Text, default=None)
     sequence_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    sequence_raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # CheapSequencer's enrollment row as last seen: written on every sync, never read by the app, so it's only loaded
+    # when asked for (it's most of an email row, and every read of it is database egress).
+    sequence_raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None, deferred=True)
     # The rated emails shown to Claude as examples when this one was written (see EmailFeedback).
     examples_used: Mapped[list[UUID]] = mapped_column(ARRAY(Uuid), server_default="{}")
     created_at: Mapped[datetime] = _created()

@@ -372,7 +372,7 @@ async def list_stakeholders(
     workspace_id: UUID = Depends(require_workspace_id),
     stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
 ) -> list[StakeholderOut]:
-    people = await stakeholders.list(workspace_id, company_id, icp_id)
+    people = await stakeholders.list(workspace_id, company_id, icp_id, light=True)
     queued = await stakeholders.queued_at([s.lead_id for s in people if s.lead_id])
     return [StakeholderOut.model_validate(s).model_copy(update={"queued_at": queued.get(s.lead_id)}) for s in people]
 

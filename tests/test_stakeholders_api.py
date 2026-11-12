@@ -54,7 +54,7 @@ class FakeStakeholders:
             found_at=datetime.now(UTC),
         )  # fmt: skip
 
-    async def list(self, ws, company_id=None, icp_id=None):
+    async def list(self, ws, company_id=None, icp_id=None, light=False):
         return [
             r for r in self.rows.values()
             if company_id in (None, r.lead_intel_business_id) and icp_id in (None, r.lead_intel_icp_id)

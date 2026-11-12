@@ -896,7 +896,9 @@ class FindCompaniesResult(ApiModel):
     google_maps: SourceFindResult | None = None
 
 
-class PipelineCompanyOut(ApiModel):
+class PipelineCompanyListOut(ApiModel):
+    """A company as list pages show it: no research, and no score or rule breakdown (its page has those)."""
+
     archived: bool = False
     id: UUID
     icp_id: UUID | None
@@ -918,12 +920,15 @@ class PipelineCompanyOut(ApiModel):
     status_reason: str | None
     overridden: bool
     rule_fit: bool | None
-    rule_detail: dict[str, Any] | None
     score: int | None
-    score_detail: dict[str, Any] | None
-    research: dict[str, Any] | None
     researched_at: datetime | None
     created_at: datetime
+
+
+class PipelineCompanyOut(PipelineCompanyListOut):
+    rule_detail: dict[str, Any] | None
+    score_detail: dict[str, Any] | None
+    research: dict[str, Any] | None
 
 
 class PipelineCompanyDetailOut(PipelineCompanyOut):

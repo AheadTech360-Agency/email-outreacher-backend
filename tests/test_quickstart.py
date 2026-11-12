@@ -105,7 +105,7 @@ class Repo:
     async def contacted(self, workspace_id, people):
         return {p.id for p in people if p.id in self.w.contacted}
 
-    async def companies(self, ids):
+    async def companies(self, ids, brief=False):
         return [self.w.companies[i] for i in ids]
 
     async def add_website_contacts(self, workspace_id, contacts):
@@ -116,7 +116,7 @@ class Repo:
     async def people_at(self, workspace_id, company_ids):
         return [p for p in self.w.people.values() if p.company_id in company_ids]
 
-    async def leads(self, ids):
+    async def leads(self, ids, brief=False):
         return [self.w.leads[i] for i in ids if i in self.w.leads]
 
     async def first_emails(self, lead_ids):

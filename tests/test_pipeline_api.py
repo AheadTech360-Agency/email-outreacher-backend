@@ -76,7 +76,7 @@ class FakeCompanies:
                 added += 1
         return added, dupes
 
-    async def list(self, ws, icp_id, status):
+    async def list(self, ws, icp_id, status, light=False):
         return [r for r in self.rows.values() if status in (None, r.status)]
 
     async def get(self, ws, cid):

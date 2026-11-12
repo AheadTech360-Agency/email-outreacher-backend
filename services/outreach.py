@@ -569,6 +569,7 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
             continue
         spec = PromptVersionSpec(version.id, version.system_prompt, version.user_prompt, version.model, version.max_tokens)
         earlier = {k: (existing[(lead.id, k)].edited_body or existing[(lead.id, k)].body) for k in range(2, step) if (lead.id, k) in existing}
+        await deps.sending.load_full(email, lead)  # the check read only a few columns of each; this one is written to
         variables = await _variables(deps, email, lead, step, earlier)
         draft, calls, error = await write_follow_up(deps.writer, replace(spec, system=render_template(spec.system, variables)), render(spec.user, variables))
         cost = sum(cost_usd(c.model, c.input_tokens, c.output_tokens) for c in calls)
@@ -584,6 +585,8 @@ async def run_follow_ups(deps: Deps, now: datetime | None = None) -> FollowUpRun
             continue
         to_write.setdefault(email.sequencer_list_id, []).append((email, lead, step, draft.body, (version.id, draft.confidence, cost)))
     await deps.sending.commit()
+    if newly_replied:  # the reply email names them and their company: read the rest of these few leads
+        await deps.sending.load_full(*newly_replied)
     for lead in newly_replied:  # saved as replied first, so the next check can't email them again
         await (deps.notify or notify.reply_received)(lead)
 
