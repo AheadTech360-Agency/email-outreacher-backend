@@ -226,9 +226,9 @@ class LeadOut(ApiModel):
     extra: dict[str, str]
     origin: str
     status: str
-    # The Email Scoring prompt's score for the lead's current draft, and its reasons.
+    # The Email Scoring prompt's score for the lead's current draft. Its reasons come with the draft (Review), not here:
+    # every page loads every lead, and the reasons were most of each one.
     score: int | None
-    score_reasons: list[str] | None = None
     # How many of their own posts are stored (from Fetch posts or Enrich).
     post_count: int = 0
     created_at: datetime

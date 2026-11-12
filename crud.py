@@ -371,8 +371,9 @@ class LeadRepo:
             where.append(or_(Lead.email.ilike(like), Lead.company.ilike(like), _full_name.ilike(like)))
         total = (await self.session.execute(select(func.count()).select_from(Lead).where(*where))).scalar_one()
         rows = await self.session.scalars(
-            select(Lead).where(*where).order_by(Lead.created_at.desc(), Lead.id).limit(limit).offset(offset)
-        )
+            select(Lead).where(*where).options(*_skip(Lead.score_reasons))
+            .order_by(Lead.created_at.desc(), Lead.id).limit(limit).offset(offset)
+        )  # fmt: skip
         return list(rows), total
 
 
@@ -1392,8 +1393,9 @@ class PostRepo:
         return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id)))
 
     async def list(self, workspace_id: UUID, lead_id: UUID | None) -> list[Post]:
-        # Leads' posts only; a company's own posts are read with for_company.
-        query = select(Post).where(Post.workspace_id == workspace_id, Post.lead_id.is_not(None))
+        # Leads' posts only; a company's own posts are read with for_company. Without the raw provider record (most of
+        # the row): the list never shows it.
+        query = select(Post).where(Post.workspace_id == workspace_id, Post.lead_id.is_not(None)).options(*_skip(Post.raw))
         if lead_id:
             query = query.where(Post.lead_id == lead_id)
         return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id)))
