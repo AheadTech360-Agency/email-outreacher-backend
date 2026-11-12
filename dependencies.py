@@ -225,6 +225,10 @@ PROSPECTOR_PAGES = {
     ("GET", "/posts"),
     # Their own saved filters (a workspace-wide one is only Management's to save or delete: routers/saved_views.py).
     ("GET", "/saved-views"), ("POST", "/saved-views"), ("DELETE", "/saved-views/{view_id}"),
+    # The background activity menu: only their own jobs (routers/jobs.py shows non-admins only what they started).
+    ("GET", "/jobs"), ("GET", "/jobs/{job_id}"),
+    # What research and analysis can read, and its prices: the same for everyone (the ICP form lists them).
+    ("GET", "/sources"),
 }  # fmt: skip
 PROSPECTOR_STEPS = {
     "/pipeline/find-linkedin", "/pipeline/web-search", "/pipeline/research", "/pipeline/stakeholders",
