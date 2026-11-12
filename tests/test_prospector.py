@@ -203,3 +203,56 @@ def test_management_isnt_held_to_the_prospector_cap(world) -> None:
     assert _start(world.client, spendLimitUsd=50, webSearch="google").status_code == 201
     assert world.runs.created[-1].settings["prospector"] is False
 
+
+
+# ---------- Approving their own run's companies, and its people ----------
+
+
+def test_a_finished_run_goes_on_once_companies_it_left_waiting_are_approved() -> None:
+    import asyncio
+
+    from routers.quickstart import _approved_since
+
+    done, waiting = uuid4(), uuid4()
+    run = SimpleNamespace(company_ids=[done, waiting], progress={"_searched": [str(done)]})
+
+    class Runs:
+        def __init__(self, statuses):
+            self.statuses = statuses
+
+        async def companies(self, ids, brief=False):
+            return [SimpleNamespace(id=i, status=self.statuses[i]) for i in ids]
+
+    assert asyncio.run(_approved_since(Runs({done: "qualified", waiting: "review"}), run)) is False
+    assert asyncio.run(_approved_since(Runs({done: "qualified", waiting: "qualified"}), run)) is True
+
+
+def test_a_prospector_decides_only_companies_they_can_see(client, monkeypatch) -> None:
+    from dependencies import get_company_repo
+    from services.access import Scope
+
+    as_role("prospector")
+    mine, other = uuid4(), uuid4()
+    decided = []
+
+    async def visible(self, session, kind, ids):
+        return [i for i in ids if i == mine]
+
+    monkeypatch.setattr(Scope, "visible_members", visible)
+
+    class Companies:
+        session = None
+
+        async def get_many(self, workspace_id, ids):
+            decided.extend(ids)
+            return []
+
+        async def save_all(self, rows):
+            pass
+
+    app.dependency_overrides[get_company_repo] = lambda: Companies()
+    body = {"companyIds": [str(other)], "status": "qualified"}
+    assert client.post("/api/v1/pipeline/companies/decide", headers=H, json=body).status_code == 404
+    body = {"companyIds": [str(mine), str(other)], "status": "qualified"}
+    assert client.post("/api/v1/pipeline/companies/decide", headers=H, json=body).status_code == 200
+    assert decided == [mine]

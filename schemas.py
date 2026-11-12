@@ -1820,6 +1820,35 @@ class QuickstartLeadOut(ApiModel):
     status: str
 
 
+class QuickstartPersonOut(ApiModel):
+    """One person a run found, with their company: a row of the run's people table (and its CSV)."""
+
+    id: UUID
+    first_name: str
+    last_name: str
+    title: str
+    seniority: str | None
+    email: str | None
+    email_status: str | None
+    linkedin_url: str | None
+    source: str
+    found_at: datetime
+    lead: bool
+    company_id: UUID | None
+    company: str
+    company_status: str | None
+    company_score: int | None
+    company_website: str | None
+    company_linkedin: str | None
+    company_instagram: str | None
+    company_facebook: str | None
+    company_phone: str | None
+    city: str | None
+    state: str | None
+    employees: int | None
+    industry: str | None
+
+
 class QuickstartDraftOut(ApiModel):
     id: UUID
     lead_id: UUID

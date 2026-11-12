@@ -220,7 +220,8 @@ PROSPECTOR_PAGES = {
     ("DELETE", "/smart-lists/{list_id}"), ("GET", "/smart-lists/candidates"), ("GET", "/smart-lists/candidates/ids"),
     ("POST", "/smart-lists/move"),
     ("GET", "/pipeline/companies/page"), ("GET", "/pipeline/companies/matching"), ("GET", "/pipeline/companies/{company_id}"),
-    ("GET", "/pipeline/companies/{company_id}/content"),
+    ("GET", "/pipeline/companies/{company_id}/content"), ("POST", "/pipeline/companies/decide"),
+    ("GET", "/quickstart/runs/{run_id}/people"),
     ("GET", "/stakeholders/page"), ("GET", "/stakeholders/matching"), ("GET", "/stakeholders/{stakeholder_id}"),
     ("GET", "/posts"),
     # Their own saved filters (a workspace-wide one is only Management's to save or delete: routers/saved_views.py).

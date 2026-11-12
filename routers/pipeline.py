@@ -22,7 +22,7 @@ from services import enrich, exports, record_data
 from crud import PRODUCT_FIELDS, CompanyFilters, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
 from services.access import Scope
 from dependencies import (
-    get_scope,
+    get_scope, require_runner,
     get_smart_list_repo,
     get_company_repo,
     get_exclusion_repo,
@@ -574,14 +574,21 @@ def _decide(company: Company, status: str) -> None:
     company.overridden = True
 
 
-@router.post("/companies/decide", response_model=CompanyDecisionResult, dependencies=[Depends(require_manager)])
+@router.post("/companies/decide", response_model=CompanyDecisionResult, dependencies=[Depends(require_runner)])
 async def decide_companies(
     body: CompanyDecisionIn,
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
+    scope: Scope = Depends(get_scope),
 ) -> CompanyDecisionResult:
-    """Approve or reject companies in bulk (the To approve queue). Research won't change them back."""
-    rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
+    """Approve or reject companies in bulk (the To approve queue). Research won't change them back. A Prospector
+    decides only companies they can see (their runs' and their lists'): anything else is left out."""
+    ids = list(dict.fromkeys(body.company_ids))
+    if scope.limited:
+        ids = await scope.visible_members(companies.session, "company", ids)
+        if not ids:
+            raise HTTPException(status_code=404, detail="Company not found")
+    rows = await companies.get_many(workspace_id, ids)
     for company in rows:
         _decide(company, body.status)
     await companies.save_all(rows)

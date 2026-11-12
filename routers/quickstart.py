@@ -20,7 +20,7 @@ from models import QuickstartRun
 from routers.emails import NO_OFFER, has_offer
 from schemas import (
     QuickstartBriefOut, QuickstartCompanyOut, QuickstartDetailOut, QuickstartDraftOut, QuickstartIn, QuickstartLeadOut, QuickstartLimitsOut,
-    QuickstartRunOut,
+    QuickstartPersonOut, QuickstartRunOut,
     QuickstartStep,
 )  # fmt: skip
 from services.auth import CurrentUser
@@ -86,6 +86,12 @@ async def _run(runs: QuickstartRepo, workspace_id: UUID, run_id: UUID, user: Cur
     if run is None or (user.is_prospector and not _theirs(run, user)):
         raise HTTPException(status_code=404, detail="Quick Start run not found")
     return run
+
+
+async def _approved_since(runs: QuickstartRepo, run: QuickstartRun) -> bool:
+    """Whether a finished run has qualified companies it hasn't looked for people at (approved after it ended)."""
+    searched = set(run.progress.get("_searched", []))
+    return any(c.status == "qualified" and str(c.id) not in searched for c in await runs.companies(list(run.company_ids), brief=True))
 
 
 def _theirs(run: QuickstartRun, user: CurrentUser) -> bool:
@@ -238,6 +244,33 @@ async def run_briefs(
     return [QuickstartBriefOut.model_validate(b) for b in await runs.briefs(list(run.company_ids))]
 
 
+@router.get("/runs/{run_id}/people", response_model=list[QuickstartPersonOut])
+async def run_people(
+    run_id: UUID,
+    workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(get_current_user),
+    runs: QuickstartRepo = Depends(get_quickstart_repo),
+) -> list[QuickstartPersonOut]:
+    """Everyone the run found, at its companies, with each company's details: the run's people table and its CSV."""
+    run = await _run(runs, workspace_id, run_id, user)
+    companies = {c.id: c for c in await runs.companies(list(run.company_ids))}
+    out = []
+    for p in await runs.people_at(workspace_id, list(companies)):
+        c = companies.get(p.company_id)
+        raw = (c.raw or {}) if c else {}
+        out.append(QuickstartPersonOut(
+            id=p.id, first_name=p.first_name, last_name=p.last_name, title=p.title, seniority=p.seniority, email=p.email,
+            email_status=p.email_status, linkedin_url=p.linkedin_url, source=p.source, found_at=p.found_at, lead=p.lead_id is not None,
+            company_id=c.id if c else None, company=(c.name if c else p.organization_name) or "", company_status=c.status if c else None,
+            company_score=c.score if c else None, company_website=(c.website_url or (f"https://{c.domain}" if c.domain else None)) if c else None,
+            company_linkedin=c.linkedin_url if c else None, company_instagram=c.instagram_url if c else None,
+            company_facebook=c.facebook_url if c else None, company_phone=c.phone if c else None, city=c.city if c else None,
+            state=c.state if c else None, employees=raw.get("employees") if isinstance(raw.get("employees"), int) else None,
+            industry=raw.get("industry") if isinstance(raw.get("industry"), str) else None,
+        ))  # fmt: skip
+    return out
+
+
 @router.post("/runs/{run_id}/stop", response_model=QuickstartRunOut)
 async def stop_run(
     run_id: UUID,
@@ -266,7 +299,13 @@ async def resume_run(
     """Pick a run up again: after the worker restarted mid-step, or after a step failed (it's tried again, and
     nothing before it is redone or paid for twice)."""
     run = await _run(runs, workspace_id, run_id, user)
-    if run.status not in ("queued", "running", "failed", "waiting"):
+    if run.status == "done" and await _approved_since(runs, run):
+        # It ended before these were approved (nobody qualified then): it goes on from verifying, with them.
+        progress = dict(run.progress)
+        progress["research"] = {**progress.get("research", {}), "state": "waiting", "note": "Continuing with the approved companies"}
+        run.progress, run.step, run.status, run.detail, run.finished_at = progress, "research", "running", None, None
+        await runs.save(run)
+    elif run.status not in ("queued", "running", "failed", "waiting"):
         raise HTTPException(status_code=409, detail="This run has finished.")
     if run.busy_until and run.busy_until > datetime.now(UTC):
         raise HTTPException(status_code=409, detail="It's still working on a step.")
