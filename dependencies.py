@@ -39,6 +39,7 @@ from lead_intel_writes import LeadIntelIcpWriter
 from services.apify import ApifyClient
 from services.supabase_admin import SupabaseAdmin
 from services.apollo import ApolloClient
+from services.access import AccessRepo, Scope
 from services.auth import AuthError, CurrentUser, verify
 from services.generation import EmailWriter
 from services.google_places import PlacesClient
@@ -195,21 +196,33 @@ def require_manager(user: CurrentUser = Depends(get_current_user)) -> CurrentUse
 
 
 def require_runner(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-    """Starting, stopping and resuming a Quick Start run: Management and admins, and Prospectors (their own
-    LinkedIn runs, under the workspace's cap; routers/quickstart.py checks which)."""
+    """Management and admins, and Prospectors where the endpoint checks what's theirs (services/access.Scope): their
+    own Quick Start runs (LinkedIn, under the workspace's cap), and the ICPs, products and smart lists they own or
+    may edit."""
     if user.role in ("admin", "management", "prospector"):
         return user
     raise HTTPException(status_code=403, detail=MANAGERS_ONLY)
 
 
-# What a Prospector may call. From the browser: who they are, their workspaces and ICPs, and Quick Start's runs
-# (only their own: routers/quickstart.py). Inside their own run (the worker): the LinkedIn option's steps. Nothing
-# else: no email writing, no other pages, no jobs of their own.
+# What a Prospector may call from the browser. Each of these checks the item against what's theirs
+# (services/access.Scope): their own Quick Start runs; the ICPs, products and smart lists they own or were shared; the
+# companies their runs found or that are in their lists, and the people there. Inside their own run (the worker):
+# the LinkedIn option's steps. Nothing else: no email writing, no Claude besides their runs, no jobs of their own.
 PROSPECTOR_PAGES = {
-    ("GET", "/me"), ("GET", "/workspaces"), ("GET", "/icps"),
+    ("GET", "/me"), ("GET", "/workspaces"),
     ("GET", "/quickstart/limits"), ("GET", "/quickstart/runs"), ("POST", "/quickstart/runs"), ("GET", "/quickstart/runs/{run_id}"),
     ("GET", "/quickstart/runs/{run_id}/briefs"), ("POST", "/quickstart/runs/{run_id}/stop"),
     ("POST", "/quickstart/runs/{run_id}/resume"),
+    ("GET", "/icps"), ("POST", "/icps"), ("GET", "/icps/{icp_id}"), ("PUT", "/icps/{icp_id}"), ("PUT", "/icps/{icp_id}/profile"),
+    ("POST", "/icps/{icp_id}/archive"), ("POST", "/icps/{icp_id}/restore"),
+    ("GET", "/products"), ("POST", "/products"), ("PUT", "/products/{product_id}"), ("DELETE", "/products/{product_id}"),
+    ("GET", "/smart-lists"), ("POST", "/smart-lists"), ("GET", "/smart-lists/{list_id}"), ("PATCH", "/smart-lists/{list_id}"),
+    ("DELETE", "/smart-lists/{list_id}"), ("GET", "/smart-lists/candidates"), ("GET", "/smart-lists/candidates/ids"),
+    ("POST", "/smart-lists/move"),
+    ("GET", "/pipeline/companies/page"), ("GET", "/pipeline/companies/matching"), ("GET", "/pipeline/companies/{company_id}"),
+    ("GET", "/pipeline/companies/{company_id}/content"),
+    ("GET", "/stakeholders/page"), ("GET", "/stakeholders/matching"), ("GET", "/stakeholders/{stakeholder_id}"),
+    ("GET", "/posts"),
 }  # fmt: skip
 PROSPECTOR_STEPS = {
     "/pipeline/find-linkedin", "/pipeline/web-search", "/pipeline/research", "/pipeline/stakeholders",
@@ -246,6 +259,21 @@ def require_workspace_id(workspace_id: UUID | None = Depends(get_workspace_id)) 
     if workspace_id is None:
         raise HTTPException(status_code=400, detail="X-Workspace-Id header is required")
     return workspace_id
+
+
+def get_access_repo(session: AsyncSession = Depends(get_session)) -> AccessRepo:
+    return AccessRepo(session)
+
+
+def get_scope(
+    user: CurrentUser = Depends(get_current_user),
+    workspace_id: UUID | None = Depends(get_workspace_id),
+    repo: AccessRepo = Depends(get_access_repo),
+) -> Scope:
+    """What the signed-in person may see (services/access.py). A Prospector's every request names its workspace."""
+    if user.role == "prospector" and workspace_id is None:
+        raise HTTPException(status_code=400, detail="X-Workspace-Id header is required")
+    return Scope(user, workspace_id, repo)  # type: ignore[arg-type]
 
 
 def get_icp_campaign_repo(session: AsyncSession = Depends(get_session)) -> IcpCampaignRepo:

@@ -108,6 +108,8 @@ class Icp(ApiModel):
     id: UUID
     name: str
     industry: str
+    # Whether the asker may change it (a Prospector: their own, or shared with editing). Everyone else: True.
+    can_edit: bool = True
     priority: int
     enabled: bool
     # Which text the rule reads; empty means all of it.
@@ -1043,6 +1045,23 @@ class CompanyDecisionResult(ApiModel):
     changed: int
 
 
+class AccessGrant(ApiModel):
+    """One ICP, product or smart list a Prospector may see, and whether they may change it."""
+
+    kind: Literal["icp", "product", "smart_list"]
+    resource_id: UUID
+    workspace_id: UUID
+    can_edit: bool = False
+
+
+class AccessOut(AccessGrant):
+    is_owner: bool = False  # they created it: they edit it and may delete it, whatever is shared
+
+
+class AccessIn(ApiModel):
+    grants: list[AccessGrant] = Field(default=[], max_length=2000)
+
+
 class QuickstartLimitsOut(ApiModel):
     # A Prospector's most per run; None: no cap beyond the form's own.
     spend_limit_usd: float | None = None
@@ -1570,6 +1589,7 @@ class ProductIn(ApiModel):
 
 class ProductOut(ProductIn):
     archived: bool = False
+    can_edit: bool = True  # whether the asker may change it (see Icp.can_edit)
     id: UUID
     created_at: datetime
     updated_at: datetime
@@ -1863,6 +1883,7 @@ class SmartListIcpDraft(ApiModel):
 
 class SmartListOut(ApiModel):
     id: UUID
+    can_edit: bool = True  # whether the asker may change it (see Icp.can_edit)
     kind: str
     name: str
     count: int

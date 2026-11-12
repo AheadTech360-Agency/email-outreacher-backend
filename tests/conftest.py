@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dependencies import (
+    get_access_repo,
     get_current_user, get_exclusion_repo, get_icp_campaign_repo, get_icp_profile_repo, get_lead_intel_repo, get_optional_apify, get_optional_inboxes, get_optional_sequencer, refuse_inline,
     get_workspace_company_repo, require_api_secret,
 )  # fmt: skip
@@ -242,9 +243,48 @@ class FakeIcpCampaigns:
         self.forgotten.append(icp_id)
 
 
+class FakeAccessRepo:
+    """services.access.AccessRepo in memory: who may see which ICP, product and smart list."""
+
+    def __init__(self) -> None:
+        self.items: list[SimpleNamespace] = []
+        self.forgotten: list[tuple[str, UUID]] = []
+
+    async def rows(self, user_id, kind=None):
+        return [a for a in self.items if a.user_id == user_id and (kind is None or a.kind == kind)]
+
+    async def get(self, user_id, kind, resource_id):
+        return next((a for a in self.items if (a.user_id, a.kind, a.resource_id) == (user_id, kind, resource_id)), None)
+
+    async def own(self, user_id, workspace_id, kind, resource_id):
+        if row := await self.get(user_id, kind, resource_id):
+            row.can_edit = row.is_owner = True
+            return
+        self.items.append(SimpleNamespace(user_id=user_id, workspace_id=workspace_id, kind=kind, resource_id=resource_id,
+                                          can_edit=True, is_owner=True, granted_by=user_id))  # fmt: skip
+
+    async def replace_shared(self, user_id, grants, granted_by):
+        self.items = [a for a in self.items if a.user_id != user_id or a.is_owner]
+        owned = {(a.kind, a.resource_id) for a in await self.rows(user_id)}
+        for g in grants:
+            if (g["kind"], g["resource_id"]) not in owned:
+                self.items.append(SimpleNamespace(user_id=user_id, workspace_id=g["workspace_id"], kind=g["kind"], resource_id=g["resource_id"],
+                                                  can_edit=bool(g["can_edit"]), is_owner=False, granted_by=granted_by))  # fmt: skip
+
+    async def forget(self, kind, resource_id):
+        self.items = [a for a in self.items if (a.kind, a.resource_id) != (kind, resource_id)]
+        self.forgotten.append((kind, resource_id))
+
+
 @pytest.fixture
-def client(profiles: FakeIcpProfileRepo, workspace_companies: FakeWorkspaceCompanyRepo, exclusions: FakeExclusions):
+def access() -> FakeAccessRepo:
+    return FakeAccessRepo()
+
+
+@pytest.fixture
+def client(profiles: FakeIcpProfileRepo, workspace_companies: FakeWorkspaceCompanyRepo, exclusions: FakeExclusions, access: FakeAccessRepo):
     app.dependency_overrides[get_lead_intel_repo] = FakeLeadIntelRepo
+    app.dependency_overrides[get_access_repo] = lambda: access
     app.dependency_overrides[get_workspace_company_repo] = lambda: workspace_companies
     app.dependency_overrides[get_icp_profile_repo] = lambda: profiles
     # Signed in as an admin, who opens every workspace. tests/test_auth.py covers the other roles.

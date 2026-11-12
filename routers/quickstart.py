@@ -9,7 +9,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 
 from crud import IcpProfileRepo, ProductRepo, QuickstartRepo, SettingsRepo
+from services.access import Scope
 from dependencies import (
+    get_scope,
     get_current_user, get_icp_profile_repo, get_lead_intel_repo, get_product_repo, get_quickstart_queue, get_quickstart_repo,
     get_settings_repo, require_runner, require_workspace_id,
 )  # fmt: skip
@@ -82,10 +84,12 @@ async def start_run(
     products: ProductRepo = Depends(get_product_repo),
     settings_repo: SettingsRepo = Depends(get_settings_repo),
     queue: Callable[[UUID], None] = Depends(get_quickstart_queue),
+    scope: Scope = Depends(get_scope),
 ) -> QuickstartRunOut:
     """Start a run. The ICP must say what we sell, or no email could be written at the end. A Prospector starts
     only LinkedIn runs, with free web search, spending at most the workspace's cap."""
     if user.is_prospector:
+        await scope.check("icp", body.icp_id)
         cap = (await settings_repo.general(workspace_id))["prospector_run_limit_usd"]
         if body.source != "linkedin":
             raise HTTPException(status_code=403, detail="Your account can only start a LinkedIn search.")

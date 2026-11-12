@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from background import report
 from crud import CompanyRepo, PostRepo, ProviderCallRepo, StakeholderRepo
 from database import get_session
+from sqlalchemy import select
+
+from models import Stakeholder
+from services.access import Scope
 from dependencies import (
+    get_scope,
     get_apify, get_company_repo, get_lead_intel_repo, get_optional_anthropic, get_post_repo, get_provider_call_repo,
     get_stakeholder_repo, require_manager, require_workspace_id,
 )  # fmt: skip
@@ -33,7 +38,17 @@ async def list_posts(
     lead_id: UUID | None = Query(default=None, alias="leadId"),
     workspace_id: UUID = Depends(require_workspace_id),
     posts: PostRepo = Depends(get_post_repo),
+    scope: Scope = Depends(get_scope),
 ) -> list[PostOut]:
+    """A lead's posts (every lead's without one). A Prospector reads only the posts of a person they may see."""
+    if scope.limited:
+        if lead_id is None:
+            raise HTTPException(status_code=422, detail="leadId is required")
+        person = await posts.session.scalar(select(Stakeholder.id).where(Stakeholder.workspace_id == workspace_id,
+                                                                          Stakeholder.lead_id == lead_id).limit(1))  # fmt: skip
+        if person is None:
+            raise HTTPException(status_code=404, detail="Person not found")
+        await scope.check_person(posts.session, person)
     return [PostOut.model_validate(p) for p in await posts.list(workspace_id, lead_id)]
 
 

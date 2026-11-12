@@ -20,7 +20,9 @@ from config import get_settings
 from background import report
 from services import enrich, exports, record_data
 from crud import PRODUCT_FIELDS, CompanyFilters, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
+from services.access import Scope
 from dependencies import (
+    get_scope,
     get_smart_list_repo,
     get_company_repo,
     get_exclusion_repo,
@@ -145,8 +147,11 @@ async def page_companies(
     offset: int = Query(default=0, ge=0),
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
+    scope: Scope = Depends(get_scope),
 ) -> CompaniesPageOut:
-    """One page of the Companies list, filtered and counted in the database (only the rows shown are read)."""
+    """One page of the Companies list, filtered and counted in the database (only the rows shown are read). A
+    Prospector's has only the companies they may see (services/access.py)."""
+    f.scope = scope.companies()
     rows, total = await companies.page(workspace_id, f, limit, offset)
     people = await companies.people_counts([c.id for c in rows])
     counts = await companies.status_counts(workspace_id, f)
@@ -162,8 +167,10 @@ async def matching_companies(
     f: CompanyFilters = Depends(company_filters),
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
+    scope: Scope = Depends(get_scope),
 ) -> list[CompanyBriefOut]:
     """Every company matching these filters, in list order, as the few fields selecting needs (Select all)."""
+    f.scope = scope.companies()
     return [CompanyBriefOut.model_validate(r) for r in await companies.matching(workspace_id, f, MATCHING_CAP)]
 
 
@@ -444,8 +451,10 @@ async def get_company(
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
     lists: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> PipelineCompanyDetailOut:
     """One company, for its own page, with everything stored about it (its record and its people's Apollo columns)."""
+    await scope.check_company(companies.session, company_id)
     company = await companies.get(workspace_id, company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -460,8 +469,10 @@ async def company_content(
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
     posts: PostRepo = Depends(get_post_repo),
+    scope: Scope = Depends(get_scope),
 ) -> CompanyContentOut:
     """What research read for a company: each website page's full text, and its own Instagram posts."""
+    await scope.check_company(companies.session, company_id)
     if not await companies.get(workspace_id, company_id):
         raise HTTPException(status_code=404, detail="Company not found")
     return CompanyContentOut(

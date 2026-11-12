@@ -912,6 +912,8 @@ class PeopleFilters:
     email_state: str | None = None
     company_text: str | None = None
     pipeline_company_id: UUID | None = None
+    # Who's asking may see only some people (services/access.Scope.people): a condition, or None for everyone.
+    scope: Any = None
 
 
 class StakeholderRepo:
@@ -945,6 +947,8 @@ class StakeholderRepo:
     @staticmethod
     def _base(workspace_id: UUID, f: PeopleFilters) -> list[Any]:
         out: list[Any] = [Stakeholder.workspace_id == workspace_id]
+        if f.scope is not None:
+            out.append(f.scope)
         if f.pipeline_company_id:
             out.append(Stakeholder.company_id == f.pipeline_company_id)
         if f.archive == "active":
@@ -1617,6 +1621,8 @@ class CompanyFilters:
     contacts: str | None = None
     score_band: str | None = None
     icp_state: str | None = None
+    # Who's asking may see only some companies (services/access.Scope.companies): a condition, or None for all.
+    scope: Any = None
 
 
 class CompanyRepo:
@@ -1632,6 +1638,8 @@ class CompanyRepo:
     def _base(workspace_id: UUID, f: "CompanyFilters") -> list[Any]:
         """The ICP and the archive filter: what the tab counts and the source options cover."""
         out: list[Any] = [Company.workspace_id == workspace_id]
+        if f.scope is not None:
+            out.append(f.scope)
         if f.icp_id:
             out.append(Company.icp_id == f.icp_id)
         if f.archive == "active":
@@ -2789,7 +2797,8 @@ class SmartListRepo:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def lists(self, workspace_id: UUID, kind: str) -> list[tuple[SmartList, int]]:
+    async def lists(self, workspace_id: UUID, kind: str, only: set[UUID] | None = None) -> list[tuple[SmartList, int]]:
+        """The lists of this kind with how many are in each; with `only`, just those lists (a Prospector's)."""
         count = (
             select(SmartListMember.list_id, func.count().label("n"))
             .where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind)
@@ -2799,9 +2808,10 @@ class SmartListRepo:
         rows = await self.session.execute(
             select(SmartList, func.coalesce(count.c.n, 0))
             .outerjoin(count, count.c.list_id == SmartList.id)
-            .where(SmartList.workspace_id == workspace_id, SmartList.kind == kind)
+            .where(SmartList.workspace_id == workspace_id, SmartList.kind == kind,
+                   SmartList.id.in_(only) if only is not None else literal(True))
             .order_by(func.coalesce(count.c.n, 0).desc(), SmartList.name)
-        )
+        )  # fmt: skip
         return [(row[0], int(row[1])) for row in rows]
 
     async def get(self, workspace_id: UUID, list_id: UUID) -> SmartList | None:
@@ -2824,8 +2834,11 @@ class SmartListRepo:
         model, query = self._unsorted(workspace_id, kind)
         return list(await self.session.scalars(query.where(model.id.in_(ids))))
 
-    async def count_unsorted(self, workspace_id: UUID, kind: str) -> int:
+    async def count_unsorted(self, workspace_id: UUID, kind: str, scope: Any = None) -> int:
+        """How many aren't in a list; with `scope`, only among those the asker may see."""
         _, query = self._unsorted(workspace_id, kind)
+        if scope is not None:
+            query = query.where(scope)
         return int(await self.session.scalar(select(func.count()).select_from(query.subquery())) or 0)
 
     async def sorted_keys(self, workspace_id: UUID, kind: str) -> dict[str, UUID]:
@@ -2967,7 +2980,7 @@ class SmartListRepo:
         return moved + len(unsorted)
 
     def _candidates(self, workspace_id: UUID, kind: str, list_id: UUID, icp: str | None, in_list: str | None,
-                    facets: dict[str, str], q: str | None) -> tuple[Any, Any, Any, Any, tuple[Any, ...]]:  # fmt: skip
+                    facets: dict[str, str], q: str | None, scope: Any = None) -> tuple[Any, Any, Any, Any, tuple[Any, ...]]:  # fmt: skip
         """Who can be added to a list, as the Add dialog filtered them: not already in it; by ICP, by the list they're in
         now and by the yes/no facts; and the search inside the name or the detail line it shows."""
         company = kind == "company"
@@ -2990,6 +3003,8 @@ class SmartListRepo:
                                     func.nullif(Stakeholder.email, ""))  # fmt: skip
             order = (Stakeholder.found_at.desc(), Stakeholder.id)
         where: list[Any] = [model.workspace_id == workspace_id, or_(current.is_(None), current != list_id)]
+        if scope is not None:
+            where.append(scope)
         if icp and icp != "all":
             where.append(icp_col.is_(None) if icp == "none" else icp_col == UUID(icp))
         if in_list and in_list != "all":
@@ -3005,15 +3020,15 @@ class SmartListRepo:
         return model, name, detail, current, (where, icp_col, order)
 
     async def candidates(self, workspace_id: UUID, kind: str, list_id: UUID, icp: str | None, in_list: str | None, facets: dict[str, str],
-                         q: str | None, limit: int, offset: int) -> tuple[list[Any], int]:  # fmt: skip
-        model, name, detail, current, (where, icp_col, order) = self._candidates(workspace_id, kind, list_id, icp, in_list, facets, q)
+                         q: str | None, limit: int, offset: int, scope: Any = None) -> tuple[list[Any], int]:  # fmt: skip
+        model, name, detail, current, (where, icp_col, order) = self._candidates(workspace_id, kind, list_id, icp, in_list, facets, q, scope)
         total = (await self.session.execute(select(func.count()).select_from(model).where(*where))).scalar_one()
         query = select(model.id, name, detail, icp_col, current).where(*where).order_by(*order).limit(limit).offset(offset)
         return list((await self.session.execute(query)).all()), total
 
     async def candidate_ids(self, workspace_id: UUID, kind: str, list_id: UUID, icp: str | None, in_list: str | None,
-                            facets: dict[str, str], q: str | None, cap: int) -> list[Any]:  # fmt: skip
-        model, _, _, current, (where, _, order) = self._candidates(workspace_id, kind, list_id, icp, in_list, facets, q)
+                            facets: dict[str, str], q: str | None, cap: int, scope: Any = None) -> list[Any]:  # fmt: skip
+        model, _, _, current, (where, _, order) = self._candidates(workspace_id, kind, list_id, icp, in_list, facets, q, scope)
         return list((await self.session.execute(select(model.id, current).where(*where).order_by(*order).limit(cap))).all())
 
     async def memberships(self, workspace_id: UUID, kind: str) -> dict[UUID, UUID]:

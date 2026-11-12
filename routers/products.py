@@ -8,7 +8,8 @@ import anthropic
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from crud import ProductRepo, PromptRepo, ProviderCallRepo
-from dependencies import get_product_repo, get_prompt_repo, get_provider_call_repo, get_optional_anthropic, require_manager, require_workspace_id
+from services.access import AccessRepo, Scope
+from dependencies import get_access_repo, get_scope, require_runner, get_product_repo, get_prompt_repo, get_provider_call_repo, get_optional_anthropic, require_manager, require_workspace_id
 from schemas import ProductIn, ProductOut
 from services.product_suggestions import suggest_product
 from services.prompts import PLACEHOLDER
@@ -34,9 +35,13 @@ async def _get(products: ProductRepo, workspace_id: UUID, product_id: UUID):
 
 @router.get("", response_model=list[ProductOut])
 async def list_products(
-    workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo)
+    workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo),
+    scope: Scope = Depends(get_scope),
 ) -> list[ProductOut]:
-    return [await _out(products, workspace_id, p) for p in await products.list(workspace_id)]
+    """The workspace's products. A Prospector gets theirs and those shared with them, each saying if they may edit it."""
+    only = await scope.ids("product")
+    return [(await _out(products, workspace_id, p)).model_copy(update={"can_edit": await scope.can_edit("product", p.id)})
+            for p in await products.list(workspace_id) if only is None or p.id in only]  # fmt: skip
 
 
 @router.post("/suggest", dependencies=[Depends(require_manager)])
@@ -74,9 +79,10 @@ async def product_suggestions(
             "promptId":str(version.prompt_id), "promptVersion":version.version}
 
 
-@router.post("", response_model=ProductOut, status_code=201, dependencies=[Depends(require_manager)])
+@router.post("", response_model=ProductOut, status_code=201, dependencies=[Depends(require_runner)])
 async def create_product(
-    body: ProductIn, workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo)
+    body: ProductIn, workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo),
+    scope: Scope = Depends(get_scope),
 ) -> ProductOut:
     if not await products.workspace_exists(workspace_id):
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -85,16 +91,20 @@ async def create_product(
         raise HTTPException(status_code=422, detail="Give the product a name")
     if await products.name_taken(workspace_id, values["name"]):
         raise HTTPException(status_code=409, detail="A product with this name already exists")
-    return await _out(products, workspace_id, await products.create(workspace_id, values))
+    product = await products.create(workspace_id, values)
+    await scope.created("product", product.id)
+    return await _out(products, workspace_id, product)
 
 
-@router.put("/{product_id}", response_model=ProductOut, dependencies=[Depends(require_manager)])
+@router.put("/{product_id}", response_model=ProductOut, dependencies=[Depends(require_runner)])
 async def update_product(
     product_id: UUID,
     body: ProductIn,
     workspace_id: UUID = Depends(require_workspace_id),
     products: ProductRepo = Depends(get_product_repo),
+    scope: Scope = Depends(get_scope),
 ) -> ProductOut:
+    await scope.check("product", product_id, edit=True)
     product = await _get(products, workspace_id, product_id)
     values = _clean(body)
     if not values["name"]:
@@ -104,12 +114,15 @@ async def update_product(
     return await _out(products, workspace_id, await products.update(product, values))
 
 
-@router.delete("/{product_id}", status_code=204, dependencies=[Depends(require_manager)])
+@router.delete("/{product_id}", status_code=204, dependencies=[Depends(require_runner)])
 async def delete_product(
-    product_id: UUID, workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo)
+    product_id: UUID, workspace_id: UUID = Depends(require_workspace_id), products: ProductRepo = Depends(get_product_repo),
+    scope: Scope = Depends(get_scope), access: AccessRepo = Depends(get_access_repo),
 ) -> Response:
     """Delete a product. ICPs that sold it are left with no product (the foreign key clears it) until another
-    is picked; their own offer, if they have one, still lets emails be written."""
+    is picked; their own offer, if they have one, still lets emails be written. A Prospector deletes only their own."""
+    await scope.check("product", product_id, owner=True)
     product = await _get(products, workspace_id, product_id)
     await products.delete(product)
+    await access.forget("product", product_id)
     return Response(status_code=204)

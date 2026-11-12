@@ -140,9 +140,14 @@ class FakeSettings:
         return {"prospector_run_limit_usd": 3.0}
 
 
+START_ICP = uuid4()
+
+
 @pytest.fixture
-def world(client, monkeypatch):
+def world(client, monkeypatch, access):
     me = as_role("prospector")
+    access.items.append(SimpleNamespace(user_id=me.id, workspace_id=WORKSPACE_ID, kind="icp", resource_id=START_ICP, can_edit=False,
+                                        is_owner=False, granted_by=None))  # fmt: skip
     mine, theirs, my_maps = _run(me.id), _run(uuid4()), _run(me.id, "google_maps")
     runs = FakeRuns([mine, theirs, my_maps])
     app.dependency_overrides[get_quickstart_repo] = lambda: runs
@@ -170,7 +175,7 @@ def test_a_prospector_sees_only_their_own_linkedin_runs(world) -> None:
 
 
 def _start(c, **kw):
-    body = {"icpId": str(uuid4()), "source": "linkedin", "searchTerms": ["custom apparel"], "places": [], "radiusMiles": 10,
+    body = {"icpId": str(START_ICP), "source": "linkedin", "searchTerms": ["custom apparel"], "places": [], "radiusMiles": 10,
             "googleRequests": 2, "companies": 5, "peoplePerCompany": 2, "titles": [], "findEmails": False, "leads": 5,
             "onlyWithEmail": False, "postsPerLead": 3, "maxPostAgeDays": 60, "spendLimitUsd": 2.5} | kw  # fmt: skip
     return c.post("/api/v1/quickstart/runs", headers=H, json=body)
@@ -185,6 +190,10 @@ def test_a_prospector_starts_linkedin_runs_within_the_cap_and_free_search_only(w
     ok = _start(c)
     assert ok.status_code == 201, ok.text
     assert world.runs.created[0].settings["source"] == "linkedin" and world.runs.created[0].settings["web_search"] == "brave"
+
+
+def test_a_prospector_starts_runs_only_for_an_icp_they_can_see(world) -> None:
+    assert _start(world.client, icpId=str(uuid4())).status_code == 404
 
 
 def test_management_isnt_held_to_the_prospector_cap(world) -> None:

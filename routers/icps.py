@@ -4,7 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from config import get_settings
 from crud import IcpCampaignRepo, IcpProfileRepo, ProductRepo, PromptRepo
+from services.access import AccessRepo, Scope
 from dependencies import (
+    get_access_repo, get_scope, require_runner,
     get_icp_campaign_repo,
     get_icp_profile_repo,
     get_lead_intel_icp_writer,
@@ -31,9 +33,15 @@ async def list_icps(
     workspace_id: UUID | None = Depends(get_workspace_id),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
+    scope: Scope = Depends(get_scope),
 ) -> list[Icp]:
-    """Lead Intel's ICPs. With X-Workspace-Id, each carries that workspace's outreach profile."""
+    """Lead Intel's ICPs. With X-Workspace-Id, each carries that workspace's outreach profile. A Prospector gets only
+    theirs and those shared with them, each saying whether they may edit it."""
     rows = await lead_intel.list_icps()
+    if (only := await scope.ids("icp")) is not None:
+        rows = [r for r in rows if r["id"] in only]
+        editable = {r["id"] for r in rows if await scope.can_edit("icp", r["id"])}
+        rows = [{**r, "can_edit": r["id"] in editable} for r in rows]
     by_id = await profiles.get_many(workspace_id, [row["id"] for row in rows]) if workspace_id else {}
     return [Icp.model_validate({**row, "profile": by_id.get(row["id"])}) for row in rows]
 
@@ -83,10 +91,12 @@ async def create_icp(
     writer: LeadIntelIcpWriter = Depends(get_lead_intel_icp_writer),
     sequencer: SequencerClient | None = Depends(get_optional_sequencer),
     links: IcpCampaignRepo = Depends(get_icp_campaign_repo),
-    _: object = Depends(require_manager),
+    _: object = Depends(require_runner),
+    scope: Scope = Depends(get_scope),
 ) -> Icp:
     """Add a new ICP to Lead Intel's icps table, which this app keeps using after Lead Intel shuts down.
-    Companies for it come from Google Maps or Apollo searches, not from Lead Intel's matching."""
+    Companies for it come from Google Maps or Apollo searches, not from Lead Intel's matching. A Prospector's ICP is
+    theirs, and gets no CheapSequencer campaign: they don't send (Management sets one up later if it's used)."""
     created_by = get_settings().lead_intel_icp_created_by
     if not created_by:
         raise HTTPException(status_code=503, detail="LEAD_INTEL_ICP_CREATED_BY is not set")
@@ -94,8 +104,9 @@ async def create_icp(
     if await writer.name_taken(values["name"]):
         raise HTTPException(status_code=409, detail="An ICP with this name already exists in Lead Intel")
     row = await writer.add_icp(created_by, values)
-    note = await _campaign_note(sequencer, links, row["id"], row["name"])
-    return Icp.model_validate({**row, "company_count": 0, "profile": None, "campaign_note": note})
+    await scope.created("icp", row["id"])
+    note = None if scope.limited else await _campaign_note(sequencer, links, row["id"], row["name"])
+    return Icp.model_validate({**row, "company_count": 0, "profile": None, "campaign_note": note, "can_edit": True})
 
 
 @router.put("/{icp_id}", response_model=Icp)
@@ -108,10 +119,12 @@ async def update_icp(
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
     sequencer: SequencerClient | None = Depends(get_optional_sequencer),
     links: IcpCampaignRepo = Depends(get_icp_campaign_repo),
-    _: object = Depends(require_manager),
+    _: object = Depends(require_runner),
+    scope: Scope = Depends(get_scope),
 ) -> Icp:
     """Edit an ICP's own fields in Lead Intel's icps table (shared: Lead Intel sees the change too).
     Only that ICP's row is updated. The next searches and research use the new definition."""
+    await scope.check("icp", icp_id, edit=True)
     values = _validated(body)
     if await writer.name_taken(values["name"], except_id=icp_id):
         raise HTTPException(status_code=409, detail="Another ICP in Lead Intel already has this name")
@@ -120,8 +133,8 @@ async def update_icp(
     # Read it back the usual way, so the answer matches GET /icps/{id} (company count, profile).
     row = await lead_intel.get_icp(icp_id)
     by_id = await profiles.get_many(workspace_id, [icp_id]) if workspace_id else {}
-    note = await _campaign_note(sequencer, links, icp_id, row["name"])
-    return Icp.model_validate({**row, "profile": by_id.get(icp_id), "campaign_note": note})
+    note = None if scope.limited else await _campaign_note(sequencer, links, icp_id, row["name"])
+    return Icp.model_validate({**row, "profile": by_id.get(icp_id), "campaign_note": note, "can_edit": True})
 
 
 @router.get("/{icp_id}", response_model=Icp)
@@ -130,15 +143,17 @@ async def get_icp(
     workspace_id: UUID | None = Depends(get_workspace_id),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
+    scope: Scope = Depends(get_scope),
 ) -> Icp:
+    await scope.check("icp", icp_id)
     row = await lead_intel.get_icp(icp_id)
     if not row:
         raise HTTPException(status_code=404, detail="ICP not found")
     by_id = await profiles.get_many(workspace_id, [icp_id]) if workspace_id else {}
-    return Icp.model_validate({**row, "profile": by_id.get(icp_id)})
+    return Icp.model_validate({**row, "profile": by_id.get(icp_id), "can_edit": await scope.can_edit("icp", icp_id)})
 
 
-@router.put("/{icp_id}/profile", response_model=IcpProfileOut, dependencies=[Depends(require_manager)])
+@router.put("/{icp_id}/profile", response_model=IcpProfileOut, dependencies=[Depends(require_runner)])
 async def save_icp_profile(
     icp_id: UUID,
     body: IcpProfileIn,
@@ -147,12 +162,20 @@ async def save_icp_profile(
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
     prompts: PromptRepo = Depends(get_prompt_repo),
     products: ProductRepo = Depends(get_product_repo),
+    scope: Scope = Depends(get_scope),
 ) -> IcpProfileOut:
-    """Save a workspace's outreach settings for a Lead Intel ICP. Writes `outreach.eo_icp_profiles` only."""
+    """Save a workspace's outreach settings for a Lead Intel ICP. Writes `outreach.eo_icp_profiles` only. A Prospector
+    changes an ICP they may edit, picks only a product they can see, and leaves its prompts as they are (prompts
+    aren't theirs)."""
     if not await profiles.workspace_exists(workspace_id):
         raise HTTPException(status_code=404, detail="Workspace not found")
+    await scope.check("icp", icp_id, edit=True)
     if not await lead_intel.get_icp(icp_id):
         raise HTTPException(status_code=404, detail="ICP not found")
+    if scope.limited:
+        current = (await profiles.get_many(workspace_id, [icp_id])).get(icp_id)
+        body = body.model_copy(update={k: getattr(current, k, None) for k in ("verify_prompt_id", "hook_prompt_id", "email_prompt_id")})
+        await scope.check("product", body.product_id)
     # A chosen prompt must be this workspace's, and of the right kind.
     for kind, prompt_id in (("verify", body.verify_prompt_id), ("hook", body.hook_prompt_id), ("email", body.email_prompt_id)):
         if prompt_id is None:
@@ -194,10 +217,13 @@ async def archive_icp(
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
     sequencer: SequencerClient | None = Depends(get_optional_sequencer),
     links: IcpCampaignRepo = Depends(get_icp_campaign_repo),
-    _: object = Depends(require_manager),
+    _: object = Depends(require_runner),
+    scope: Scope = Depends(get_scope),
 ) -> Icp:
     """Turn the ICP off (its `enabled` flag in Lead Intel) and archive its campaign. Its leads, companies
-    and history stay; Restore brings it back. Refused while its campaign still has leads in a sequence."""
+    and history stay; Restore brings it back. Refused while its campaign still has leads in a sequence. A Prospector
+    archives only an ICP they created (one shared with them may be in use elsewhere)."""
+    await scope.check("icp", icp_id, owner=True)
     if not await lead_intel.get_icp(icp_id):
         raise HTTPException(status_code=404, detail="ICP not found")
     note = await _retire(sequencer, links, icp_id)
@@ -214,13 +240,15 @@ async def restore_icp(
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
     sequencer: SequencerClient | None = Depends(get_optional_sequencer),
     links: IcpCampaignRepo = Depends(get_icp_campaign_repo),
-    _: object = Depends(require_manager),
+    _: object = Depends(require_runner),
+    scope: Scope = Depends(get_scope),
 ) -> Icp:
-    """Turn an archived ICP back on and give it a campaign again (a new draft copy)."""
+    """Turn an archived ICP back on and give it a campaign again (a new draft copy; not for a Prospector's own)."""
+    await scope.check("icp", icp_id, owner=True)
     row = await writer.update_icp(icp_id, {"enabled": True})
     if row is None:
         raise HTTPException(status_code=404, detail="ICP not found")
-    note = await _campaign_note(sequencer, links, icp_id, row["name"])
+    note = None if scope.limited else await _campaign_note(sequencer, links, icp_id, row["name"])
     return await _icp_out(icp_id, workspace_id, lead_intel, profiles, note)
 
 
@@ -231,6 +259,7 @@ async def delete_icp(
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     sequencer: SequencerClient | None = Depends(get_optional_sequencer),
     links: IcpCampaignRepo = Depends(get_icp_campaign_repo),
+    access: AccessRepo = Depends(get_access_repo),
     _: object = Depends(require_manager),
 ) -> None:
     """Delete the ICP from Lead Intel's icps table and archive its campaign. Its companies, people and leads in
@@ -248,4 +277,5 @@ async def delete_icp(
     if not await writer.delete_icp(icp_id):
         raise HTTPException(status_code=409, detail=f"{icp['name']} couldn't be deleted: Lead Intel has businesses in it now. Archive it instead.")
     await links.detach(icp_id)
+    await access.forget("icp", icp_id)
     await links.forget(icp_id)

@@ -13,7 +13,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from config import get_settings
 from background import report
 from crud import IcpCampaignRepo, IcpProfileRepo, PromptRepo, ProviderCallRepo, SmartListRepo
+from services.access import AccessRepo, Scope
 from dependencies import (
+    get_access_repo, get_scope, require_runner,
     get_icp_campaign_repo, get_icp_profile_repo, get_lead_intel_icp_writer, get_lead_intel_repo, get_optional_anthropic,
     get_optional_sequencer, get_prompt_repo, get_provider_call_repo, get_smart_list_repo, get_website_reader, require_manager, require_workspace_id,
 )  # fmt: skip
@@ -60,9 +62,15 @@ async def get_lists(
     kind: str = Query(default="company", pattern="^(company|person)$"),
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> SmartListsSummary:
-    lists = [_out(lst, n) for lst, n in await repo.lists(workspace_id, kind)]
-    return SmartListsSummary(lists=lists, unsorted=await repo.count_unsorted(workspace_id, kind))
+    """The lists of this kind. A Prospector gets theirs and those shared with them, each saying if they may edit it,
+    and "not in a list" counts only the companies (or people) they may see."""
+    only = await scope.ids("smart_list")
+    lists = [_out(lst, n).model_copy(update={"can_edit": await scope.can_edit("smart_list", lst.id)})
+             for lst, n in await repo.lists(workspace_id, kind, only)]  # fmt: skip
+    visible = scope.companies() if kind == "company" else scope.people()
+    return SmartListsSummary(lists=lists, unsorted=await repo.count_unsorted(workspace_id, kind, visible))
 
 
 async def sort_context(
@@ -157,6 +165,14 @@ def _candidate_filters(
     return {"kind": kind, "list_id": list_id, "icp": icp, "in_list": in_list, "facets": facets, "q": q}
 
 
+async def _scoped(f: dict[str, Any], scope: Scope) -> dict[str, Any]:
+    """The Add dialog's filters, for a Prospector only over what they may see and from lists they can see."""
+    await scope.check("smart_list", f["list_id"])
+    if f["in_list"] and f["in_list"] not in ("all", "none"):
+        await scope.check("smart_list", UUID(f["in_list"]))
+    return {**f, "scope": scope.companies() if f["kind"] == "company" else scope.people()}
+
+
 @router.get("/candidates", response_model=CandidatesPageOut)
 async def candidates(
     f: dict[str, Any] = Depends(_candidate_filters),
@@ -164,9 +180,10 @@ async def candidates(
     offset: int = Query(default=0, ge=0),
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> CandidatesPageOut:
     """One page of the companies or people that can be added to a list (not already in it), filtered in the database."""
-    rows, total = await repo.candidates(workspace_id, limit=limit, offset=offset, **f)
+    rows, total = await repo.candidates(workspace_id, limit=limit, offset=offset, **await _scoped(f, scope))
     return CandidatesPageOut(items=[CandidateOut(id=i, name=n, detail=d or "", icp_id=icp, list_id=cur) for i, n, d, icp, cur in rows], total=total)
 
 
@@ -175,9 +192,10 @@ async def candidate_ids(
     f: dict[str, Any] = Depends(_candidate_filters),
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> list[CandidateIdOut]:
     """Every matching candidate's id and current list (Select all)."""
-    return [CandidateIdOut(id=i, list_id=cur) for i, cur in await repo.candidate_ids(workspace_id, cap=20000, **f)]
+    return [CandidateIdOut(id=i, list_id=cur) for i, cur in await repo.candidate_ids(workspace_id, cap=20000, **await _scoped(f, scope))]
 
 
 @router.get("/facts", response_model=SmartListFactsOut)
@@ -200,22 +218,35 @@ async def export_people(
     return _csv(await _rows(repo, workspace_id, people), "people.csv")
 
 
-@router.post("/move", response_model=MoveMembersResult, dependencies=[Depends(require_manager)])
+@router.post("/move", response_model=MoveMembersResult, dependencies=[Depends(require_runner)])
 async def move_members(
-    body: MoveMembersIn, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+    body: MoveMembersIn, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> MoveMembersResult:
     """Move companies or people to another list, an existing one or a new one named here. A company moved to a list
-    whose ICP is created doesn't change ICP: that's set on the company."""
+    whose ICP is created doesn't change ICP: that's set on the company. A Prospector moves only companies or people
+    they may see, into a list they may edit, and out of no list but one they may edit (or none)."""
     if bool(body.to_list_id) == bool(body.new_list_name and body.new_list_name.strip()):
         raise HTTPException(status_code=422, detail="Pick a list to move them to, or name a new one.")
     if body.to_list_id:
+        await scope.check("smart_list", body.to_list_id, edit=True)
         target = await _list(repo, workspace_id, body.to_list_id)
         if target.kind != body.kind:
             raise HTTPException(status_code=422, detail="That list is for the other kind (companies or people).")
     else:
         name = " ".join(body.new_list_name.split())
-        target = await repo.get_or_create(workspace_id, body.kind, name, smart_lists.name_key(name))
-    moved = await repo.move(workspace_id, body.kind, list(dict.fromkeys(body.member_ids)), target.id)
+        key = smart_lists.name_key(name)
+        if scope.limited and any(other.name_key == key for other, _ in await repo.lists(workspace_id, body.kind)):
+            raise HTTPException(status_code=409, detail="A list with this name already exists. Pick another name.")
+        target = await repo.get_or_create(workspace_id, body.kind, name, key)
+        # The new list is committed with the move (or now, by scope.created, when a Prospector owns it).
+        await scope.created("smart_list", target.id)
+    ids = list(dict.fromkeys(body.member_ids))
+    if scope.limited:
+        ids = await scope.visible_members(repo.session, body.kind, ids)
+        held = await repo.memberships(workspace_id, body.kind)
+        ids = [i for i in ids if held.get(i) is None or await scope.can_edit("smart_list", held[i])]
+    moved = await repo.move(workspace_id, body.kind, ids, target.id)
     return MoveMembersResult(moved=moved, to_list_id=target.id, to_list_name=target.name)
 
 
@@ -234,11 +265,13 @@ async def get_list(
     verified: str = Query(default="", pattern="^(|yes|no)$"),
     workspace_id: UUID = Depends(require_workspace_id),
     repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> SmartListDetailOut:
     """A list with one page of its members (50 by default), optionally searched by name and filtered by whether they
     were written to yet, sent or queued, and have a verified email or any email (for a company, anyone at it), together."""
     if page_size not in PAGE_SIZES:
         raise HTTPException(status_code=422, detail=f"pageSize is one of {', '.join(map(str, PAGE_SIZES))}")
+    await scope.check("smart_list", list_id)
     lst = await _list(repo, workspace_id, list_id)
     members, matching = await repo.members_page(workspace_id, lst, (page - 1) * page_size, page_size, q,
                                                {"processed": processed, "emails": emails, "contacted": contacted, "verified": verified})
@@ -254,13 +287,14 @@ async def get_list(
             people.append(SmartListPersonOut(id=m.id, name=_name(m), title=m.title, company=m.organization_name, email=m.email,
                                              email_status=m.email_status, linkedin_url=m.linkedin_url, reason=member.reason,
                                              processed=m.id in written))  # fmt: skip
-    return SmartListDetailOut(**_out(lst, count).model_dump(), companies=companies, people=people, page=page, page_size=page_size,
-                              matching=matching)  # fmt: skip
+    return SmartListDetailOut(**_out(lst, count).model_dump(exclude={"can_edit"}), companies=companies, people=people, page=page,
+                              page_size=page_size, matching=matching, can_edit=await scope.can_edit("smart_list", lst.id))  # fmt: skip
 
 
-@router.post("", response_model=SmartListOut, status_code=201, dependencies=[Depends(require_manager)])
+@router.post("", response_model=SmartListOut, status_code=201, dependencies=[Depends(require_runner)])
 async def create_list(
-    body: SmartListCreateIn, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+    body: SmartListCreateIn, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope),
 ) -> SmartListOut:
     """An empty list to move companies or people into. Sorting also puts new ones in it when they fit."""
     name = " ".join(body.name.split())
@@ -269,23 +303,32 @@ async def create_list(
         raise HTTPException(status_code=409, detail="A list with this name already exists")
     lst = await repo.get_or_create(workspace_id, body.kind, name, key)
     await repo.save(lst)  # get_or_create leaves the commit to its caller
-    return _out(lst, 0)
+    await scope.created("smart_list", lst.id)
+    return _out(lst, 0).model_copy(update={"can_edit": True})
 
 
-@router.delete("/{list_id}", status_code=204, dependencies=[Depends(require_manager)])
+@router.delete("/{list_id}", status_code=204, dependencies=[Depends(require_runner)])
 async def delete_list(
-    list_id: UUID, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo)
+    list_id: UUID, workspace_id: UUID = Depends(require_workspace_id), repo: SmartListRepo = Depends(get_smart_list_repo),
+    scope: Scope = Depends(get_scope), access: AccessRepo = Depends(get_access_repo),
 ) -> None:
-    """Delete a list. Its companies or people are kept, back in "not in a list"; an ICP created from it stays."""
+    """Delete a list. Its companies or people are kept, back in "not in a list"; an ICP created from it stays. A
+    Prospector deletes only a list they created."""
+    await scope.check("smart_list", list_id, owner=True)
     await repo.delete(await _list(repo, workspace_id, list_id))
+    await access.forget("smart_list", list_id)
 
 
-@router.patch("/{list_id}", response_model=SmartListOut, dependencies=[Depends(require_manager)])
+@router.patch("/{list_id}", response_model=SmartListOut, dependencies=[Depends(require_runner)])
 async def update_list(
     list_id: UUID, body: SmartListUpdateIn, workspace_id: UUID = Depends(require_workspace_id),
-    repo: SmartListRepo = Depends(get_smart_list_repo),
+    repo: SmartListRepo = Depends(get_smart_list_repo), scope: Scope = Depends(get_scope),
 ) -> SmartListOut:  # fmt: skip
-    """Rename a list, or set its Lead Intel ICP (created from its draft, or an existing one)."""
+    """Rename a list, or set its Lead Intel ICP (created from its draft, or an existing one). A Prospector changes
+    only a list they may edit, and gives it only an ICP they can see."""
+    await scope.check("smart_list", list_id, edit=True)
+    if "lead_intel_icp_id" in body.model_fields_set:
+        await scope.check("icp", body.lead_intel_icp_id)
     lst = await _list(repo, workspace_id, list_id)
     if body.name is not None:
         key = smart_lists.name_key(body.name)

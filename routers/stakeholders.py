@@ -22,7 +22,9 @@ from crud import (
     lead_from_stakeholder,
 )  # fmt: skip
 from database import get_session
+from services.access import Scope
 from dependencies import (
+    get_scope,
     MANAGERS_ONLY,
     get_apify,
     get_apollo,
@@ -408,8 +410,11 @@ async def page_people(
     offset: int = Query(default=0, ge=0),
     workspace_id: UUID = Depends(require_workspace_id),
     stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    scope: Scope = Depends(get_scope),
 ) -> PeoplePageOut:
-    """One page of the People list, filtered in the database (only the rows shown are read)."""
+    """One page of the People list, filtered in the database (only the rows shown are read). A Prospector's has only
+    the people they may see (services/access.py)."""
+    f.scope = scope.people()
     rows, total = await stakeholders.page(workspace_id, f, limit, offset)
     leads = [s.lead_id for s, _ in rows if s.lead_id]
     queued = await stakeholders.queued_at(leads)
@@ -429,8 +434,10 @@ async def matching_people(
     f: PeopleFilters = Depends(people_filters),
     workspace_id: UUID = Depends(require_workspace_id),
     stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    scope: Scope = Depends(get_scope),
 ) -> list[PersonBriefOut]:
     """Every person matching these filters, in list order, as the few fields selecting needs (Select all)."""
+    f.scope = scope.people()
     return [PersonBriefOut.model_validate(r) for r in await stakeholders.matching(workspace_id, f, MATCHING_CAP)]
 
 
@@ -472,8 +479,10 @@ async def get_stakeholder(
     stakeholder_id: UUID,
     workspace_id: UUID = Depends(require_workspace_id),
     stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    scope: Scope = Depends(get_scope),
 ) -> StakeholderOut:
     """One person, for their own page."""
+    await scope.check_person(stakeholders.session, stakeholder_id)
     [person] = await stakeholders.get_many(workspace_id, [stakeholder_id]) or [None]
     if person is None:
         raise HTTPException(status_code=404, detail="Person not found")

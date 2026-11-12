@@ -917,6 +917,30 @@ class ExampleEmail(Base):
     updated_at: Mapped[datetime] = _updated()
 
 
+class Access(Base):
+    """Which ICPs, products and smart lists a Prospector may see (services/access.py). Whoever created an item owns
+    it; an admin shares others, editable or not. Everyone else sees the whole workspace, so has no rows here."""
+
+    __tablename__ = "eo_access"
+    __table_args__ = (
+        CheckConstraint(_in("kind", ("icp", "product", "smart_list")), name="kind"),
+        UniqueConstraint("user_id", "kind", "resource_id"),
+        Index("eo_access_resource_idx", "kind", "resource_id"),
+    )
+
+    id: Mapped[UUID] = _uuid_pk()
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("eo_users.id", ondelete="CASCADE"))
+    # Where it was shared (products and lists belong to one; ICPs are Lead Intel's, shared by every workspace).
+    workspace_id: Mapped[UUID] = _workspace()
+    kind: Mapped[str] = mapped_column(Text)
+    # An ICP's (Lead Intel's, no foreign key), a product's or a smart list's id, by kind.
+    resource_id: Mapped[UUID] = mapped_column()
+    can_edit: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    is_owner: Mapped[bool] = mapped_column(Boolean, server_default="false")
+    granted_by: Mapped[UUID | None] = _user_ref()
+    created_at: Mapped[datetime] = _created()
+
+
 class SavedView(Base):
     __tablename__ = "eo_saved_views"
     __table_args__ = (

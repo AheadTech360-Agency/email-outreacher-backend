@@ -14,9 +14,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from crud import UserRepo
-from dependencies import forget_sign_ins, get_current_user, get_supabase_admin, get_user_repo, require_admin
-from schemas import UserAdded, UserIn, UserOut, UserUpdate
+from crud import ProductRepo, SmartListRepo, UserRepo
+from dependencies import (
+    forget_sign_ins, get_access_repo, get_current_user, get_lead_intel_repo, get_product_repo, get_smart_list_repo, get_supabase_admin,
+    get_user_repo, require_admin,
+)  # fmt: skip
+from lead_intel import LeadIntelRepo
+from schemas import AccessIn, AccessOut, UserAdded, UserIn, UserOut, UserUpdate
+from services.access import AccessRepo
 from services.supabase_admin import SupabaseAdmin, SupabaseAdminError
 from services.auth import CurrentUser
 
@@ -95,6 +100,52 @@ async def update_user(
     user = await users.update(user, values, workspace_ids)
     forget_sign_ins()
     return _out(user, await users.workspace_ids(user.id))
+
+
+@router.get("/users/{user_id}/access", response_model=list[AccessOut])
+async def get_access(
+    user_id: UUID, _: CurrentUser = Depends(require_admin), users: UserRepo = Depends(get_user_repo),
+    access: AccessRepo = Depends(get_access_repo),
+) -> list[AccessOut]:
+    """The ICPs, products and smart lists a Prospector may see: theirs, and those shared with them."""
+    if await users.get(user_id) is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return [AccessOut(kind=a.kind, resource_id=a.resource_id, workspace_id=a.workspace_id, can_edit=a.can_edit or a.is_owner,
+                      is_owner=a.is_owner) for a in await access.rows(user_id)]  # fmt: skip
+
+
+@router.put("/users/{user_id}/access", response_model=list[AccessOut])
+async def set_access(
+    user_id: UUID,
+    body: AccessIn,
+    admin: CurrentUser = Depends(require_admin),
+    users: UserRepo = Depends(get_user_repo),
+    access: AccessRepo = Depends(get_access_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    products: ProductRepo = Depends(get_product_repo),
+    lists: SmartListRepo = Depends(get_smart_list_repo),
+) -> list[AccessOut]:
+    """Share ICPs, products and smart lists with a Prospector, each to use or to edit. Replaces what was shared
+    before; what they created stays theirs. Each item must exist, in a workspace they're in."""
+    user = await users.get(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role != "prospector":
+        raise HTTPException(status_code=422, detail="Only Prospectors see just what's shared with them; everyone else sees the whole workspace.")
+    workspaces = set(await users.workspace_ids(user_id))
+    icp_ids = {i["id"] for i in await lead_intel.list_icps()}
+    grants = []
+    for g in {(g.kind, g.resource_id): g for g in body.grants}.values():
+        if g.workspace_id not in workspaces:
+            raise HTTPException(status_code=422, detail="Give them that workspace first: an item can only be shared in a workspace they're in.")
+        found = (g.resource_id in icp_ids if g.kind == "icp" else await products.get(g.workspace_id, g.resource_id) is not None
+                 if g.kind == "product" else await lists.get(g.workspace_id, g.resource_id) is not None)  # fmt: skip
+        if not found:
+            raise HTTPException(status_code=422, detail=f"That {g.kind.replace('_', ' ')} doesn't exist in the workspace chosen.")
+        grants.append(g.model_dump())
+    await access.replace_shared(user_id, grants, admin.id)
+    forget_sign_ins()
+    return await get_access(user_id, admin, users, access)
 
 
 @router.delete("/users/{user_id}", status_code=204, response_class=Response)
