@@ -198,7 +198,7 @@ class Company(Base):
 
     __tablename__ = "eo_companies"
     __table_args__ = (
-        CheckConstraint(_in("source", ("lead_intel", "apollo", "google_maps")), name="source"),
+        CheckConstraint(_in("source", ("lead_intel", "apollo", "google_maps", "linkedin")), name="source"),
         CheckConstraint(_in("status", COMPANY_STATUSES), name="status"),
         CheckConstraint("score is null or score between 0 and 100", name="score"),
         Index("eo_companies_workspace_domain_key", "workspace_id", "domain", unique=True,

@@ -45,19 +45,28 @@ from models import Job, QuickstartRun
 
 log = logging.getLogger("coldbrew.quickstart")
 
-STEPS = ["find", "research", "website", "people", "leads", "profiles", "posts", "write"]
+STEPS = ["find", "google", "research", "website", "people", "leads", "profiles", "posts", "write", "analysis"]
 LABELS = {
     "find": "Find companies", "research": "Verify companies", "website": "Read websites", "people": "Fetch LinkedIn profiles",
     "leads": "Make leads", "profiles": "Fill in profiles", "posts": "Read their posts", "write": "Write emails",
+    "google": "Search the web", "analysis": "Analyse companies",
 }  # fmt: skip
+# The LinkedIn option (source "linkedin") ends with a brief per company instead of email drafts.
+LINKEDIN_STEPS = ["find", "google", "research", "people", "leads", "posts", "analysis"]
+WEB_BATCH, BRIEF_BATCH = 10, 10
 EXISTING_ONLY = ("website", "profiles")
 WEBSITE_BATCH = 25
 VERIFIED = ("verified", "valid")  # Apollo's word, and the LinkedIn finder's
 
 
 def steps_for(settings: dict[str, Any]) -> list[str]:
-    """The steps a run goes through: a Google Maps run has no website or profiles step."""
-    return STEPS if settings.get("source") == "existing" else [s for s in STEPS if s not in EXISTING_ONLY]
+    """The steps a run goes through: a Google Maps run has no website or profiles step; the LinkedIn option searches
+    the web and ends with company briefs instead of emails."""
+    source = settings.get("source")
+    if source == "linkedin":
+        return LINKEDIN_STEPS
+    plain = [s for s in STEPS if s not in ("google", "analysis")]
+    return plain if source == "existing" else [s for s in plain if s not in EXISTING_ONLY]
 RESEARCH_BATCH, PEOPLE_BATCH, POSTS_BATCH, WRITE_BATCH = 10, 10, 25, 25
 CRASHED = "Something went wrong running it. The worker's log has the details."
 
@@ -99,7 +108,8 @@ async def _step(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
     _set(run, run.step, state="running")
     await session.commit()
     return await {"find": _find, "research": _research, "website": _website, "people": _people, "leads": _leads,
-                  "profiles": _profiles, "posts": _posts, "write": _write}[run.step](session, repo, run)  # fmt: skip
+                  "profiles": _profiles, "posts": _posts, "write": _write, "google": _google,
+                  "analysis": _analysis}[run.step](session, repo, run)  # fmt: skip
 
 
 # ---------- Steps ----------
@@ -115,6 +125,8 @@ async def _find(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
         if not run.company_ids:
             return _finish(run, "Every company for this ICP already has someone written to.")
         return _next(run, "research")
+    if s.get("source") == "linkedin":
+        return await _find_on_linkedin(session, run)
     body = {"icpId": str(run.icp_id), "sources": ["google_maps"], "googleMaps": {
         "searchTerms": s["search_terms"], "locations": s["places"], "radiusMiles": s["radius_miles"], "maxSearches": s["google_requests"]}}  # fmt: skip
     # A search this run already finished (it failed just after, say) isn't paid for again.
@@ -129,6 +141,50 @@ async def _find(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
     if not run.company_ids:
         return _finish(run, "No new companies to verify. Try other search terms or places.")
     return _next(run, "research")
+
+
+async def _find_on_linkedin(session: Any, run: QuickstartRun) -> bool:
+    s = run.settings
+    body = {"icpId": str(run.icp_id), "searchTerms": s["search_terms"], "places": s["places"], "maxCompanies": s["companies"]}
+    # A search this run already finished (it failed just after, say) isn't paid for again.
+    done = await _finished_job(session, run, "/pipeline/find-linkedin")
+    ok, out, detail = (True, done, None) if done is not None else await _job(session, run, "/pipeline/find-linkedin", body,
+                                                                            "Quick Start: finding companies on LinkedIn")  # fmt: skip
+    if not ok:
+        return _fail(run, "find", detail)
+    out = out or {}
+    run.company_ids = [UUID(i) for i in out.get("companyIds", [])]
+    note = f"{out.get('added', 0)} new on LinkedIn" + (f", {out['duplicates']} already here" if out.get("duplicates") else "")
+    if out.get("notes"):
+        note += f". {out['notes'][0]}"
+    _set(run, "find", state="done", done=len(run.company_ids), total=s["companies"], note=note)
+    if not run.company_ids:
+        return _finish(run, "No new companies were found on LinkedIn. Try other search terms or places.")
+    return _next(run, "google")
+
+
+async def _google(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
+    """Web searches (free, SearXNG) for each company's missing website, Instagram and Facebook, before it's verified."""
+    tried = set(run.progress.get("_webbed", []))
+    todo = [i for i in run.company_ids if str(i) not in tried][:WEB_BATCH]
+    found = dict(run.progress.get("_web", {}))
+    if todo:
+        ok, out, detail = await _job(session, run, "/pipeline/web-search", {"companyIds": [str(i) for i in todo]}, "Quick Start: searching the web")
+        if not ok:
+            return _fail(run, "google", detail)
+        out = out or {}
+        if not out.get("searched") and out.get("notes"):
+            # Web search isn't set up, or refused: verify with what LinkedIn gave.
+            _set(run, "google", state="skipped", note=out["notes"][0])
+            return _next(run, "research")
+        for key in ("websites", "instagram", "facebook"):
+            found[key] = found.get(key, 0) + out.get(key, 0)
+        run.progress = {**run.progress, "_webbed": sorted(tried | {str(i) for i in todo}), "_web": found}
+    tried = set(run.progress.get("_webbed", []))
+    left = [i for i in run.company_ids if str(i) not in tried]
+    note = f"{found.get('websites', 0)} websites, {found.get('instagram', 0)} Instagram and {found.get('facebook', 0)} Facebook pages found"
+    _set(run, "google", state="running" if left else "done", done=len(tried), total=len(run.company_ids), note=note)
+    return True if left else _next(run, "research")
 
 
 async def _research(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
@@ -219,6 +275,21 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
         run.progress = {**run.progress, "_searched": sorted(searched | {str(i) for i in batch})}
     people = await repo.people_at(run.workspace_id, list(run.company_ids))
     left = len([i for i in qualified if str(i) not in set(run.progress.get("_searched", []))])
+    if not left and s.get("source") == "linkedin":
+        # The LinkedIn option also looks on the web for people LinkedIn's employee search didn't find there.
+        webbed = set(run.progress.get("_peopleweb", []))
+        nobody = [i for i in qualified if i not in {p.company_id for p in people} and str(i) not in webbed][:WEB_BATCH]
+        if nobody:
+            titles = s.get("titles") or await _icp_titles(session, run)
+            body = {"companyIds": [str(i) for i in nobody], "titles": titles, "maxPerCompany": s["people_per_company"]}
+            ok, out, detail = await _job(session, run, "/pipeline/people-web", body, "Quick Start: finding people on the web")
+            if not ok:
+                return _fail(run, "people", detail)
+            # Web search not set up: no company is tried again.
+            done = qualified if not (out or {}).get("companies") and (out or {}).get("notes") else nobody
+            run.progress = {**run.progress, "_peopleweb": sorted(webbed | {str(i) for i in done})}
+            _set(run, "people", state="running", note="Looking on the web for people at companies LinkedIn found no one at")
+            return True
     if not left:
         # Small shops are often not on LinkedIn but publish an address on their site (orders@, info@), which
         # research already read: that's the contact for a qualified company where no one with an email was found.
@@ -301,7 +372,7 @@ async def _leads(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
 def _after_profiles(run: QuickstartRun) -> bool:
     if run.settings["posts_per_lead"] == 0:
         _set(run, "posts", state="skipped", note="Posts per lead is 0")
-        return _next(run, "write")
+        return _next(run, _after_posts(run))
     return _next(run, "posts")
 
 
@@ -360,7 +431,33 @@ async def _posts(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
     if not sources:
         note = "LinkedIn and Instagram are both off for this ICP"
     _set(run, "posts", state="running" if left and sources else "done", done=len(tried), total=len(leads), note=note)
-    return True if left and sources else _next(run, "write")
+    return True if left and sources else _next(run, _after_posts(run))
+
+
+def _after_posts(run: QuickstartRun) -> str:
+    """The LinkedIn option ends with company briefs; the others with email drafts."""
+    return "analysis" if run.settings.get("source") == "linkedin" else "write"
+
+
+async def _analysis(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
+    """A brief per qualified company (Claude): who they are, signals, socials, what they post, hooks that will work."""
+    companies = await repo.companies(list(run.company_ids), brief=True)
+    qualified = [c.id for c in companies if c.status == "qualified"]
+    tried = set(run.progress.get("_briefed", []))
+    todo = [i for i in qualified if str(i) not in tried][:BRIEF_BATCH]
+    written = int(run.progress.get("_briefs", 0))
+    if todo:
+        ok, out, detail = await _job(session, run, "/pipeline/briefs", {"companyIds": [str(i) for i in todo]}, "Quick Start: analysing companies")
+        if not ok:
+            return _fail(run, "analysis", detail)
+        written += int((out or {}).get("written", 0))
+        run.progress = {**run.progress, "_briefed": sorted(tried | {str(i) for i in todo}), "_briefs": written}
+    left = [i for i in qualified if str(i) not in set(run.progress.get("_briefed", []))]
+    _set(run, "analysis", state="running" if left else "done", done=len(qualified) - len(left), total=len(qualified),
+         note=f"{written} compan{'ies' if written != 1 else 'y'} analysed")  # fmt: skip
+    if left:
+        return True
+    return _finish(run, f"Done: {written} compan{'ies are' if written != 1 else 'y is'} analysed below, with the hooks to use.")
 
 
 async def _write(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:

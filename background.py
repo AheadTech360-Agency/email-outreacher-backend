@@ -52,6 +52,10 @@ LONG_RUNNING: dict[str, str] = {
     "/pipeline/enrich": "Filling in companies",
     "/posts/gather": "Reading posts",
     "/stakeholders/enrich": "Reading LinkedIn profiles",
+    "/pipeline/find-linkedin": "Finding companies on LinkedIn",
+    "/pipeline/web-search": "Searching the web",
+    "/pipeline/people-web": "Finding people on the web",
+    "/pipeline/briefs": "Writing company briefs",
 }
 
 

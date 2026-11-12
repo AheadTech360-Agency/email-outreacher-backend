@@ -25,6 +25,8 @@ INSTAGRAM_ACTOR = "apify~instagram-scraper"
 INSTAGRAM_PROFILE_ACTOR = "apify~instagram-profile-scraper"
 LINKEDIN_COMPANY_ACTOR = "harvestapi~linkedin-company"  # $0.004 a company page
 LINKEDIN_PROFILE_ACTOR = "harvestapi~linkedin-profile-scraper"  # $0.004 a profile, no email search
+# LinkedIn company search by keywords and places (no cookies). Full mode carries website, size, industry and address.
+LINKEDIN_COMPANY_SEARCH_ACTOR = "harvestapi~linkedin-company-search"
 PROFILE_DETAILS = "Profile details no email ($4 per 1k)"
 
 RUN_TIMEOUT = 300  # seconds to wait for a run before giving up on it
@@ -116,6 +118,32 @@ def current_job_at(item: dict[str, Any], keys: set[str], linkedin_url: str | Non
     return None
 
 
+def employee_from_profile(item: dict[str, Any], keys: set[str], company_linkedin_url: str | None) -> Employee | None:
+    """A full LinkedIn profile (found by a web search) as a person at this company, or None when they don't work there
+    now: a current position, else an ongoing experience entry, at this company."""
+    url = item.get("linkedinUrl")
+    ext = item.get("id") or item.get("publicIdentifier") or linkedin_slug(url)
+    if not ext:
+        return None
+    position = current_job_at(item, keys, company_linkedin_url)
+    if position is None:
+        for job in item.get("experience") or []:
+            job = job or {}
+            end = job.get("endDate")
+            ongoing = not end or (isinstance(end, dict) and str(end.get("text") or "").lower() == "present")
+            name = job.get("companyName") or (job.get("company") or {}).get("name")
+            if ongoing and (_same_page(job.get("companyLinkedinUrl"), company_linkedin_url) or _key(name) in keys):
+                position = {"title": job.get("position") or job.get("title"), "companyName": name}
+                break
+    if position is None:
+        return None
+    return Employee(
+        external_id=str(ext), first_name=item.get("firstName") or "", last_name=item.get("lastName") or "",
+        title=position.get("title") or position.get("position") or item.get("headline") or "", linkedin_url=url,
+        company_name=position.get("companyName") or (position.get("company") or {}).get("name"), raw=item,
+    )  # fmt: skip
+
+
 def elsewhere(n: int) -> str | None:
     """The note for people a name search found at other companies."""
     if not n:
@@ -132,6 +160,41 @@ def best_email(item: dict[str, Any]) -> tuple[str | None, str | None]:
     rank = lambda e: (not e.get("free"), e.get("status") == "valid", bool(e.get("deliverable")), e.get("qualityScore") or 0)  # noqa: E731
     best = max(found, key=rank)
     return str(best["email"]).strip().lower(), str(best.get("status") or "unknown")
+
+
+@dataclass
+class FoundCompany:
+    """A company from LinkedIn's company search."""
+
+    name: str
+    linkedin_url: str | None
+    website_url: str | None
+    city: str | None
+    state: str | None
+    country: str | None
+    employees: int | None
+    industry: str | None
+    description: str | None
+    raw: dict[str, Any]
+
+
+def found_company(item: dict[str, Any]) -> FoundCompany | None:
+    """One search result as a company, or None without a name. Address fields vary by result, so each is optional."""
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return None
+    locations = item.get("locations") or []
+    first = next((loc for loc in locations if isinstance(loc, dict) and loc.get("headquarter")), locations[0] if locations and isinstance(locations[0], dict) else {})
+    parsed = first.get("parsed") if isinstance(first.get("parsed"), dict) else {}
+    industries = item.get("industries") or []
+    industry = next((str(i.get("name")) for i in industries if isinstance(i, dict) and i.get("name")), None)
+    employees = item.get("employeeCount")
+    return FoundCompany(
+        name=name, linkedin_url=item.get("linkedinUrl") or item.get("url"), website_url=item.get("website") or None,
+        city=parsed.get("city") or first.get("city"), state=parsed.get("state") or first.get("geographicArea"),
+        country=parsed.get("country") or first.get("country"), employees=employees if isinstance(employees, int) else None,
+        industry=industry, description=item.get("description") or item.get("tagline"), raw=item,
+    )  # fmt: skip
 
 
 @dataclass
@@ -426,6 +489,15 @@ class ApifyClient:
             if post := _instagram_post(item, owner):
                 posts.append(post)
         return posts, result
+
+    async def search_linkedin_companies(self, query: str, locations: list[str], max_items: int) -> tuple[list[FoundCompany], RunResult]:
+        """Companies LinkedIn finds for these keywords in these places (full details: website, size, industry,
+        address), up to `max_items`."""
+        actor_input: dict[str, Any] = {"searchQuery": query, "maxItems": max_items, "scraperMode": "full"}
+        if locations:
+            actor_input["locations"] = locations
+        result = await self.run(LINKEDIN_COMPANY_SEARCH_ACTOR, actor_input, max_items)
+        return [c for c in (found_company(i) for i in result.items) if c], result
 
     async def linkedin_companies(self, urls: list[str]) -> tuple[dict[str, dict[str, Any]], RunResult]:
         """LinkedIn company pages (description, size, industry, address, specialties...), keyed by the page's slug."""

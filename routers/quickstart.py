@@ -17,7 +17,8 @@ from lead_intel import LeadIntelRepo
 from models import QuickstartRun
 from routers.emails import NO_OFFER, has_offer
 from schemas import (
-    QuickstartCompanyOut, QuickstartDetailOut, QuickstartDraftOut, QuickstartIn, QuickstartLeadOut, QuickstartRunOut, QuickstartStep,
+    QuickstartBriefOut, QuickstartCompanyOut, QuickstartDetailOut, QuickstartDraftOut, QuickstartIn, QuickstartLeadOut, QuickstartRunOut,
+    QuickstartStep,
 )  # fmt: skip
 from services.auth import CurrentUser
 from services.quickstart import steps_for
@@ -91,6 +92,11 @@ async def start_run(
             raise HTTPException(status_code=422, detail="Add at least one search term and one place.")
         if body.companies > 100:
             raise HTTPException(status_code=422, detail="From Google Maps, verify up to 100 companies a run.")
+    elif body.source == "linkedin":
+        if not settings["search_terms"]:
+            raise HTTPException(status_code=422, detail="Add at least one search term to look for on LinkedIn.")
+        if body.companies > 200:
+            raise HTTPException(status_code=422, detail="From LinkedIn, find up to 200 companies a run.")
     elif not await runs.existing_companies(workspace_id, body.icp_id, body.smart_list_id, 1):
         raise HTTPException(status_code=422, detail="No companies for this ICP are waiting: each one already has someone written to.")
     run = await runs.create(workspace_id, user.id, body.icp_id, settings, body.spend_limit_usd)
@@ -159,6 +165,17 @@ async def get_run(
             for e in drafts
         ],
     )  # fmt: skip
+
+
+@router.get("/runs/{run_id}/briefs", response_model=list[QuickstartBriefOut])
+async def run_briefs(
+    run_id: UUID,
+    workspace_id: UUID = Depends(require_workspace_id),
+    runs: QuickstartRepo = Depends(get_quickstart_repo),
+) -> list[QuickstartBriefOut]:
+    """The company briefs a LinkedIn run wrote (best score first), with each company's links and latest posts."""
+    run = await _run(runs, workspace_id, run_id)
+    return [QuickstartBriefOut.model_validate(b) for b in await runs.briefs(list(run.company_ids))]
 
 
 @router.post("/runs/{run_id}/stop", response_model=QuickstartRunOut, dependencies=[Depends(require_manager)])

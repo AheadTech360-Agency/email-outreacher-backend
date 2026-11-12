@@ -16,7 +16,7 @@ PEOPLE_COLUMNS = [
 ]  # fmt: skip
 
 STATUS = {"found": "To research", "review": "To approve", "qualified": "Qualified", "not_fit": "Not a fit", "error": "Couldn't finish"}
-SOURCE = {"lead_intel": "Lead Intel", "apollo": "Apollo", "google_maps": "Google Maps"}
+SOURCE = {"lead_intel": "Lead Intel", "apollo": "Apollo", "google_maps": "Google Maps", "linkedin": "LinkedIn"}
 FOUND_BY = {"apollo": "Apollo", "apify_linkedin": "LinkedIn", "manual": "Added by hand or CSV"}
 
 

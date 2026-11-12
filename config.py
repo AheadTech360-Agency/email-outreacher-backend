@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     # Jina Reader, for websites that need a browser to render. Works without a key at a lower limit.
     jina_api_key: str | None = None
+    # A SearXNG instance (self-hosted, JSON output on): Quick Start's LinkedIn option uses it for web searches to
+    # find each company's website, socials and people. Free; without it those searches are skipped.
+    searxng_url: str | None = None
+    # The model that writes a company's outreach brief (Quick Start's LinkedIn option). Haiku is about 0.1 cents a
+    # company; claude-sonnet-5-5 gives deeper hooks for about 2 cents.
+    claude_brief_model: str = "claude-haiku-5-5"
     # Requests per minute to allow Jina. Defaults sit just under its published limits
     # (20 without a key, 500 with one) so a burst never trips them.
     jina_rpm: int | None = None

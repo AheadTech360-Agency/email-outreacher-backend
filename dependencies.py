@@ -43,7 +43,9 @@ from services.auth import AuthError, CurrentUser, verify
 from services.generation import EmailWriter
 from services.google_places import PlacesClient
 from services.jina import JinaClient
+from services.briefs import BriefWriter
 from services.scoring import CompanyScorer
+from services.searxng import SearxClient
 from services.sending import InboxesClient, SequencerClient
 from services.website import WebsiteReader
 
@@ -388,6 +390,27 @@ async def get_website_reader() -> AsyncIterator[WebsiteReader]:
     finally:
         await reader.aclose()
         await jina.aclose()
+
+
+async def get_optional_searx() -> AsyncIterator[SearxClient | None]:
+    """Web search through the workspace's SearXNG instance (SEARXNG_URL), or None when it isn't set."""
+    url = get_settings().searxng_url
+    client = SearxClient(url) if url else None
+    try:
+        yield client
+    finally:
+        if client:
+            await client.aclose()
+
+
+async def get_optional_brief_writer() -> AsyncIterator[BriefWriter | None]:
+    settings = get_settings()
+    writer = BriefWriter(settings.anthropic_api_key, settings.claude_brief_model, base_url=settings.anthropic_base_url) if settings.anthropic_api_key else None
+    try:
+        yield writer
+    finally:
+        if writer:
+            await writer.aclose()
 
 
 async def get_optional_scorer() -> AsyncIterator[CompanyScorer | None]:

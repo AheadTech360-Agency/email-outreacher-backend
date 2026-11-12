@@ -14,7 +14,7 @@ from models import (
     Company, CompanyPage, Email, EmailFeedback, ExampleEmail, IcpCampaign, IcpProfile, Product, Settings, Insight, Lead, Post, Prompt, PromptVersion, ProviderCall, Stakeholder,
     Exclusion, Job, QueuedAddress, QuickstartRun, SendEvent, SmartList, SmartListMember, User, Workspace, WorkspaceCompany, WorkspaceMember, FALLBACK_2, FALLBACK_3, FALLBACK_4, FALLBACK_5,
 )  # fmt: skip
-from services.apify import Employee, FetchedPost, search_name
+from services.apify import Employee, FetchedPost, linkedin_slug, search_name
 from services.cost_estimate import DEFAULT_ESTIMATE, upgrade as upgrade_estimate
 from services.apollo import ApolloOrganization, FoundPerson, RevealedPerson
 from services.google_places import Place
@@ -23,6 +23,7 @@ from services.leads import Existing, LeadInput, clean_lead
 from services.prompts import DEFAULTS
 from services import listing
 from services.smart_lists import company_key, person_key
+from services.website import normalize_domain
 
 
 def _skip(*columns: Any) -> list[Any]:
@@ -1732,6 +1733,30 @@ class CompanyRepo:
             )
         await self.session.commit()
 
+    async def brief_material(self, workspace_id: UUID, company: Company) -> dict[str, Any]:
+        """What a company's brief is written from, besides the company itself: its website pages, its recent posts and
+        its people's, and the people found there."""
+        pages = list(await self.session.scalars(
+            select(CompanyPage).where(CompanyPage.workspace_id == workspace_id, CompanyPage.company_id == company.id)
+            .order_by(CompanyPage.fetched_at, CompanyPage.url).limit(4)
+        ))  # fmt: skip
+        people = list(await self.session.scalars(
+            select(Stakeholder).options(*_skip(Stakeholder.raw))
+            .where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id == company.id).limit(10)
+        ))  # fmt: skip
+        lead_ids = [p.lead_id for p in people if p.lead_id]
+        owners = [Post.company_id == company.id] + ([Post.lead_id.in_(lead_ids)] if lead_ids else [])
+        posts = list(await self.session.scalars(
+            select(Post).options(*_skip(Post.raw)).where(Post.workspace_id == workspace_id, or_(*owners))
+            .order_by(Post.posted_at.desc().nulls_last()).limit(12)
+        ))  # fmt: skip
+        return {
+            "website_pages": [{"url": p.url, "text": (p.text or "")[:3000]} for p in pages],
+            "posts": [{"source": p.source, "whose": "person" if p.lead_id else "company", "posted": p.posted_at.date().isoformat() if p.posted_at else None,
+                       "text": (p.text or "")[:800], "url": p.url} for p in posts],  # fmt: skip
+            "people": [{"name": f"{p.first_name} {p.last_name}".strip(), "title": p.title, "email": bool(p.email), "linkedin": p.linkedin_url} for p in people],
+        }
+
     async def pages(self, workspace_id: UUID, company_id: UUID) -> list[CompanyPage]:
         query = select(CompanyPage).where(CompanyPage.workspace_id == workspace_id, CompanyPage.company_id == company_id)
         return list(await self.session.scalars(query.order_by(CompanyPage.fetched_at, CompanyPage.url)))
@@ -1870,13 +1895,52 @@ class CompanyRepo:
 
         return add
 
+    async def _identity_keys(self, workspace_id: UUID) -> set[tuple[str, str]]:
+        """Every identity key of the workspace's companies (place id, domain, phone, name and place, LinkedIn page),
+        read as those few columns only."""
+        rows = await self.session.execute(
+            select(Company.google_place_id, Company.domain, Company.phone, Company.name, Company.city, Company.state, Company.linkedin_url)
+            .where(Company.workspace_id == workspace_id)
+        )  # fmt: skip
+        known: set[tuple[str, str]] = set()
+        for place_id, domain, phone, name, city, state, linkedin_url in rows:
+            known |= set(identity_keys(place_id=place_id, domain=domain, phone=phone, name=name, city=city, state=state))
+            if slug := linkedin_slug(linkedin_url):
+                known.add(("linkedin", slug))
+        return known
+
+    async def add_linkedin(self, workspace_id: UUID, icp_id: UUID, found: list[Any]) -> tuple[list[UUID], int]:
+        """Add companies from LinkedIn's company search, to be checked. Returns (the new ids, duplicates). A duplicate
+        shares any identity key with a company already here, from any source, or the same LinkedIn page."""
+        known = await self._identity_keys(workspace_id)
+        new_ids: list[UUID] = []
+        dupes = 0
+        for c in found:
+            domain = normalize_domain(c.website_url) if c.website_url else None
+            keys = set(identity_keys(domain=domain, name=c.name, city=c.city, state=c.state))
+            if slug := linkedin_slug(c.linkedin_url):
+                keys.add(("linkedin", slug))
+            if known & keys:
+                dupes += 1
+                continue
+            row = Company(
+                workspace_id=workspace_id, icp_id=icp_id, source="linkedin", name=c.name, domain=domain, website_url=c.website_url,
+                linkedin_url=c.linkedin_url, city=c.city, state=c.state, status="found",
+                raw={"country": c.country, "employees": c.employees, "industry": c.industry, "description": c.description,
+                     "linkedin": {k: c.raw.get(k) for k in ("followerCount", "employeeCountRange", "specialities", "foundedOn", "tagline") if c.raw.get(k)}},
+            )  # fmt: skip
+            self.session.add(row)
+            await self.session.flush()
+            new_ids.append(row.id)
+            known |= keys
+        await self.session.commit()
+        return new_ids, dupes
+
     async def add_google_maps(self, workspace_id: UUID, icp_id: UUID, places: list[tuple[Place, str | None]]) -> tuple[int, int]:
         """Add Google Maps businesses to be researched, each with its website domain (or None).
         Returns (added, duplicates). A duplicate shares any identity key with a company already here,
         from any source: place id, domain, phone, or name and city (Lead Intel's keys)."""
-        known: set[tuple[str, str]] = set()
-        for c in await self.session.scalars(select(Company).where(Company.workspace_id == workspace_id)):
-            known |= set(identity_keys(place_id=c.google_place_id, domain=c.domain, phone=c.phone, name=c.name, city=c.city, state=c.state))
+        known = await self._identity_keys(workspace_id)
         added = dupes = 0
         for place, domain in places:
             keys = identity_keys(place_id=place.place_id, domain=domain, phone=place.phone, name=place.name, city=place.city, state=place.state)
@@ -2654,6 +2718,41 @@ class QuickstartRepo:
             return []
         query = select(Email).where(Email.lead_id.in_(lead_ids), Email.step == 1).order_by(Email.created_at)
         return list(await self.session.scalars(query.execution_options(populate_existing=True)))
+
+    async def briefs(self, company_ids: list[UUID]) -> list[dict[str, Any]]:
+        """The analysed companies of a run: what the analysis page shows, with the brief read out of the research JSON
+        (not the whole research), and each company's three latest posts (its own or its people's)."""
+        if not company_ids:
+            return []
+        rows = (await self.session.execute(
+            select(Company.id, Company.name, Company.domain, Company.website_url, Company.linkedin_url, Company.instagram_url,
+                   Company.facebook_url, Company.city, Company.state, Company.score, Company.status, Company.research.op("->")("brief"),
+                   Company.raw.op("->>")("employees"), Company.raw.op("->>")("industry"))
+            .where(Company.id.in_(company_ids), Company.research.op("?")("brief"))
+            .order_by(Company.score.desc().nulls_last(), Company.name)
+        )).all()  # fmt: skip
+        ids = [r[0] for r in rows]
+        people = (await self.session.execute(
+            select(Stakeholder.company_id, Stakeholder.lead_id).where(Stakeholder.company_id.in_(ids), Stakeholder.lead_id.is_not(None))
+        )).all() if ids else []  # fmt: skip
+        company_of_lead = {lead: cid for cid, lead in people}
+        recent: dict[UUID, list[dict[str, Any]]] = {}
+        if ids:
+            owners = [Post.company_id.in_(ids)] + ([Post.lead_id.in_(list(company_of_lead))] if company_of_lead else [])
+            posts = await self.session.execute(
+                select(Post.company_id, Post.lead_id, Post.source, Post.url, Post.posted_at, func.left(Post.text, 400))
+                .where(or_(*owners)).order_by(Post.posted_at.desc().nulls_last()).limit(len(ids) * 12)
+            )  # fmt: skip
+            for cid, lead, source, url, posted, text_ in posts:
+                key = cid or company_of_lead.get(lead)
+                if key and len(recent.setdefault(key, [])) < 3:
+                    recent[key].append({"source": source, "url": url, "posted_at": posted, "text": text_, "whose": "person" if lead else "company"})
+        return [
+            {"id": r[0], "name": r[1], "domain": r[2], "website_url": r[3], "linkedin_url": r[4], "instagram_url": r[5], "facebook_url": r[6],
+             "city": r[7], "state": r[8], "score": r[9], "status": r[10], "brief": r[11], "employees": int(r[12]) if (r[12] or "").isdigit() else None,
+             "industry": r[13], "posts": recent.get(r[0], [])}
+            for r in rows
+        ]  # fmt: skip
 
     async def post_counts(self, lead_ids: list[UUID]) -> dict[UUID, int]:
         if not lead_ids:

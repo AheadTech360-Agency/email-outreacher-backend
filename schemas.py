@@ -1043,6 +1043,60 @@ class CompanyDecisionResult(ApiModel):
     changed: int
 
 
+class LinkedInFindIn(ApiModel):
+    """Find companies with LinkedIn's company search: each search term in turn, in these places, up to the limit."""
+
+    icp_id: UUID
+    search_terms: list[str] = Field(min_length=1, max_length=10)
+    places: list[str] = Field(default=[], max_length=10)
+    max_companies: int = Field(default=50, ge=1, le=500)
+
+
+class LinkedInFindResult(ApiModel):
+    added: int
+    duplicates: int
+    company_ids: list[UUID]
+    cost_usd: float | None = None
+    notes: list[str] = []
+
+
+class CompanyIdsIn(ApiModel):
+    company_ids: list[UUID] = Field(min_length=1, max_length=25)
+
+
+class WebSearchResult(ApiModel):
+    """Web searches for these companies' missing website, Instagram and Facebook: how many of each were found."""
+
+    searched: int
+    websites: int
+    instagram: int
+    facebook: int
+    notes: list[str] = []
+
+
+class PeopleWebIn(ApiModel):
+    company_ids: list[UUID] = Field(min_length=1, max_length=10)
+    titles: list[str] = Field(default=[], max_length=30)
+    max_per_company: int = Field(default=3, ge=1, le=10)
+
+
+class PeopleWebResult(ApiModel):
+    """People at these companies found through web searches for their LinkedIn profiles, then read from LinkedIn."""
+
+    companies: int
+    profiles: int
+    new: int
+    cost_usd: float | None = None
+    notes: list[str] = []
+
+
+class BriefsResult(ApiModel):
+    written: int
+    failed: int
+    cost_usd: float | None = None
+    notes: list[str] = []
+
+
 class PipelineStakeholdersIn(ApiModel):
     company_ids: list[UUID] = Field(min_length=1, max_length=25)
     source: Literal["apollo", "linkedin"] = "apollo"
@@ -1627,7 +1681,9 @@ class QuickstartIn(ApiModel):
     icp_id: UUID
     # google_maps: search for new companies. existing: work companies already here (imported ones, say) that no
     # one has written to yet, optionally only those in one smart list.
-    source: Literal["google_maps", "existing"] = "google_maps"
+    # google_maps: find on Google Maps; existing: companies already here; linkedin: find on LinkedIn, search the web,
+    # verify, find people, read posts, and end with a brief per company.
+    source: Literal["google_maps", "existing", "linkedin"] = "google_maps"
     smart_list_id: UUID | None = None
     search_terms: list[str] = Field(default=[], max_length=10)
     places: list[str] = Field(default=[], max_length=10)
@@ -1734,6 +1790,35 @@ class QuickstartDraftOut(ApiModel):
     status: str
     score: int | None
     flags: list[str]
+
+
+class BriefPostOut(ApiModel):
+    source: str
+    url: str
+    posted_at: datetime | None
+    text: str
+    whose: str
+
+
+class QuickstartBriefOut(ApiModel):
+    """An analysed company of a LinkedIn run: its data, links, latest posts and the brief (summary, fit, signals,
+    online presence, posting themes, hooks, who to email first, cautions)."""
+
+    id: UUID
+    name: str
+    domain: str | None
+    website_url: str | None
+    linkedin_url: str | None
+    instagram_url: str | None
+    facebook_url: str | None
+    city: str | None
+    state: str | None
+    score: int | None
+    status: str
+    employees: int | None
+    industry: str | None
+    brief: dict[str, Any]
+    posts: list[BriefPostOut]
 
 
 class QuickstartDetailOut(QuickstartRunOut):

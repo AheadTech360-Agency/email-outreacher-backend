@@ -10,6 +10,7 @@
 Lead Intel is only read here.
 """
 
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -28,7 +29,9 @@ from dependencies import (
     get_optional_apify,
     get_optional_apollo,
     get_optional_places,
+    get_optional_brief_writer,
     get_optional_scorer,
+    get_optional_searx,
     get_post_repo,
     get_product_repo,
     get_prompt_repo,
@@ -60,12 +63,24 @@ from schemas import (
     CompaniesPageOut,
     CompanyBriefOut,
     PipelineStakeholdersIn,
+    BriefsResult,
+    CompanyIdsIn,
+    LinkedInFindIn,
+    LinkedInFindResult,
+    PeopleWebIn,
+    PeopleWebResult,
+    WebSearchResult,
     ResearchIn,
     ResearchResult,
     SourceFindResult,
     StakeholderSearchResult,
 )
-from services.apify import EMPLOYEES_ACTOR, INSTAGRAM_PROFILE_ACTOR, ApifyClient, ApifyError, elsewhere
+from services.apify import (
+    EMPLOYEES_ACTOR, INSTAGRAM_PROFILE_ACTOR, LINKEDIN_COMPANY_SEARCH_ACTOR, LINKEDIN_PROFILE_ACTOR, ApifyClient, ApifyError, company_keys,
+    elsewhere, employee_from_profile,
+)  # fmt: skip
+from services.briefs import BriefWriter
+from services.searxng import SearchError, SearxClient, pick_facebook, pick_instagram, pick_profiles, pick_website, quoted
 from services.apollo import SENIORITIES, ApolloClient, ApolloError
 from services.claude import cost_usd
 from services.google_places import CENTER_COST_USD, SEARCH_COST_USD, PlacesClient, PlacesError, shared_domain
@@ -559,6 +574,202 @@ async def decide_companies(
         _decide(company, body.status)
     await companies.save_all(rows)
     return CompanyDecisionResult(changed=len(rows))
+
+
+
+# ---------- Quick Start's LinkedIn option: find on LinkedIn, web searches, people from the web, company briefs ----------
+
+
+@router.post("/find-linkedin", response_model=LinkedInFindResult, dependencies=[Depends(require_manager)])
+async def find_on_linkedin(
+    body: LinkedInFindIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    companies: CompanyRepo = Depends(get_company_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    apify: ApifyClient | None = Depends(get_optional_apify),
+) -> LinkedInFindResult:
+    """Companies LinkedIn's company search finds for the ICP: each search term in turn, in its places, until the limit.
+    Paid per company found (Apify). New ones are added to be checked; ones already here are left as they are."""
+    if apify is None:
+        raise HTTPException(status_code=503, detail="APIFY_TOKEN is not set")
+    await _workspace(companies, workspace_id)
+    await _icp(lead_intel, body.icp_id)
+    terms = [t.strip() for t in body.search_terms if t.strip()]
+    places = [p.strip() for p in body.places if p.strip()]
+    record = apify_recorder(calls, workspace_id, "Find companies on LinkedIn")
+    ids: list[UUID] = []
+    dupes, cost, notes = 0, 0.0, []
+    for i, term in enumerate(terms):
+        left = body.max_companies - len(ids)
+        if left <= 0:
+            break
+        await report("Searching LinkedIn", i, len(terms))
+        try:
+            found, run = await apify.search_linkedin_companies(term, places, min(left + 10, 1000))
+        except ApifyError as exc:
+            await record(LINKEDIN_COMPANY_SEARCH_ACTOR, None, "failed")
+            notes.append(f"{term}: {exc.message}")
+            if exc.status in STOP_STATUSES:
+                break
+            continue
+        await record(LINKEDIN_COMPANY_SEARCH_ACTOR, run, "succeeded")
+        cost += run.cost_usd or 0
+        new, d = await companies.add_linkedin(workspace_id, body.icp_id, found[:left])
+        ids += new
+        dupes += d
+    return LinkedInFindResult(added=len(ids), duplicates=dupes, company_ids=ids, cost_usd=round(cost, 4) or None, notes=notes)
+
+
+@router.post("/web-search", response_model=WebSearchResult, dependencies=[Depends(require_manager)])
+async def web_search_companies(
+    body: CompanyIdsIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+    searx: SearxClient | None = Depends(get_optional_searx),
+) -> WebSearchResult:
+    """Fill in what's missing for these companies from web searches (SearXNG, free): their own website, their
+    Instagram and their Facebook. Only an answer that names the company is used; nothing found is left empty."""
+    if searx is None:
+        return WebSearchResult(searched=0, websites=0, instagram=0, facebook=0, notes=["Web search isn't set up (SEARXNG_URL), so it was skipped."])
+    rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
+    got = {"websites": 0, "instagram": 0, "facebook": 0}
+    notes: list[str] = []
+    for i, c in enumerate(rows):
+        await report("Searching the web", i, len(rows))
+        place = " ".join(x for x in (c.city, c.state) if x)
+        try:
+            if not c.domain:
+                if domain := pick_website(c.name, await searx.search(f"{quoted(c.name)} {place} official website".strip())):
+                    c.domain, c.website_url = domain, f"https://{domain}"
+                    got["websites"] += 1
+            if not c.instagram_url:
+                if url := pick_instagram(c.name, await searx.search(f"site:instagram.com {quoted(c.name)}")):
+                    c.instagram_url = url
+                    got["instagram"] += 1
+            if not c.facebook_url:
+                if url := pick_facebook(c.name, await searx.search(f"site:facebook.com {quoted(c.name)} {place}".strip())):
+                    c.facebook_url = url
+                    got["facebook"] += 1
+        except SearchError as exc:
+            notes.append(exc.message)
+            break
+    await companies.save_all(rows)
+    return WebSearchResult(searched=len(rows), notes=notes, **got)
+
+
+@router.post("/people-web", response_model=PeopleWebResult, dependencies=[Depends(require_manager)])
+async def people_from_the_web(
+    body: PeopleWebIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    apify: ApifyClient | None = Depends(get_optional_apify),
+    searx: SearxClient | None = Depends(get_optional_searx),
+) -> PeopleWebResult:
+    """People at qualified companies found by web searches for LinkedIn profiles that name the company and a title
+    (free), then read from LinkedIn (Apify, paid per profile). Someone whose current job is elsewhere is left out."""
+    if searx is None:
+        return PeopleWebResult(companies=0, profiles=0, new=0, notes=["Web search isn't set up (SEARXNG_URL), so it was skipped."])
+    if apify is None:
+        raise HTTPException(status_code=503, detail="APIFY_TOKEN is not set")
+    rows = [c for c in await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids))) if c.status == "qualified"]
+    titles = [t.strip() for t in body.titles if t.strip()][:6] or ["Owner", "Founder", "CEO"]
+    record = apify_recorder(calls, workspace_id, "Find stakeholders")
+    profiles = new = 0
+    cost, notes = 0.0, []
+    for i, c in enumerate(rows):
+        await report("Searching the web for people", i, len(rows))
+        role = " OR ".join(quoted(t) for t in titles)
+        try:
+            urls = pick_profiles(c.name, await searx.search(f"site:linkedin.com/in {quoted(c.name)} ({role})", 20), body.max_per_company)
+        except SearchError as exc:
+            notes.append(exc.message)
+            break
+        if not urls:
+            continue
+        try:
+            found, run = await apify.linkedin_profiles(urls)
+        except ApifyError as exc:
+            await record(LINKEDIN_PROFILE_ACTOR, None, "failed")
+            notes.append(f"{c.name}: {exc.message}")
+            if exc.status in STOP_STATUSES:
+                break
+            continue
+        await record(LINKEDIN_PROFILE_ACTOR, run, "succeeded")
+        cost += run.cost_usd or 0
+        keys = company_keys(c.name, c.domain)
+        people = [p for p in (employee_from_profile(item, keys, c.linkedin_url) for item in found.values()) if p]
+        for p in people:
+            p.company_name = p.company_name or c.name
+        profiles += len(people)
+        new += await stakeholders.save_employees(workspace_id, c.lead_intel_business_id, people, pipeline_company_id=c.id, icp_id=c.icp_id)
+    return PeopleWebResult(companies=len(rows), profiles=profiles, new=new, cost_usd=round(cost, 4) or None, notes=notes)
+
+
+@router.post("/briefs", response_model=BriefsResult, dependencies=[Depends(require_manager)])
+async def write_briefs(
+    body: CompanyIdsIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+    companies: CompanyRepo = Depends(get_company_repo),
+    profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
+    products: ProductRepo = Depends(get_product_repo),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    writer: BriefWriter | None = Depends(get_optional_brief_writer),
+) -> BriefsResult:
+    """An outreach brief for each of these companies, by Claude, from everything gathered about it: who they are, why
+    they fit, their signals and online presence, what they post, the hooks most likely to work, who to email first.
+    Kept with the company (its research, under "brief")."""
+    if writer is None:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set")
+    rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
+    icps: dict[UUID, dict[str, Any]] = {}
+    written = failed = 0
+    cost, notes = 0.0, []
+    for i, c in enumerate(rows):
+        await report("Writing company briefs", i, len(rows))
+        context: dict[str, Any] = {}
+        if c.icp_id:
+            if c.icp_id not in icps:
+                icp = await lead_intel.get_icp(c.icp_id) or {}
+                profile = (await profiles.get_many(workspace_id, [c.icp_id])).get(c.icp_id)
+                product = await products.get(workspace_id, profile.product_id) if profile and profile.product_id else None
+                icps[c.icp_id] = {
+                    "name": icp.get("name"), "industry": icp.get("industry"), "places": icp.get("places"),
+                    "description": getattr(profile, "description", None), "pains": getattr(profile, "pains", None),
+                    "offer": getattr(profile, "offer", None), "proof": getattr(profile, "proof", None),
+                    "product": None if product is None else {k: getattr(product, k, None) for k in PRODUCT_FIELDS},
+                }  # fmt: skip
+            context = icps[c.icp_id]
+        material = await companies.brief_material(workspace_id, c)
+        research = c.research or {}
+        evidence = {
+            "icp_and_product": context,
+            "company": {"name": c.name, "website": c.website_url or c.domain, "city": c.city, "state": c.state, "phone": c.phone,
+                        "linkedin": c.linkedin_url, "instagram": c.instagram_url, "facebook": c.facebook_url, "twitter": c.twitter_url,
+                        "source": c.source, "status": c.status},  # fmt: skip
+            "linkedin_listing": c.raw if c.source == "linkedin" else None,
+            "verdict": {"score": c.score, "detail": c.score_detail, "reason": c.status_reason},
+            "website": research.get("website"),
+            "instagram": research.get("instagram"),
+            "contacts": research.get("contacts"),
+            **material,
+        }
+        result = await writer.write(evidence)
+        call_cost = cost_usd(result.model, result.input_tokens, result.output_tokens) if result.input_tokens else 0
+        cost += call_cost
+        await calls.record(workspace_id, "claude", "messages", "failed" if result.error else "succeeded", cost_usd=round(call_cost, 4),
+                           action="Write company briefs", model=result.model, input_tokens=result.input_tokens, output_tokens=result.output_tokens)  # fmt: skip
+        if result.brief is None:
+            failed += 1
+            notes.append(f"{c.name}: {result.error}")
+            continue
+        c.research = {**research, "brief": result.brief.model_dump(), "brief_at": datetime.now(UTC).isoformat()}
+        written += 1
+    await companies.save_all(rows)
+    return BriefsResult(written=written, failed=failed, cost_usd=round(cost, 4) or None, notes=notes)
 
 
 @router.post("/stakeholders", response_model=StakeholderSearchResult, dependencies=[Depends(require_manager)])
