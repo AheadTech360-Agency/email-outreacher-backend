@@ -8,16 +8,17 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from crud import IcpProfileRepo, ProductRepo, QuickstartRepo
+from crud import IcpProfileRepo, ProductRepo, QuickstartRepo, SettingsRepo
 from dependencies import (
-    get_icp_profile_repo, get_lead_intel_repo, get_product_repo, get_quickstart_queue, get_quickstart_repo, require_manager,
-    require_workspace_id,
+    get_current_user, get_icp_profile_repo, get_lead_intel_repo, get_product_repo, get_quickstart_queue, get_quickstart_repo,
+    get_settings_repo, require_runner, require_workspace_id,
 )  # fmt: skip
 from lead_intel import LeadIntelRepo
 from models import QuickstartRun
 from routers.emails import NO_OFFER, has_offer
 from schemas import (
-    QuickstartBriefOut, QuickstartCompanyOut, QuickstartDetailOut, QuickstartDraftOut, QuickstartIn, QuickstartLeadOut, QuickstartRunOut,
+    QuickstartBriefOut, QuickstartCompanyOut, QuickstartDetailOut, QuickstartDraftOut, QuickstartIn, QuickstartLeadOut, QuickstartLimitsOut,
+    QuickstartRunOut,
     QuickstartStep,
 )  # fmt: skip
 from services.auth import CurrentUser
@@ -58,25 +59,40 @@ async def _name(lead_intel: LeadIntelRepo, icp_id: UUID) -> str:
     return icp["name"] if icp else "Deleted ICP"
 
 
-async def _run(runs: QuickstartRepo, workspace_id: UUID, run_id: UUID) -> QuickstartRun:
+async def _run(runs: QuickstartRepo, workspace_id: UUID, run_id: UUID, user: CurrentUser) -> QuickstartRun:
+    """The run. A Prospector sees only the LinkedIn runs they started: anyone else's reads as not found."""
     run = await runs.get(workspace_id, run_id)
-    if run is None:
+    if run is None or (user.is_prospector and not _theirs(run, user)):
         raise HTTPException(status_code=404, detail="Quick Start run not found")
     return run
+
+
+def _theirs(run: QuickstartRun, user: CurrentUser) -> bool:
+    return run.created_by == user.id and run.settings.get("source") == "linkedin"
 
 
 @router.post("/runs", response_model=QuickstartRunOut, status_code=201)
 async def start_run(
     body: QuickstartIn,
     workspace_id: UUID = Depends(require_workspace_id),
-    user: CurrentUser = Depends(require_manager),
+    user: CurrentUser = Depends(require_runner),
     runs: QuickstartRepo = Depends(get_quickstart_repo),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     profiles: IcpProfileRepo = Depends(get_icp_profile_repo),
     products: ProductRepo = Depends(get_product_repo),
+    settings_repo: SettingsRepo = Depends(get_settings_repo),
     queue: Callable[[UUID], None] = Depends(get_quickstart_queue),
 ) -> QuickstartRunOut:
-    """Start a run. The ICP must say what we sell, or no email could be written at the end."""
+    """Start a run. The ICP must say what we sell, or no email could be written at the end. A Prospector starts
+    only LinkedIn runs, with free web search, spending at most the workspace's cap."""
+    if user.is_prospector:
+        cap = (await settings_repo.general(workspace_id))["prospector_run_limit_usd"]
+        if body.source != "linkedin":
+            raise HTTPException(status_code=403, detail="Your account can only start a LinkedIn search.")
+        if body.web_search != "brave":
+            raise HTTPException(status_code=403, detail="Your account can't use paid Google search. Leave it on Brave.")
+        if body.spend_limit_usd > cap:
+            raise HTTPException(status_code=422, detail=f"Your runs can spend at most ${cap:,.2f}. Lower the spend limit.")
     icp = await lead_intel.get_icp(body.icp_id)
     if not icp:
         raise HTTPException(status_code=404, detail="ICP not found")
@@ -87,6 +103,8 @@ async def start_run(
     settings = body.model_dump(mode="json", exclude={"icp_id", "spend_limit_usd"})
     settings["search_terms"] = [t.strip() for t in body.search_terms if t.strip()]
     settings["places"] = [p.strip() for p in body.places if p.strip()]
+    # A Prospector's run goes on with the companies verified on their own: they can't approve the borderline ones.
+    settings["prospector"] = user.is_prospector
     if body.source == "google_maps":
         if not settings["search_terms"] or not settings["places"]:
             raise HTTPException(status_code=422, detail="Add at least one search term and one place.")
@@ -109,15 +127,29 @@ async def start_run(
     return QuickstartRunOut(**_out(run, icp["name"]))
 
 
+@router.get("/limits", response_model=QuickstartLimitsOut)
+async def my_limits(
+    workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(get_current_user),
+    settings_repo: SettingsRepo = Depends(get_settings_repo),
+) -> QuickstartLimitsOut:
+    """What the start form allows this person: a Prospector's most per run (the workspace's cap); None for others."""
+    if not user.is_prospector:
+        return QuickstartLimitsOut(spend_limit_usd=None)
+    return QuickstartLimitsOut(spend_limit_usd=(await settings_repo.general(workspace_id))["prospector_run_limit_usd"])
+
+
 @router.get("/runs", response_model=list[QuickstartRunOut])
 async def list_runs(
     workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(get_current_user),
     runs: QuickstartRepo = Depends(get_quickstart_repo),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
 ) -> list[QuickstartRunOut]:
+    """The latest runs. A Prospector sees only the LinkedIn runs they started."""
     names: dict[UUID, str] = {}
     out = []
-    for run in await runs.recent(workspace_id):
+    for run in await runs.recent(workspace_id, started_by=user.id if user.is_prospector else None):
         if run.icp_id not in names:
             names[run.icp_id] = await _name(lead_intel, run.icp_id)
         out.append(QuickstartRunOut(**_out(run, names[run.icp_id])))
@@ -128,11 +160,12 @@ async def list_runs(
 async def get_run(
     run_id: UUID,
     workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(get_current_user),
     runs: QuickstartRepo = Depends(get_quickstart_repo),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
 ) -> QuickstartDetailOut:
     """A run with what it made so far: companies and their verdicts, leads and their emails, and the drafts."""
-    run = await _run(runs, workspace_id, run_id)
+    run = await _run(runs, workspace_id, run_id, user)
     # Polled every few seconds while a run works: only the columns shown here are read.
     companies = await runs.companies(list(run.company_ids), brief=True)
     leads = await runs.leads(list(run.lead_ids), brief=True)
@@ -171,39 +204,42 @@ async def get_run(
 async def run_briefs(
     run_id: UUID,
     workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(get_current_user),
     runs: QuickstartRepo = Depends(get_quickstart_repo),
 ) -> list[QuickstartBriefOut]:
     """The company briefs a LinkedIn run wrote (best score first), with each company's links and latest posts."""
-    run = await _run(runs, workspace_id, run_id)
+    run = await _run(runs, workspace_id, run_id, user)
     return [QuickstartBriefOut.model_validate(b) for b in await runs.briefs(list(run.company_ids))]
 
 
-@router.post("/runs/{run_id}/stop", response_model=QuickstartRunOut, dependencies=[Depends(require_manager)])
+@router.post("/runs/{run_id}/stop", response_model=QuickstartRunOut)
 async def stop_run(
     run_id: UUID,
     workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(require_runner),
     runs: QuickstartRepo = Depends(get_quickstart_repo),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
 ) -> QuickstartRunOut:
     """Stop after the batch it's on. What it made so far stays."""
-    run = await _run(runs, workspace_id, run_id)
+    run = await _run(runs, workspace_id, run_id, user)
     if run.status in ("queued", "running", "waiting"):
         run.status, run.detail, run.finished_at = "cancelled", "Stopped. What it made so far is below.", datetime.now(UTC)
         await runs.save(run)
     return QuickstartRunOut(**_out(run, await _name(lead_intel, run.icp_id)))
 
 
-@router.post("/runs/{run_id}/resume", response_model=QuickstartRunOut, dependencies=[Depends(require_manager)])
+@router.post("/runs/{run_id}/resume", response_model=QuickstartRunOut)
 async def resume_run(
     run_id: UUID,
     workspace_id: UUID = Depends(require_workspace_id),
+    user: CurrentUser = Depends(require_runner),
     runs: QuickstartRepo = Depends(get_quickstart_repo),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     queue: Callable[[UUID], None] = Depends(get_quickstart_queue),
 ) -> QuickstartRunOut:
     """Pick a run up again: after the worker restarted mid-step, or after a step failed (it's tried again, and
     nothing before it is redone or paid for twice)."""
-    run = await _run(runs, workspace_id, run_id)
+    run = await _run(runs, workspace_id, run_id, user)
     if run.status not in ("queued", "running", "failed", "waiting"):
         raise HTTPException(status_code=409, detail="This run has finished.")
     if run.busy_until and run.busy_until > datetime.now(UTC):

@@ -106,7 +106,8 @@ class User(Base):
 
     __tablename__ = "eo_users"
     __table_args__ = (
-        CheckConstraint(_in("role", ("sales", "management", "admin")), name="role"),
+        # prospector: only Quick Start's LinkedIn option, and only the runs they start (dependencies.limit_prospectors).
+        CheckConstraint(_in("role", ("sales", "management", "admin", "prospector")), name="role"),
         CheckConstraint(_in("status", ("active", "invited", "deactivated")), name="status"),
     )
 
@@ -272,6 +273,7 @@ class Settings(Base):
         CheckConstraint("sample_examples between 0 and 10", name="sample_examples"),
         CheckConstraint("research_max_seconds between 30 and 600", name="research_max_seconds"),
         CheckConstraint("followup_lead_hours between 2 and 72", name="followup_lead_hours"),
+        CheckConstraint("prospector_run_limit_usd >= 0", name="prospector_run_limit_usd"),
     )
 
     workspace_id: Mapped[UUID] = mapped_column(ForeignKey("eo_workspaces.id", ondelete="CASCADE"), primary_key=True)
@@ -298,6 +300,8 @@ class Settings(Base):
     # Research: the most pages read per company (homepage included) while Claude chooses the next
     # page, and the most time spent on one company.
     research_max_pages: Mapped[int] = mapped_column(SmallInteger, server_default="6")
+    # The most one Prospector's Quick Start run may spend (they set their own limit up to this). Admins set it.
+    prospector_run_limit_usd: Mapped[Decimal] = mapped_column(Numeric(10, 2), server_default="5")
     research_max_seconds: Mapped[int] = mapped_column(SmallInteger, server_default="120")
     # Sending: who the emails are from (company and website; sender_address is no longer used), the generic follow-ups
     # a lead holds until the personal one is written, and how many hours before a follow-up is due

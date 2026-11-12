@@ -187,10 +187,49 @@ MANAGERS_ONLY = "Only Management and admins can do that: ICPs, prompts, products
 def require_manager(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
     """Admin or Management (the Roles tab's "Campaign setup"): ICPs, prompts, products, example emails, the
     workspace's writing and research settings, and every run that spends budget. Sales reviews, approves,
-    queues and adds leads."""
-    if user.role not in ("admin", "management"):
-        raise HTTPException(status_code=403, detail=MANAGERS_ONLY)
-    return user
+    queues and adds leads. A Prospector's own Quick Start run gets through too, but only inside the worker and
+    only on its LinkedIn steps (limit_prospectors refuses everything else)."""
+    if user.role in ("admin", "management") or (user.role == "prospector" and current_job.get() is not None):
+        return user
+    raise HTTPException(status_code=403, detail=MANAGERS_ONLY)
+
+
+def require_runner(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Starting, stopping and resuming a Quick Start run: Management and admins, and Prospectors (their own
+    LinkedIn runs, under the workspace's cap; routers/quickstart.py checks which)."""
+    if user.role in ("admin", "management", "prospector"):
+        return user
+    raise HTTPException(status_code=403, detail=MANAGERS_ONLY)
+
+
+# What a Prospector may call. From the browser: who they are, their workspaces and ICPs, and Quick Start's runs
+# (only their own: routers/quickstart.py). Inside their own run (the worker): the LinkedIn option's steps. Nothing
+# else: no email writing, no other pages, no jobs of their own.
+PROSPECTOR_PAGES = {
+    ("GET", "/me"), ("GET", "/workspaces"), ("GET", "/icps"),
+    ("GET", "/quickstart/limits"), ("GET", "/quickstart/runs"), ("POST", "/quickstart/runs"), ("GET", "/quickstart/runs/{run_id}"),
+    ("GET", "/quickstart/runs/{run_id}/briefs"), ("POST", "/quickstart/runs/{run_id}/stop"),
+    ("POST", "/quickstart/runs/{run_id}/resume"),
+}  # fmt: skip
+PROSPECTOR_STEPS = {
+    "/pipeline/find-linkedin", "/pipeline/web-search", "/pipeline/research", "/pipeline/stakeholders",
+    "/stakeholders/add-as-leads", "/posts/fetch", "/pipeline/people-web", "/pipeline/briefs",
+}  # fmt: skip
+PROSPECTORS_ONLY = "Your account can only use Quick Start's LinkedIn search and the companies and people you find with it."
+
+
+async def limit_prospectors(request: Request, user: CurrentUser = Depends(get_current_user)) -> None:
+    """Every protected request: a Prospector gets only PROSPECTOR_PAGES, or PROSPECTOR_STEPS inside their run."""
+    if user.role != "prospector":
+        return
+    route = request.scope.get("route")
+    template = str(getattr(route, "path", request.url.path)).removeprefix("/api/v1")
+    if current_job.get() is not None:
+        if request.method == "POST" and template in PROSPECTOR_STEPS:
+            return
+    elif (request.method, template) in PROSPECTOR_PAGES:
+        return
+    raise HTTPException(status_code=403, detail=PROSPECTORS_ONLY)
 
 
 def get_workspace_id(

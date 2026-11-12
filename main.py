@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
 from response_cache import ResponseCache
-from dependencies import get_current_user, refuse_inline, require_api_secret
+from dependencies import get_current_user, limit_prospectors, refuse_inline, require_api_secret
 from routers import (
     analysis, campaigns, companies, emails, own_settings, examples, exclusions, health, home, icps, improve, jobs, leads, mailboxes, pipeline, posts, products, prompts,
     quickstart, records, saved_views, senders, sending, settings, social, smart_lists, sources, stakeholders, usage, users, webhooks, workspaces,
@@ -20,7 +20,8 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(health.router)
 # CheapSequencer's webhooks can't sign in: each delivery is checked against its signature instead (routers/webhooks.py).
 api_router.include_router(webhooks.router)
-protected = APIRouter(dependencies=[Depends(require_api_secret), Depends(get_current_user), Depends(refuse_inline)])
+# A Prospector only gets Quick Start's LinkedIn option and its own runs (dependencies.limit_prospectors).
+protected = APIRouter(dependencies=[Depends(require_api_secret), Depends(get_current_user), Depends(limit_prospectors), Depends(refuse_inline)])
 protected.include_router(analysis.router)
 protected.include_router(users.router)
 protected.include_router(icps.router)

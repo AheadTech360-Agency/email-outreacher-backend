@@ -605,7 +605,7 @@ class FollowUpRunOut(ApiModel):
 
 # ---------- Users ----------
 
-UserRole = Literal["sales", "management", "admin"]
+UserRole = Literal["sales", "management", "admin", "prospector"]
 
 
 class UserIn(ApiModel):
@@ -1043,6 +1043,11 @@ class CompanyDecisionResult(ApiModel):
     changed: int
 
 
+class QuickstartLimitsOut(ApiModel):
+    # A Prospector's most per run; None: no cap beyond the form's own.
+    spend_limit_usd: float | None = None
+
+
 class LinkedInFindIn(ApiModel):
     """Find companies with LinkedIn's company search: each search term in turn, in these places, up to the limit."""
 
@@ -1448,6 +1453,8 @@ class GeneralSettings(ApiModel):
     posts_per_lead: int = Field(ge=1, le=20)
     max_post_age_days: int = Field(ge=1, le=365)
     monthly_budget_usd: float = Field(ge=0, le=1_000_000)
+    # The most one Prospector's Quick Start run may spend. Admins only; left out by an older page: kept as saved.
+    prospector_run_limit_usd: float | None = Field(default=None, ge=0, le=10_000)
     scoring: ScoringSettings
     company_approval: CompanyApprovalSettings | None = None  # left out by an older page: kept as saved
 

@@ -302,6 +302,27 @@ def test_it_waits_for_companies_to_be_approved_then_continues(world, monkeypatch
     assert "/pipeline/stakeholders" in world.calls and run.detail.startswith("Done: 2 drafts")
 
 
+def test_a_prospectors_run_doesnt_wait_and_goes_on_with_the_verified_companies(world, monkeypatch) -> None:
+    """A Prospector can't approve companies: their run carries on with the ones verified on their own, and the
+    borderline ones wait on the Companies page for Management."""
+    real_job = world.job
+
+    async def research_to_review(session, run, path, body, label):
+        out = await real_job(session, run, path, body, label)
+        if path == "/pipeline/research":
+            for c in world.companies.values():
+                if c.name == "Big Box":
+                    c.status = "review"
+        return out
+
+    monkeypatch.setattr(quickstart, "_job", research_to_review)
+    run = new_run(prospector=True)
+    run_all(run, world)
+    assert run.status != "waiting" and "/pipeline/stakeholders" in world.calls
+    assert "wait for Management" in run.progress["research"]["note"]
+    assert next(c for c in world.companies.values() if c.name == "Big Box").status == "review"
+
+
 def test_a_run_on_imported_companies_skips_the_search_and_verifying(world) -> None:
     """Imported companies are verified already and their people came with them: the run goes straight to leads,
     posts and emails, looks on LinkedIn only where no one has an email, and keeps to the people per company."""

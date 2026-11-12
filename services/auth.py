@@ -39,12 +39,16 @@ class CurrentUser:
     id: UUID
     email: str
     name: str
-    role: str  # sales | management | admin
+    role: str  # sales | management | admin | prospector
     workspace_ids: list[UUID] = field(default_factory=list)
 
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+    @property
+    def is_prospector(self) -> bool:
+        return self.role == "prospector"
 
     def can_open(self, workspace_id: UUID) -> bool:
         return self.is_admin or workspace_id in self.workspace_ids

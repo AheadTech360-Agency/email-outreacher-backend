@@ -222,7 +222,11 @@ async def _research(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> b
     _set(run, "research", state="running" if left and todo else "done", done=len(done), total=len(companies), note=note)
     if left and todo:
         return True
-    if waiting:
+    if waiting and run.settings.get("prospector"):
+        # A Prospector can't approve companies: their run goes on with the ones verified on their own, and the rest
+        # wait on the Companies page for Management.
+        _set(run, "research", note=f"{note}. Those to approve wait for Management; only verified ones go on")
+    elif waiting:
         # Like email review: companies under the threshold wait for a person. The run picks up again when they
         # press Continue on its page (resume), and waits again if any are still undecided.
         _set(run, "research", state="waiting", note=note)

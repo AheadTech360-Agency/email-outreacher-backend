@@ -2336,7 +2336,7 @@ RESEARCH_DEFAULTS = {"research_max_pages": 6, "research_max_seconds": 120}
 GENERAL_DEFAULTS: dict[str, Any] = {
     "default_model": "claude-haiku-5-5", "posts_per_lead": 5, "max_post_age_days": 60, "monthly_budget_usd": 150,
     "score_threshold": 80, "auto_send": False, "daily_auto_send_cap": 50, "scoring_prompt_id": None,
-    "company_threshold": 60, "company_auto_approve": True,
+    "company_threshold": 60, "company_auto_approve": True, "prospector_run_limit_usd": 5,
 }  # fmt: skip
 SENDING_DEFAULTS: dict[str, Any] = {
     "sender_company": "", "sender_website": "", "followup_fallback_2": FALLBACK_2, "followup_fallback_3": FALLBACK_3,
@@ -2400,6 +2400,7 @@ class SettingsRepo:
         if not str(values["default_model"] or "").startswith("claude-"):
             values["default_model"] = GENERAL_DEFAULTS["default_model"]
         values["monthly_budget_usd"] = float(values["monthly_budget_usd"])
+        values["prospector_run_limit_usd"] = float(values["prospector_run_limit_usd"])
         return values
 
     async def save_general(self, workspace_id: UUID, values: dict[str, Any]) -> dict[str, Any]:
@@ -2597,8 +2598,12 @@ class QuickstartRepo:
             select(QuickstartRun).where(QuickstartRun.workspace_id == workspace_id, QuickstartRun.id == run_id)
         )
 
-    async def recent(self, workspace_id: UUID, limit: int = 20) -> list[QuickstartRun]:
-        query = select(QuickstartRun).where(QuickstartRun.workspace_id == workspace_id).order_by(QuickstartRun.created_at.desc())
+    async def recent(self, workspace_id: UUID, limit: int = 20, started_by: UUID | None = None) -> list[QuickstartRun]:
+        """The latest runs; with started_by, only that person's LinkedIn runs (what a Prospector sees)."""
+        query = select(QuickstartRun).where(QuickstartRun.workspace_id == workspace_id)
+        if started_by is not None:
+            query = query.where(QuickstartRun.created_by == started_by, QuickstartRun.settings["source"].astext == "linkedin")
+        query = query.order_by(QuickstartRun.created_at.desc())
         return list(await self.session.scalars(query.limit(limit)))
 
     async def claim(self, run_id: UUID, minutes: int) -> QuickstartRun | None:

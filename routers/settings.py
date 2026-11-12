@@ -52,7 +52,7 @@ ADMINS_ONLY = "Only admins can change the monthly budget, auto-send and email sc
 def _general_out(values: dict) -> GeneralSettings:
     return GeneralSettings(
         default_model=values["default_model"], posts_per_lead=values["posts_per_lead"], max_post_age_days=values["max_post_age_days"],
-        monthly_budget_usd=values["monthly_budget_usd"],
+        monthly_budget_usd=values["monthly_budget_usd"], prospector_run_limit_usd=values.get("prospector_run_limit_usd", 5),
         scoring=ScoringSettings(prompt_id=values["scoring_prompt_id"], threshold=values["score_threshold"],
                                 auto_send=values["auto_send"], daily_auto_send_cap=values["daily_auto_send_cap"]),
         company_approval=CompanyApprovalSettings(threshold=values["company_threshold"], auto_approve=values["company_auto_approve"]),
@@ -78,15 +78,16 @@ async def save_general_settings(
     """Save them for everyone in the workspace. Management changes the model and posts; only admins change the
     budget, auto-send and scoring."""
     await _workspace(settings, workspace_id)
-    now = await settings.general(workspace_id)
+    now = {"prospector_run_limit_usd": 5.0, **await settings.general(workspace_id)}
     values = {
         "default_model": body.default_model, "posts_per_lead": body.posts_per_lead, "max_post_age_days": body.max_post_age_days,
         "monthly_budget_usd": body.monthly_budget_usd, "score_threshold": body.scoring.threshold, "auto_send": body.scoring.auto_send,
         "daily_auto_send_cap": body.scoring.daily_auto_send_cap, "scoring_prompt_id": body.scoring.prompt_id,
         "company_threshold": body.company_approval.threshold if body.company_approval else now["company_threshold"],
         "company_auto_approve": body.company_approval.auto_approve if body.company_approval else now["company_auto_approve"],
+        "prospector_run_limit_usd": body.prospector_run_limit_usd if body.prospector_run_limit_usd is not None else now["prospector_run_limit_usd"],
     }  # fmt: skip
-    admin_fields = ("monthly_budget_usd", "score_threshold", "auto_send", "daily_auto_send_cap", "scoring_prompt_id")
+    admin_fields = ("monthly_budget_usd", "score_threshold", "auto_send", "daily_auto_send_cap", "scoring_prompt_id", "prospector_run_limit_usd")
     if not user.is_admin and any(values[k] != now[k] for k in admin_fields):
         raise HTTPException(status_code=403, detail=ADMINS_ONLY)
     if body.scoring.prompt_id is not None:
