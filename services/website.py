@@ -29,6 +29,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
+import httpcore
 import httpx
 
 from services.contacts import contact_links, founder_names
@@ -219,7 +220,7 @@ class PublicOnlyTransport(httpx.AsyncBaseTransport):
     private addresses). Website addresses come from outside (LinkedIn pages, search results, imports)."""
 
     def __init__(self, inner: httpx.AsyncBaseTransport | None = None, resolve=None) -> None:
-        self._inner = inner or httpx.AsyncHTTPTransport()
+        self._inner = inner or pinned_transport()
         self._resolve = resolve or _resolve
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -234,6 +235,38 @@ class PublicOnlyTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._inner.aclose()
+
+
+class PublicOnlyBackend(httpcore.AsyncNetworkBackend):
+    """Checks the address again at the moment of connecting, and connects to that exact address. The check in
+    PublicOnlyTransport alone could be fooled by a name that answers a public address first and a private one
+    a moment later (DNS rebinding). TLS still verifies the certificate for the site's name."""
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend | None = None, resolve=None) -> None:
+        self._inner = inner or httpcore.AnyIOBackend()
+        self._resolve = resolve or _resolve
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        try:
+            addresses = await self._resolve(host)
+        except (OSError, UnicodeError) as exc:
+            raise httpcore.ConnectError(f"Couldn't resolve {host}") from exc
+        if not addresses or not all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addresses):
+            raise httpcore.ConnectError(f"{host} isn't a public address")
+        return await self._inner.connect_tcp(addresses[0], port, timeout=timeout, local_address=local_address, socket_options=socket_options)
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("Not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def pinned_transport(backend: httpcore.AsyncNetworkBackend | None = None) -> httpx.AsyncHTTPTransport:
+    """httpx's transport, connecting through PublicOnlyBackend."""
+    transport = httpx.AsyncHTTPTransport()
+    transport._pool = httpcore.AsyncConnectionPool(ssl_context=httpx.create_ssl_context(), network_backend=backend or PublicOnlyBackend())
+    return transport
 
 
 async def _resolve(host: str) -> list[str]:
