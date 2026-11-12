@@ -17,7 +17,9 @@ time, under the same rules, up to a number of pages and seconds the workspace se
 """
 
 import asyncio
+import ipaddress
 import re
+import socket
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -211,6 +213,38 @@ def normalize_domain(value: str | None) -> str | None:
     return host or None
 
 
+class PublicOnlyTransport(httpx.AsyncBaseTransport):
+    """Lets a request through only when its host resolves to public addresses. Every redirect hop comes through
+    here too, so a public site can't redirect us into a private network (localhost, 10.x, 169.254.x, Railway's
+    private addresses). Website addresses come from outside (LinkedIn pages, search results, imports)."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport | None = None, resolve=None) -> None:
+        self._inner = inner or httpx.AsyncHTTPTransport()
+        self._resolve = resolve or _resolve
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        try:
+            addresses = await self._resolve(host)
+        except (OSError, UnicodeError) as exc:
+            raise httpx.ConnectError(f"Couldn't resolve {host}", request=request) from exc
+        if not addresses or not all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addresses):
+            raise httpx.ConnectError(f"{host} isn't a public address", request=request)
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+async def _resolve(host: str) -> list[str]:
+    try:
+        return [str(ipaddress.ip_address(host))]  # an IP written out: checked as it is
+    except ValueError:
+        pass
+    infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return [str(i[4][0]) for i in infos]
+
+
 class WebsiteReader:
     def __init__(
         self,
@@ -225,7 +259,7 @@ class WebsiteReader:
             timeout=REQUEST_TIMEOUT,
             follow_redirects=True,
             max_redirects=5,
-            transport=transport,
+            transport=transport or PublicOnlyTransport(),
         )
         self._jina = jina
         self._sleep = sleep
