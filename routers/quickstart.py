@@ -61,6 +61,25 @@ async def _name(lead_intel: LeadIntelRepo, icp_id: UUID) -> str:
     return icp["name"] if icp else "Deleted ICP"
 
 
+# What the LinkedIn option can cost at most, per unit (the start form's PRICE, app/quickstart/page.tsx). Brave search is
+# free; a Prospector can't choose Google.
+LINKEDIN_PRICES = {"search": 0.004, "verify": 0.004, "people_lookup": 0.02, "person": 0.003, "person_email": 0.012,
+                   "profile": 0.004, "post": 0.002, "brief": 0.002}  # fmt: skip
+
+
+def linkedin_worst_case(body: QuickstartIn) -> float:
+    """The most a LinkedIn run with these settings can spend: every company found qualifies, every person is found and
+    has posts. The spend limit is checked between steps, so a Prospector's run must fit under their cap from the
+    start (one step could otherwise go past it)."""
+    p, n = LINKEDIN_PRICES, body.companies
+    searched = n + max(3, min(n // 2, 25))  # routers/pipeline.find_on_linkedin asks for a few extra
+    people = n * body.people_per_company
+    leads = min(body.leads, people)
+    return round(searched * p["search"] + n * (p["verify"] + p["people_lookup"] + p["brief"])
+                 + people * ((p["person_email"] if body.find_emails else p["person"]) + p["profile"])
+                 + leads * body.posts_per_lead * p["post"], 4)  # fmt: skip
+
+
 async def _run(runs: QuickstartRepo, workspace_id: UUID, run_id: UUID, user: CurrentUser) -> QuickstartRun:
     """The run. A Prospector sees only the LinkedIn runs they started: anyone else's reads as not found."""
     run = await runs.get(workspace_id, run_id)
@@ -97,6 +116,9 @@ async def start_run(
             raise HTTPException(status_code=403, detail="Your account can't use paid Google search. Leave it on Brave.")
         if body.spend_limit_usd > cap:
             raise HTTPException(status_code=422, detail=f"Your runs can spend at most ${cap:,.2f}. Lower the spend limit.")
+        if (worst := linkedin_worst_case(body)) > cap:
+            raise HTTPException(status_code=422, detail=f"These settings could cost up to ${worst:,.2f}, over your ${cap:,.2f} a run. "
+                                                        "Find fewer companies or people, or read fewer posts.")
     icp = await lead_intel.get_icp(body.icp_id)
     if not icp:
         raise HTTPException(status_code=404, detail="ICP not found")

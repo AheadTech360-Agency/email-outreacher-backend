@@ -298,3 +298,36 @@ def test_admins_share_items_with_a_prospector_and_their_own_stay_theirs(client, 
 
 def test_only_admins_share(client, me) -> None:
     assert client.get(f"/api/v1/users/{me.id}/access").status_code == 403
+
+
+# ---------- Security review: per workspace, the cap, a list's ICP ----------
+
+
+def test_sharing_in_one_workspace_says_nothing_about_another(client, me, access) -> None:
+    other = uuid4()
+    me.workspace_ids.append(other)
+    access.items.append(SimpleNamespace(user_id=me.id, workspace_id=other, kind="icp", resource_id=ICP_ID, can_edit=True,
+                                        is_owner=False, granted_by=None))  # fmt: skip
+    # Shared to edit in another workspace: here it isn't there at all, so its settings here can't be changed.
+    assert client.get("/api/v1/icps", headers=H).json() == []
+    assert client.put(f"/api/v1/icps/{ICP_ID}/profile", headers=H, json={}).status_code == 404
+    assert client.get("/api/v1/icps", headers={"X-Workspace-Id": str(other)}).json()[0]["canEdit"] is True
+
+
+def test_a_prospector_doesnt_change_which_icp_a_list_is_under(client, me, access, lists) -> None:
+    mine = lists.add("Mine")
+    share(access, me, "smart_list", mine.id, owner=True)
+    share(access, me, "icp", ICP_ID)
+    r = client.patch(f"/api/v1/smart-lists/{mine.id}", headers=H, json={"leadIntelIcpId": str(ICP_ID)})
+    assert r.status_code == 403 and "Management" in r.json()["detail"]
+
+
+def test_a_prospectors_run_must_fit_under_the_cap_at_its_worst() -> None:
+    from routers.quickstart import linkedin_worst_case
+    from schemas import QuickstartIn
+
+    small = QuickstartIn(icp_id=uuid4(), source="linkedin", search_terms=["x"], companies=3, people_per_company=1, leads=3,
+                         posts_per_lead=2, find_emails=False, spend_limit_usd=1)  # fmt: skip
+    assert linkedin_worst_case(small) < 0.2
+    big = small.model_copy(update={"companies": 200, "people_per_company": 10, "leads": 2000, "posts_per_lead": 20, "find_emails": True})
+    assert linkedin_worst_case(big) > 5

@@ -327,8 +327,9 @@ async def update_list(
     """Rename a list, or set its Lead Intel ICP (created from its draft, or an existing one). A Prospector changes
     only a list they may edit, and gives it only an ICP they can see."""
     await scope.check("smart_list", list_id, edit=True)
-    if "lead_intel_icp_id" in body.model_fields_set:
-        await scope.check("icp", body.lead_intel_icp_id)
+    if "lead_intel_icp_id" in body.model_fields_set and scope.limited:
+        # Giving a list an ICP moves its companies under it (or out from under the one Management chose).
+        raise HTTPException(status_code=403, detail="Only Management changes which ICP a list's companies are under.")
     lst = await _list(repo, workspace_id, list_id)
     if body.name is not None:
         key = smart_lists.name_key(body.name)

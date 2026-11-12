@@ -34,16 +34,21 @@ class AccessRepo:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def rows(self, user_id: UUID, kind: str | None = None) -> list[Access]:
+    async def rows(self, user_id: UUID, kind: str | None = None, workspace_id: UUID | None = None) -> list[Access]:
+        """Their rows; with workspace_id, only that workspace's (what they may use there)."""
         query = select(Access).where(Access.user_id == user_id)
         if kind:
             query = query.where(Access.kind == kind)
+        if workspace_id is not None:
+            query = query.where(Access.workspace_id == workspace_id)
         return list(await self.session.scalars(query.order_by(Access.kind, Access.created_at)))
 
-    async def get(self, user_id: UUID, kind: str, resource_id: UUID) -> Access | None:
+    async def get(self, user_id: UUID, kind: str, resource_id: UUID, workspace_id: UUID) -> Access | None:
+        """Their access to this item in this workspace (sharing in one workspace says nothing about another)."""
         return await self.session.scalar(
-            select(Access).where(Access.user_id == user_id, Access.kind == kind, Access.resource_id == resource_id)
-        )
+            select(Access).where(Access.user_id == user_id, Access.kind == kind, Access.resource_id == resource_id,
+                                 Access.workspace_id == workspace_id)
+        )  # fmt: skip
 
     async def own(self, user_id: UUID, workspace_id: UUID, kind: str, resource_id: UUID) -> None:
         """The person who just created this item owns it: they see it, edit it and may delete it."""
@@ -52,7 +57,7 @@ class AccessRepo:
             .values(user_id=user_id, workspace_id=workspace_id, kind=kind, resource_id=resource_id, can_edit=True, is_owner=True,
                     granted_by=user_id)
             .on_conflict_do_update(index_elements=[Access.user_id, Access.kind, Access.resource_id],
-                                   set_={"can_edit": True, "is_owner": True})
+                                   set_={"can_edit": True, "is_owner": True, "workspace_id": workspace_id})
         )  # fmt: skip
         await self.session.commit()
 
@@ -93,13 +98,13 @@ class Scope:
         """The items of this kind they may see; None: all of them."""
         if not self.limited:
             return None
-        return {a.resource_id for a in await self.repo.rows(self.user.id, kind)}
+        return {a.resource_id for a in await self.repo.rows(self.user.id, kind, self.workspace_id)}
 
     async def check(self, kind: Kind, resource_id: UUID | None, *, edit: bool = False, owner: bool = False) -> None:
         """404 when they can't see it, 403 when they may see it but not change (or delete) it."""
         if not self.limited or resource_id is None:
             return
-        row = await self.repo.get(self.user.id, kind, resource_id)
+        row = await self.repo.get(self.user.id, kind, resource_id, self.workspace_id)
         if row is None:
             raise HTTPException(status_code=404, detail=f"{NAMES[kind]} not found")
         if owner and not row.is_owner:
@@ -112,14 +117,14 @@ class Scope:
             return True
         if resource_id is None:
             return True
-        row = await self.repo.get(self.user.id, kind, resource_id)
+        row = await self.repo.get(self.user.id, kind, resource_id, self.workspace_id)
         return bool(row and (row.can_edit or row.is_owner))
 
     async def is_owner(self, kind: Kind, resource_id: UUID) -> bool:
         """Whether they may delete (or archive) it: everyone but a Prospector, and a Prospector for what they created."""
         if not self.limited:
             return True
-        row = await self.repo.get(self.user.id, kind, resource_id)
+        row = await self.repo.get(self.user.id, kind, resource_id, self.workspace_id)
         return bool(row and row.is_owner)
 
     async def flags(self, kind: Kind, resource_id: UUID) -> dict[str, bool]:
@@ -141,7 +146,8 @@ class Scope:
 
     def _listed(self, kind: str) -> Any:
         """The companies (or people) in the smart lists they can see."""
-        lists = select(Access.resource_id).where(Access.user_id == self.user.id, Access.kind == "smart_list")
+        lists = select(Access.resource_id).where(Access.user_id == self.user.id, Access.kind == "smart_list",
+                                                 Access.workspace_id == self.workspace_id)  # fmt: skip
         return select(SmartListMember.member_id).where(
             SmartListMember.workspace_id == self.workspace_id, SmartListMember.kind == kind, SmartListMember.list_id.in_(lists)
         )

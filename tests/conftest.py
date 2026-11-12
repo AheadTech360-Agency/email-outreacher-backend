@@ -250,14 +250,16 @@ class FakeAccessRepo:
         self.items: list[SimpleNamespace] = []
         self.forgotten: list[tuple[str, UUID]] = []
 
-    async def rows(self, user_id, kind=None):
-        return [a for a in self.items if a.user_id == user_id and (kind is None or a.kind == kind)]
+    async def rows(self, user_id, kind=None, workspace_id=None):
+        return [a for a in self.items if a.user_id == user_id and (kind is None or a.kind == kind)
+                and (workspace_id is None or a.workspace_id == workspace_id)]  # fmt: skip
 
-    async def get(self, user_id, kind, resource_id):
-        return next((a for a in self.items if (a.user_id, a.kind, a.resource_id) == (user_id, kind, resource_id)), None)
+    async def get(self, user_id, kind, resource_id, workspace_id=None):
+        return next((a for a in self.items if (a.user_id, a.kind, a.resource_id) == (user_id, kind, resource_id)
+                     and (workspace_id is None or a.workspace_id == workspace_id)), None)  # fmt: skip
 
     async def own(self, user_id, workspace_id, kind, resource_id):
-        if row := await self.get(user_id, kind, resource_id):
+        if row := await self.get(user_id, kind, resource_id, workspace_id):
             row.can_edit = row.is_owner = True
             return
         self.items.append(SimpleNamespace(user_id=user_id, workspace_id=workspace_id, kind=kind, resource_id=resource_id,
