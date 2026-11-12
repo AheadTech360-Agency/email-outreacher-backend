@@ -685,6 +685,8 @@ class PeoplePageOut(ApiModel):
     total: int
     limit: int
     offset: int
+    # Everyone in the list before search and filters (the archive filter only): none at all shows how to add people.
+    base_total: int
     email_statuses: list[str]
 
 
@@ -1789,6 +1791,26 @@ class SmartListPersonOut(ApiModel):
     linkedin_url: str | None
     reason: str
     processed: bool = False  # an email was already written to them
+
+
+class CandidateOut(ApiModel):
+    """Someone who can be added to a list, as the Add dialog shows them, and the list they're in now."""
+
+    id: UUID
+    name: str
+    detail: str
+    icp_id: UUID | None
+    list_id: UUID | None
+
+
+class CandidatesPageOut(ApiModel):
+    items: list[CandidateOut]
+    total: int
+
+
+class CandidateIdOut(ApiModel):
+    id: UUID
+    list_id: UUID | None
 
 
 class SmartListFactsOut(ApiModel):

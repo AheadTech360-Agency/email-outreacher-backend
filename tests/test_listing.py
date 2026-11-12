@@ -51,3 +51,17 @@ def test_score_bands() -> None:
 def test_recent_days_never_in_the_future() -> None:
     text = sql(listing.recent("7", column("d"), NOW))
     assert "d IS NOT NULL" in text and "d <=" in text and "d >=" in text
+
+
+def test_smart_list_candidates_build_with_search_and_facts() -> None:
+    from uuid import uuid4
+
+    from crud import SmartListRepo
+
+    for kind in ("company", "person"):
+        model, name, detail, current, (where, _, order) = SmartListRepo(None)._candidates(
+            uuid4(), kind, uuid4(), "none", "none", {"processed": "no", "emails": "yes"}, "shop"
+        )
+        text = str(select(model.id).where(*where).compile(dialect=postgresql.dialect()))
+        # The facts drop nulls first: a NOT IN over a list holding a null would match nobody.
+        assert "IS NOT NULL" in text and "NOT IN" in text and "ILIKE" in text

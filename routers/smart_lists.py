@@ -22,7 +22,7 @@ from lead_intel_writes import LeadIntelIcpWriter
 from routers.icps import create_icp
 from models import Company, SmartList, Stakeholder
 from schemas import (
-    IcpCreateIn, MoveMembersIn, MoveMembersResult, SmartListCompanyOut, SmartListFactsOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
+    CandidateIdOut, CandidateOut, CandidatesPageOut, IcpCreateIn, MoveMembersIn, MoveMembersResult, SmartListCompanyOut, SmartListFactsOut, SmartListDetailOut, SmartListIcpDraft, SmartListOut, SmartListPersonOut, SmartListsSummary,
     SmartListCreateIn, SmartListUpdateIn, SortListsIn, SortListsResult,
 )  # fmt: skip
 from services import smart_lists
@@ -137,6 +137,47 @@ async def memberships(
 ) -> dict[UUID, UUID]:
     """Which list each company or person is in (member id to list id), for pickers that add them to a list."""
     return await repo.memberships(workspace_id, kind)
+
+
+FACT_KEYS = ("processed", "contacted", "verified", "emails")
+
+
+def _candidate_filters(
+    kind: Literal["company", "person"] = Query(),
+    list_id: UUID = Query(alias="listId"),
+    icp: str | None = Query(default=None, pattern="^(all|none|[0-9a-fA-F-]{36})$"),
+    in_list: str | None = Query(default=None, alias="from", pattern="^(all|none|[0-9a-fA-F-]{36})$"),
+    q: str | None = Query(default=None, max_length=200),
+    processed: str | None = Query(default=None, pattern="^(all|yes|no)$"),
+    contacted: str | None = Query(default=None, pattern="^(all|yes|no)$"),
+    verified: str | None = Query(default=None, pattern="^(all|yes|no)$"),
+    emails: str | None = Query(default=None, pattern="^(all|yes|no)$"),
+) -> dict[str, Any]:
+    facets = {k: v for k, v in zip(FACT_KEYS, (processed, contacted, verified, emails), strict=True) if v}
+    return {"kind": kind, "list_id": list_id, "icp": icp, "in_list": in_list, "facets": facets, "q": q}
+
+
+@router.get("/candidates", response_model=CandidatesPageOut)
+async def candidates(
+    f: dict[str, Any] = Depends(_candidate_filters),
+    limit: int = Query(default=25, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    workspace_id: UUID = Depends(require_workspace_id),
+    repo: SmartListRepo = Depends(get_smart_list_repo),
+) -> CandidatesPageOut:
+    """One page of the companies or people that can be added to a list (not already in it), filtered in the database."""
+    rows, total = await repo.candidates(workspace_id, limit=limit, offset=offset, **f)
+    return CandidatesPageOut(items=[CandidateOut(id=i, name=n, detail=d or "", icp_id=icp, list_id=cur) for i, n, d, icp, cur in rows], total=total)
+
+
+@router.get("/candidates/ids", response_model=list[CandidateIdOut])
+async def candidate_ids(
+    f: dict[str, Any] = Depends(_candidate_filters),
+    workspace_id: UUID = Depends(require_workspace_id),
+    repo: SmartListRepo = Depends(get_smart_list_repo),
+) -> list[CandidateIdOut]:
+    """Every matching candidate's id and current list (Select all)."""
+    return [CandidateIdOut(id=i, list_id=cur) for i, cur in await repo.candidate_ids(workspace_id, cap=20000, **f)]
 
 
 @router.get("/facts", response_model=SmartListFactsOut)

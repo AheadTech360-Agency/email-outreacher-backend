@@ -81,9 +81,10 @@ def lead_filters(
     score: str | None = Query(default=None, pattern="^(all|low|medium|high|unscored)$"),
     queued_within: str | None = Query(default=None, alias="queuedWithin", pattern="^(all|7|30|90)$"),
     q: str | None = Query(default=None, max_length=200),
+    q_title: bool = Query(default=True, alias="qTitle", description="Search job titles too"),
 ) -> LeadFilters:
     """The Leads pages list only leads whose first email was queued (they count as leads from then on)."""
-    return LeadFilters(True, icp_id, status, source, email, linkedin, posts, score, queued_within, q)
+    return LeadFilters(True, icp_id, status, source, email, linkedin, posts, score, queued_within, q, q_title)
 
 
 @router.get("/page", response_model=LeadsPageOut)
@@ -91,6 +92,7 @@ async def page_leads(
     f: LeadFilters = Depends(lead_filters),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    scope_icp_id: UUID | None = Query(default=None, alias="scopeIcpId", description="The ICP the counts cover (an ICP's Leads tab); none is every ICP"),
     workspace_id: UUID = Depends(require_workspace_id),
     leads: LeadRepo = Depends(get_lead_repo),
 ) -> LeadsPageOut:
@@ -99,7 +101,7 @@ async def page_leads(
     posts = await leads.post_counts([r.id for r in rows])
     queued = await leads.queued_at([r.id for r in rows])
     items = [LeadOut.model_validate(r).model_copy(update={"post_count": posts.get(r.id, 0), "queued_at": queued.get(r.id)}) for r in rows]
-    queued_total, no_email, statuses = await leads.queued_counts_by(workspace_id, f.icp_id)
+    queued_total, no_email, statuses = await leads.queued_counts_by(workspace_id, scope_icp_id)
     return LeadsPageOut(items=items, total=total, limit=limit, offset=offset, queued_total=queued_total, no_email=no_email, statuses=statuses)
 
 
@@ -130,6 +132,16 @@ async def leads_summary(
     for icp_id, status, n in await leads.summary(workspace_id):
         by_icp.setdefault(icp_id, {})[status] = n
     return [LeadSummaryOut(icp_id=k, statuses=v) for k, v in by_icp.items()]
+
+
+@router.get("/email-taken", response_model=bool)
+async def lead_email_taken(
+    email: str = Query(min_length=3, max_length=320),
+    workspace_id: UUID = Depends(require_workspace_id),
+    leads: LeadRepo = Depends(get_lead_repo),
+) -> bool:
+    """Whether this email is already a lead here (the Add lead form warns before saving)."""
+    return await leads.email_taken(workspace_id, email)
 
 
 @router.get("/extra-keys", response_model=list[str])

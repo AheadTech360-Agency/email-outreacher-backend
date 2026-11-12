@@ -263,6 +263,7 @@ class LeadFilters:
     score: str | None = None
     queued_within: str | None = None
     q: str | None = None
+    q_title: bool = True  # the Leads page searches titles too; an ICP's Leads tab doesn't
 
 
 class LeadRepo:
@@ -372,7 +373,7 @@ class LeadRepo:
         verified = and_(url(Lead.email), func.lower(Lead.email_status).in_(("verified", "valid")))
         email = {"none": ~url(Lead.email), "has": url(Lead.email), "verified": verified}.get(f.email or "all")
         text = func.concat(func.trim(func.concat(Lead.first_name, " ", Lead.last_name)), " ", func.coalesce(Lead.email, ""), " ",
-                           func.coalesce(Lead.company, ""), " ", func.coalesce(Lead.title, ""))  # fmt: skip
+                           func.coalesce(Lead.company, ""), *([" ", func.coalesce(Lead.title, "")] if f.q_title else []))  # fmt: skip
         source = None
         if f.source and f.source != "all":
             source = sources.get(f.source, literal(False))
@@ -418,6 +419,11 @@ class LeadRepo:
         """How many leads each ICP has in each status (every lead, queued or not): the ICP pages' pipelines."""
         query = select(Lead.lead_intel_icp_id, Lead.status, func.count()).where(Lead.workspace_id == workspace_id)
         return list((await self.session.execute(query.group_by(Lead.lead_intel_icp_id, Lead.status))).all())
+
+    async def email_taken(self, workspace_id: UUID, email: str) -> bool:
+        """Whether a lead in this workspace already has this email (any case)."""
+        query = select(exists().where(Lead.workspace_id == workspace_id, func.lower(Lead.email) == email.strip().lower()))
+        return bool(await self.session.scalar(query))
 
     async def extra_keys(self, workspace_id: UUID) -> list[str]:
         """Every column name found in the leads' extra fields (prompt variables lead.extra.<column>)."""
@@ -990,6 +996,9 @@ class StakeholderRepo:
             .where(*self._matching(workspace_id, f)).order_by(*self.ORDER).limit(cap)
         )  # fmt: skip
         return list((await self.session.execute(query)).all())
+
+    async def base_total(self, workspace_id: UUID, f: PeopleFilters) -> int:
+        return (await self.session.execute(select(func.count()).select_from(Stakeholder).where(*self._base(workspace_id, f)))).scalar_one()
 
     async def email_statuses(self, workspace_id: UUID, f: PeopleFilters) -> list[str]:
         """The verification statuses in the list (archive filter only): the Email verification filter's options."""
@@ -2845,6 +2854,56 @@ class SmartListRepo:
             await self.add_members(workspace_id, kind, [(m.id, list_id, key(m), "Added by hand") for m in unsorted])
         await self.session.commit()
         return moved + len(unsorted)
+
+    def _candidates(self, workspace_id: UUID, kind: str, list_id: UUID, icp: str | None, in_list: str | None,
+                    facets: dict[str, str], q: str | None) -> tuple[Any, Any, Any, Any, tuple[Any, ...]]:  # fmt: skip
+        """Who can be added to a list, as the Add dialog filtered them: not already in it; by ICP, by the list they're in
+        now and by the yes/no facts; and the search inside the name or the detail line it shows."""
+        company = kind == "company"
+        model = Company if company else Stakeholder
+        current = (
+            select(SmartListMember.list_id)
+            .where(SmartListMember.workspace_id == workspace_id, SmartListMember.kind == kind, SmartListMember.member_id == model.id)
+            .limit(1).scalar_subquery()
+        )  # fmt: skip
+        icp_col = Company.icp_id if company else Stakeholder.lead_intel_icp_id
+        if company:
+            name = Company.name
+            place = func.nullif(func.concat_ws(", ", func.nullif(Company.city, ""), func.nullif(Company.state, "")), "")
+            detail = func.concat_ws(" · ", func.nullif(Company.domain, ""), place)
+            order = (Company.score.desc().nulls_last(), Company.created_at.desc(), Company.id)
+        else:
+            name = func.coalesce(func.nullif(func.trim(func.concat(Stakeholder.first_name, " ", Stakeholder.last_name)), ""),
+                                 func.nullif(Stakeholder.email, ""), "Unnamed")  # fmt: skip
+            detail = func.concat_ws(" · ", func.nullif(Stakeholder.title, ""), func.nullif(Stakeholder.organization_name, ""),
+                                    func.nullif(Stakeholder.email, ""))  # fmt: skip
+            order = (Stakeholder.found_at.desc(), Stakeholder.id)
+        where: list[Any] = [model.workspace_id == workspace_id, or_(current.is_(None), current != list_id)]
+        if icp and icp != "all":
+            where.append(icp_col.is_(None) if icp == "none" else icp_col == UUID(icp))
+        if in_list and in_list != "all":
+            where.append(current.is_(None) if in_list == "none" else current == UUID(in_list))
+        for key, ids in self._facets(workspace_id, kind).items():
+            if facets.get(key) in ("yes", "no"):
+                sub = ids.subquery()
+                held = select(sub.c[0]).where(sub.c[0].is_not(None))  # a null here would make NOT IN match nobody
+                where.append(model.id.in_(held) if facets[key] == "yes" else ~model.id.in_(held))
+        text = listing.any_field(q, name, detail)
+        if text is not None:
+            where.append(text)
+        return model, name, detail, current, (where, icp_col, order)
+
+    async def candidates(self, workspace_id: UUID, kind: str, list_id: UUID, icp: str | None, in_list: str | None, facets: dict[str, str],
+                         q: str | None, limit: int, offset: int) -> tuple[list[Any], int]:  # fmt: skip
+        model, name, detail, current, (where, icp_col, order) = self._candidates(workspace_id, kind, list_id, icp, in_list, facets, q)
+        total = (await self.session.execute(select(func.count()).select_from(model).where(*where))).scalar_one()
+        query = select(model.id, name, detail, icp_col, current).where(*where).order_by(*order).limit(limit).offset(offset)
+        return list((await self.session.execute(query)).all()), total
+
+    async def candidate_ids(self, workspace_id: UUID, kind: str, list_id: UUID, icp: str | None, in_list: str | None,
+                            facets: dict[str, str], q: str | None, cap: int) -> list[Any]:  # fmt: skip
+        model, _, _, current, (where, _, order) = self._candidates(workspace_id, kind, list_id, icp, in_list, facets, q)
+        return list((await self.session.execute(select(model.id, current).where(*where).order_by(*order).limit(cap))).all())
 
     async def memberships(self, workspace_id: UUID, kind: str) -> dict[UUID, UUID]:
         """Every company's (or person's) list: member id to list id. Those in no list are left out."""

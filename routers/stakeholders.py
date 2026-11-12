@@ -420,7 +420,8 @@ async def page_people(
         })
         for s, name in rows
     ]  # fmt: skip
-    return PeoplePageOut(items=items, total=total, limit=limit, offset=offset, email_statuses=await stakeholders.email_statuses(workspace_id, f))
+    return PeoplePageOut(items=items, total=total, limit=limit, offset=offset, base_total=await stakeholders.base_total(workspace_id, f),
+                         email_statuses=await stakeholders.email_statuses(workspace_id, f))  # fmt: skip
 
 
 @router.get("/matching", response_model=list[PersonBriefOut])
