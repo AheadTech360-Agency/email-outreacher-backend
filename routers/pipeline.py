@@ -602,7 +602,11 @@ async def find_on_linkedin(
     apify: ApifyClient | None = Depends(get_optional_apify),
 ) -> LinkedInFindResult:
     """Companies LinkedIn's company search finds for the ICP: each search term in turn, in its places, until the limit.
-    Paid per company found (Apify). New ones are added to be checked; ones already here are left as they are."""
+    Paid per company found (Apify). New ones are added to be checked; ones already here are left as they are.
+
+    A few more than needed are asked for, in case some are here already (not 10 more: a 3-company run paid for 13).
+    LinkedIn's search sometimes answers nothing at all for a search that finds companies a minute later; then it's
+    asked once more (about $0.001), and if it's still empty the run says so rather than blaming the search words."""
     if apify is None:
         raise HTTPException(status_code=503, detail="APIFY_TOKEN is not set")
     await _workspace(companies, workspace_id)
@@ -617,16 +621,27 @@ async def find_on_linkedin(
         if left <= 0:
             break
         await report("Searching LinkedIn", i, len(terms))
-        try:
-            found, run = await apify.search_linkedin_companies(term, places, min(left + 10, 1000))
-        except ApifyError as exc:
-            await record(LINKEDIN_COMPANY_SEARCH_ACTOR, None, "failed")
-            notes.append(f"{term}: {exc.message}")
-            if exc.status in STOP_STATUSES:
+        wanted = min(left + max(3, min(left // 2, 25)), 1000)
+        found: list = []
+        stop = skip = False
+        for attempt in range(2):
+            try:
+                found, run = await apify.search_linkedin_companies(term, places, wanted)
+            except ApifyError as exc:
+                await record(LINKEDIN_COMPANY_SEARCH_ACTOR, None, "failed")
+                notes.append(f"{term}: {exc.message}")
+                stop, skip = exc.status in STOP_STATUSES, True
                 break
+            await record(LINKEDIN_COMPANY_SEARCH_ACTOR, run, "succeeded")
+            cost += run.cost_usd or 0
+            if found or attempt:
+                break
+        if stop:
+            break
+        if skip:
             continue
-        await record(LINKEDIN_COMPANY_SEARCH_ACTOR, run, "succeeded")
-        cost += run.cost_usd or 0
+        if not found:
+            notes.append(f"LinkedIn's search answered nothing for \"{term}\", twice. It does that now and then: try again in a few minutes.")
         new, d = await companies.add_linkedin(workspace_id, body.icp_id, found[:left])
         ids += new
         dupes += d

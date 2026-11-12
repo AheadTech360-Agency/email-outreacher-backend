@@ -224,3 +224,47 @@ def test_a_profile_from_the_web_counts_only_if_they_work_there_now() -> None:
     gone = {"publicIdentifier": "bob", "firstName": "Bob", "experience": [{"companyName": "Ink Co", "position": "Owner", "endDate": {"text": "2021"}}]}
     assert employee_from_profile(now, keys, None).title == "Owner"
     assert employee_from_profile(gone, keys, None) is None
+
+
+# ---------- LinkedIn's search answering nothing ----------
+
+
+def test_an_empty_linkedin_search_is_asked_once_more_and_said_as_it_is() -> None:
+    from routers import pipeline as pr
+    from schemas import LinkedInFindIn
+
+    asked = []
+
+    class Apify:
+        async def search_linkedin_companies(self, term, places, max_items):
+            asked.append(max_items)
+            return [], SimpleNamespace(items=[], cost_usd=0.001, run_id=None)
+
+    class Companies:
+        async def workspace_exists(self, workspace_id):
+            return True
+
+        async def add_linkedin(self, workspace_id, icp_id, found):
+            return [], 0
+
+    class Calls:
+        async def record(self, *a, **kw):
+            pass
+
+    class LeadIntel:
+        async def get_icp(self, icp_id):
+            return {"id": icp_id, "name": "X"}
+
+    body = LinkedInFindIn(icp_id=uuid4(), search_terms=["screen printing"], places=[], max_companies=3)
+    out = asyncio.run(pr.find_on_linkedin(body, uuid4(), LeadIntel(), Companies(), Calls(), Apify()))
+    assert asked == [6, 6]  # 3 wanted plus a few in case some are here already (not 10 more), asked twice
+    assert out.added == 0 and "answered nothing" in out.notes[0] and "try again in a few minutes" in out.notes[0]
+
+
+def test_a_facebook_page_listed_as_the_website_is_their_facebook_not_their_domain() -> None:
+    fb = found_company({"name": "B&S Embroidery", "website": "https://www.facebook.com/BSEmbroidery"})
+    assert (fb.website_url, fb.facebook_url) == (None, "https://www.facebook.com/BSEmbroidery")
+    ig = found_company({"name": "Ink Co", "website": "instagram.com/inkco"})
+    assert (ig.website_url, ig.instagram_url) == (None, "instagram.com/inkco")
+    assert found_company({"name": "Ink Co", "website": "https://www.yelp.com/biz/ink-co"}).website_url is None
+    assert found_company({"name": "Ink Co", "website": "https://inkco.com"}).website_url == "https://inkco.com"

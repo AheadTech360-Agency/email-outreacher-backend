@@ -159,6 +159,12 @@ async def _find_on_linkedin(session: Any, run: QuickstartRun) -> bool:
         note += f". {out['notes'][0]}"
     _set(run, "find", state="done", done=len(run.company_ids), total=s["companies"], note=note)
     if not run.company_ids:
+        # LinkedIn answering nothing (it happens) is said as it is, not as "try other search terms".
+        why = next((n for n in out.get("notes") or [] if "answered nothing" in n), None)
+        if why:
+            return _finish(run, f"No companies this time. {why}")
+        if out.get("duplicates"):
+            return _finish(run, f"Every company LinkedIn found ({out['duplicates']}) is here already. Try other search terms or places.")
         return _finish(run, "No new companies were found on LinkedIn. Try other search terms or places.")
     return _next(run, "google")
 

@@ -1940,7 +1940,8 @@ class CompanyRepo:
                 continue
             row = Company(
                 workspace_id=workspace_id, icp_id=icp_id, source="linkedin", name=c.name, domain=domain, website_url=c.website_url,
-                linkedin_url=c.linkedin_url, city=c.city, state=c.state, status="found",
+                linkedin_url=c.linkedin_url, facebook_url=getattr(c, "facebook_url", None), instagram_url=getattr(c, "instagram_url", None),
+                city=c.city, state=c.state, status="found",
                 raw={"country": c.country, "employees": c.employees, "industry": c.industry, "description": c.description,
                      "linkedin": {k: c.raw.get(k) for k in ("followerCount", "employeeCountRange", "specialities", "foundedOn", "tagline") if c.raw.get(k)}},
             )  # fmt: skip

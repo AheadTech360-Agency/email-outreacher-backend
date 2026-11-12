@@ -176,6 +176,27 @@ class FoundCompany:
     industry: str | None
     description: str | None
     raw: dict[str, Any]
+    # A Facebook or Instagram page LinkedIn gave as the website (then website_url is None).
+    facebook_url: str | None = None
+    instagram_url: str | None = None
+
+
+def _own_site(url: str | None) -> tuple[str | None, str | None, str | None]:
+    """(website, facebook, instagram) from the website LinkedIn lists. Small shops often list their Facebook page: that
+    isn't their website (its domain would be facebook.com, shared by every such shop, and research would read
+    Facebook). A directory or another social network is dropped; web search looks for the real site."""
+    from services.websearch import NOT_A_WEBSITE
+
+    if not url:
+        return None, None, None
+    host = (urlsplit(url if "://" in url else f"https://{url}").hostname or "").lower().removeprefix("www.").removeprefix("m.")
+    if host == "facebook.com":
+        return None, url, None
+    if host == "instagram.com":
+        return None, None, url
+    if not host or "." not in host or any(bad in host for bad in NOT_A_WEBSITE):
+        return None, None, None
+    return url, None, None
 
 
 def found_company(item: dict[str, Any]) -> FoundCompany | None:
@@ -189,8 +210,9 @@ def found_company(item: dict[str, Any]) -> FoundCompany | None:
     industries = item.get("industries") or []
     industry = next((str(i.get("name")) for i in industries if isinstance(i, dict) and i.get("name")), None)
     employees = item.get("employeeCount")
+    website, facebook, instagram = _own_site(item.get("website") or None)
     return FoundCompany(
-        name=name, linkedin_url=item.get("linkedinUrl") or item.get("url"), website_url=item.get("website") or None,
+        name=name, linkedin_url=item.get("linkedinUrl") or item.get("url"), website_url=website, facebook_url=facebook, instagram_url=instagram,
         city=parsed.get("city") or first.get("city"), state=parsed.get("state") or first.get("geographicArea"),
         country=parsed.get("country") or first.get("country"), employees=employees if isinstance(employees, int) else None,
         industry=industry, description=item.get("description") or item.get("tagline"), raw=item,
