@@ -223,6 +223,8 @@ PROSPECTOR_PAGES = {
     ("GET", "/pipeline/companies/{company_id}/content"),
     ("GET", "/stakeholders/page"), ("GET", "/stakeholders/matching"), ("GET", "/stakeholders/{stakeholder_id}"),
     ("GET", "/posts"),
+    # Their own saved filters (a workspace-wide one is only Management's to save or delete: routers/saved_views.py).
+    ("GET", "/saved-views"), ("POST", "/saved-views"), ("DELETE", "/saved-views/{view_id}"),
 }  # fmt: skip
 PROSPECTOR_STEPS = {
     "/pipeline/find-linkedin", "/pipeline/web-search", "/pipeline/research", "/pipeline/stakeholders",

@@ -108,8 +108,10 @@ class Icp(ApiModel):
     id: UUID
     name: str
     industry: str
-    # Whether the asker may change it (a Prospector: their own, or shared with editing). Everyone else: True.
+    # Whether the asker may change it (a Prospector: their own, or shared with editing), and archive or delete it (a
+    # Prospector: only what they created). Everyone else: True.
     can_edit: bool = True
+    is_owner: bool = True
     priority: int
     enabled: bool
     # Which text the rule reads; empty means all of it.
@@ -1589,7 +1591,8 @@ class ProductIn(ApiModel):
 
 class ProductOut(ProductIn):
     archived: bool = False
-    can_edit: bool = True  # whether the asker may change it (see Icp.can_edit)
+    can_edit: bool = True  # whether the asker may change it, and delete it (see Icp.can_edit)
+    is_owner: bool = True
     id: UUID
     created_at: datetime
     updated_at: datetime
@@ -1883,7 +1886,8 @@ class SmartListIcpDraft(ApiModel):
 
 class SmartListOut(ApiModel):
     id: UUID
-    can_edit: bool = True  # whether the asker may change it (see Icp.can_edit)
+    can_edit: bool = True  # whether the asker may change it, and delete it (see Icp.can_edit)
+    is_owner: bool = True
     kind: str
     name: str
     count: int

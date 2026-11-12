@@ -115,6 +115,17 @@ class Scope:
         row = await self.repo.get(self.user.id, kind, resource_id)
         return bool(row and (row.can_edit or row.is_owner))
 
+    async def is_owner(self, kind: Kind, resource_id: UUID) -> bool:
+        """Whether they may delete (or archive) it: everyone but a Prospector, and a Prospector for what they created."""
+        if not self.limited:
+            return True
+        row = await self.repo.get(self.user.id, kind, resource_id)
+        return bool(row and row.is_owner)
+
+    async def flags(self, kind: Kind, resource_id: UUID) -> dict[str, bool]:
+        """can_edit and is_owner, as the pages show them."""
+        return {"can_edit": await self.can_edit(kind, resource_id), "is_owner": await self.is_owner(kind, resource_id)}
+
     async def created(self, kind: Kind, resource_id: UUID) -> None:
         """A Prospector made this: it's theirs. (Others see everything already.)"""
         if self.limited:

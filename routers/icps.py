@@ -40,8 +40,7 @@ async def list_icps(
     rows = await lead_intel.list_icps()
     if (only := await scope.ids("icp")) is not None:
         rows = [r for r in rows if r["id"] in only]
-        editable = {r["id"] for r in rows if await scope.can_edit("icp", r["id"])}
-        rows = [{**r, "can_edit": r["id"] in editable} for r in rows]
+        rows = [{**r, **await scope.flags("icp", r["id"])} for r in rows]
     by_id = await profiles.get_many(workspace_id, [row["id"] for row in rows]) if workspace_id else {}
     return [Icp.model_validate({**row, "profile": by_id.get(row["id"])}) for row in rows]
 
@@ -134,7 +133,7 @@ async def update_icp(
     row = await lead_intel.get_icp(icp_id)
     by_id = await profiles.get_many(workspace_id, [icp_id]) if workspace_id else {}
     note = None if scope.limited else await _campaign_note(sequencer, links, icp_id, row["name"])
-    return Icp.model_validate({**row, "profile": by_id.get(icp_id), "campaign_note": note, "can_edit": True})
+    return Icp.model_validate({**row, "profile": by_id.get(icp_id), "campaign_note": note, **await scope.flags("icp", icp_id)})
 
 
 @router.get("/{icp_id}", response_model=Icp)
@@ -150,7 +149,7 @@ async def get_icp(
     if not row:
         raise HTTPException(status_code=404, detail="ICP not found")
     by_id = await profiles.get_many(workspace_id, [icp_id]) if workspace_id else {}
-    return Icp.model_validate({**row, "profile": by_id.get(icp_id), "can_edit": await scope.can_edit("icp", icp_id)})
+    return Icp.model_validate({**row, "profile": by_id.get(icp_id), **await scope.flags("icp", icp_id)})
 
 
 @router.put("/{icp_id}/profile", response_model=IcpProfileOut, dependencies=[Depends(require_runner)])

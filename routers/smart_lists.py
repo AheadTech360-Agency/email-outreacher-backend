@@ -67,7 +67,7 @@ async def get_lists(
     """The lists of this kind. A Prospector gets theirs and those shared with them, each saying if they may edit it,
     and "not in a list" counts only the companies (or people) they may see."""
     only = await scope.ids("smart_list")
-    lists = [_out(lst, n).model_copy(update={"can_edit": await scope.can_edit("smart_list", lst.id)})
+    lists = [_out(lst, n).model_copy(update=await scope.flags("smart_list", lst.id))
              for lst, n in await repo.lists(workspace_id, kind, only)]  # fmt: skip
     visible = scope.companies() if kind == "company" else scope.people()
     return SmartListsSummary(lists=lists, unsorted=await repo.count_unsorted(workspace_id, kind, visible))
@@ -287,8 +287,8 @@ async def get_list(
             people.append(SmartListPersonOut(id=m.id, name=_name(m), title=m.title, company=m.organization_name, email=m.email,
                                              email_status=m.email_status, linkedin_url=m.linkedin_url, reason=member.reason,
                                              processed=m.id in written))  # fmt: skip
-    return SmartListDetailOut(**_out(lst, count).model_dump(exclude={"can_edit"}), companies=companies, people=people, page=page,
-                              page_size=page_size, matching=matching, can_edit=await scope.can_edit("smart_list", lst.id))  # fmt: skip
+    return SmartListDetailOut(**_out(lst, count).model_dump(exclude={"can_edit", "is_owner"}), companies=companies, people=people, page=page,
+                              page_size=page_size, matching=matching, **await scope.flags("smart_list", lst.id))  # fmt: skip
 
 
 @router.post("", response_model=SmartListOut, status_code=201, dependencies=[Depends(require_runner)])

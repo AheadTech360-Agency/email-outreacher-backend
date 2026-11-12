@@ -40,7 +40,7 @@ async def list_products(
 ) -> list[ProductOut]:
     """The workspace's products. A Prospector gets theirs and those shared with them, each saying if they may edit it."""
     only = await scope.ids("product")
-    return [(await _out(products, workspace_id, p)).model_copy(update={"can_edit": await scope.can_edit("product", p.id)})
+    return [(await _out(products, workspace_id, p)).model_copy(update=await scope.flags("product", p.id))
             for p in await products.list(workspace_id) if only is None or p.id in only]  # fmt: skip
 
 
