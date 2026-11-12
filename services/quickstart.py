@@ -164,12 +164,14 @@ async def _find_on_linkedin(session: Any, run: QuickstartRun) -> bool:
 
 
 async def _google(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
-    """Web searches (free, SearXNG) for each company's missing website, Instagram and Facebook, before it's verified."""
+    """Web searches for each company's missing website, Instagram and Facebook, before it's verified: Brave (free up
+    to its monthly allowance) or Google through Apify (paid), as the run chose."""
     tried = set(run.progress.get("_webbed", []))
     todo = [i for i in run.company_ids if str(i) not in tried][:WEB_BATCH]
     found = dict(run.progress.get("_web", {}))
     if todo:
-        ok, out, detail = await _job(session, run, "/pipeline/web-search", {"companyIds": [str(i) for i in todo]}, "Quick Start: searching the web")
+        body = {"companyIds": [str(i) for i in todo], "engine": _engine(run)}
+        ok, out, detail = await _job(session, run, "/pipeline/web-search", body, "Quick Start: searching the web")
         if not ok:
             return _fail(run, "google", detail)
         out = out or {}
@@ -179,12 +181,25 @@ async def _google(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
             return _next(run, "research")
         for key in ("websites", "instagram", "facebook"):
             found[key] = found.get(key, 0) + out.get(key, 0)
+        if out.get("remaining") is not None:
+            found["remaining"] = out["remaining"]
+        if out.get("notes"):
+            # Refused partway (Brave's allowance ran out, say): the rest are verified with what LinkedIn gave.
+            run.progress = {**run.progress, "_webbed": [str(i) for i in run.company_ids], "_web": found}
+            _set(run, "google", state="done", done=len(run.company_ids), total=len(run.company_ids), note=out["notes"][0])
+            return _next(run, "research")
         run.progress = {**run.progress, "_webbed": sorted(tried | {str(i) for i in todo}), "_web": found}
     tried = set(run.progress.get("_webbed", []))
     left = [i for i in run.company_ids if str(i) not in tried]
     note = f"{found.get('websites', 0)} websites, {found.get('instagram', 0)} Instagram and {found.get('facebook', 0)} Facebook pages found"
+    if found.get("remaining") is not None:
+        note += f". {found['remaining']:,} free Brave searches left this month"
     _set(run, "google", state="running" if left else "done", done=len(tried), total=len(run.company_ids), note=note)
     return True if left else _next(run, "research")
+
+
+def _engine(run: QuickstartRun) -> str:
+    return "google" if run.settings.get("web_search") == "google" else "brave"
 
 
 async def _research(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
@@ -281,7 +296,7 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
         nobody = [i for i in qualified if i not in {p.company_id for p in people} and str(i) not in webbed][:WEB_BATCH]
         if nobody:
             titles = s.get("titles") or await _icp_titles(session, run)
-            body = {"companyIds": [str(i) for i in nobody], "titles": titles, "maxPerCompany": s["people_per_company"]}
+            body = {"companyIds": [str(i) for i in nobody], "titles": titles, "maxPerCompany": s["people_per_company"], "engine": _engine(run)}
             ok, out, detail = await _job(session, run, "/pipeline/people-web", body, "Quick Start: finding people on the web")
             if not ok:
                 return _fail(run, "people", detail)

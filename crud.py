@@ -1392,6 +1392,13 @@ class ProviderCallRepo:
         )
         await self.session.commit()
 
+    async def used_this_month(self, provider: str) -> int:
+        """Units (credits) logged for a provider since the 1st of this month (UTC), every workspace: Brave searches."""
+        start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        total = await self.session.scalar(select(func.coalesce(func.sum(ProviderCall.credits), 0))
+                                          .where(ProviderCall.provider == provider, ProviderCall.called_at >= start))  # fmt: skip
+        return int(total or 0)
+
     async def spent_by_jobs(self, job_ids: list[UUID]) -> float:
         """What these jobs' paid calls cost, as logged (Apify's figures are corrected as they settle)."""
         if not job_ids:

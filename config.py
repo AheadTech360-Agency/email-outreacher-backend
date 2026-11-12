@@ -51,9 +51,12 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     # Jina Reader, for websites that need a browser to render. Works without a key at a lower limit.
     jina_api_key: str | None = None
-    # A SearXNG instance (self-hosted, JSON output on): Quick Start's LinkedIn option uses it for web searches to
-    # find each company's website, socials and people. Free; without it those searches are skipped.
-    searxng_url: str | None = None
+    # Brave Search API, for Quick Start's LinkedIn option: web searches for each company's website, socials and
+    # people. Free up to the plan's monthly allowance; without it (and without Google through Apify) they're skipped.
+    brave_api_key: str | None = None
+    # Brave searches a month, across every workspace, before Brave searches stop (Brave's free credit is about 1,000;
+    # past it Brave charges the card). Runs can use Google through Apify instead.
+    brave_monthly_searches: int = 1000
     # The model that writes a company's outreach brief (Quick Start's LinkedIn option). Haiku is about 0.1 cents a
     # company; claude-sonnet-5-5 gives deeper hooks for about 2 cents.
     claude_brief_model: str = "claude-haiku-5-5"

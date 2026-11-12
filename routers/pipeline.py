@@ -31,7 +31,7 @@ from dependencies import (
     get_optional_places,
     get_optional_brief_writer,
     get_optional_scorer,
-    get_optional_searx,
+    get_optional_brave,
     get_post_repo,
     get_product_repo,
     get_prompt_repo,
@@ -69,6 +69,7 @@ from schemas import (
     LinkedInFindResult,
     PeopleWebIn,
     PeopleWebResult,
+    WebSearchIn,
     WebSearchResult,
     ResearchIn,
     ResearchResult,
@@ -80,7 +81,7 @@ from services.apify import (
     elsewhere, employee_from_profile,
 )  # fmt: skip
 from services.briefs import BriefWriter
-from services.searxng import SearchError, SearxClient, pick_facebook, pick_instagram, pick_profiles, pick_website, quoted
+from services.websearch import GOOGLE_SEARCH_ACTOR, BraveSearch, GoogleSearch, Searched, pick_facebook, pick_instagram, pick_profiles, pick_website, quoted
 from services.apollo import SENIORITIES, ApolloClient, ApolloError
 from services.claude import cost_usd
 from services.google_places import CENTER_COST_USD, SEARCH_COST_USD, PlacesClient, PlacesError, shared_domain
@@ -621,41 +622,78 @@ async def find_on_linkedin(
     return LinkedInFindResult(added=len(ids), duplicates=dupes, company_ids=ids, cost_usd=round(cost, 4) or None, notes=notes)
 
 
+def web_searcher(engine: str, brave: BraveSearch | None, apify: ApifyClient | None) -> tuple[Any, str | None]:
+    """The engine a run chose, or why it can't be used (then its searches are skipped)."""
+    if engine == "google":
+        return (GoogleSearch(apify), None) if apify else (None, "Google search needs Apify (APIFY_TOKEN), so the web search was skipped.")
+    return (brave, None) if brave else (None, "Web search isn't set up (BRAVE_API_KEY), so it was skipped.")
+
+
+async def run_searches(searcher: Any, queries: list[str], limit: int, calls: ProviderCallRepo, workspace_id: UUID) -> Searched:
+    """The searches. A Google (Apify) run is logged as spend; Brave searches are counted (free up to the month's
+    allowance), and once the month's allowance is reached Brave isn't asked any more."""
+    if isinstance(searcher, GoogleSearch):
+        out = await searcher.search_many(queries, limit)
+        await apify_recorder(calls, workspace_id, "Search the web")(GOOGLE_SEARCH_ACTOR, out.run, "succeeded" if out.run is not None else "failed")
+        return out
+    wanted = list(dict.fromkeys(queries))
+    allowance = get_settings().brave_monthly_searches
+    left = max(0, allowance - await calls.used_this_month("brave"))
+    out = await searcher.search_many(wanted[:left], limit)
+    if out.hits:
+        await calls.record(workspace_id, "brave", "web/search", "succeeded", credits=len(out.hits), action="Search the web")
+    if len(wanted) > left:
+        out.notes.append(f"This month's {allowance:,} free Brave searches are used up. Choose Google (Apify) for web search on the next run.")
+    out.remaining = max(0, left - len(out.hits))
+    return out
+
+
+def _web_queries(c: Company) -> dict[str, str]:
+    place = " ".join(x for x in (c.city, c.state) if x)
+    wanted = {"website": f"{quoted(c.name)} {place}".strip() if not c.domain else None,
+              "instagram": f"site:instagram.com {quoted(c.name)}" if not c.instagram_url else None,
+              "facebook": f"site:facebook.com {quoted(c.name)} {place}".strip() if not c.facebook_url else None}  # fmt: skip
+    return {k: q for k, q in wanted.items() if q}
+
+
 @router.post("/web-search", response_model=WebSearchResult, dependencies=[Depends(require_manager)])
 async def web_search_companies(
-    body: CompanyIdsIn,
+    body: WebSearchIn,
     workspace_id: UUID = Depends(require_workspace_id),
     companies: CompanyRepo = Depends(get_company_repo),
-    searx: SearxClient | None = Depends(get_optional_searx),
+    calls: ProviderCallRepo = Depends(get_provider_call_repo),
+    brave: BraveSearch | None = Depends(get_optional_brave),
+    apify: ApifyClient | None = Depends(get_optional_apify),
 ) -> WebSearchResult:
-    """Fill in what's missing for these companies from web searches (SearXNG, free): their own website, their
-    Instagram and their Facebook. Only an answer that names the company is used; nothing found is left empty."""
-    if searx is None:
-        return WebSearchResult(searched=0, websites=0, instagram=0, facebook=0, notes=["Web search isn't set up (SEARXNG_URL), so it was skipped."])
+    """Fill in what's missing for these companies from web searches: their own website, their Instagram and their
+    Facebook. Brave is free up to its monthly allowance; Google goes through Apify and is paid per search. Only an
+    answer that names the company is used (a website only when its domain is the company's name); a website
+    LinkedIn gave is never replaced, and nothing found is left empty."""
+    searcher, why_not = web_searcher(body.engine, brave, apify)
+    if searcher is None:
+        return WebSearchResult(searched=0, websites=0, instagram=0, facebook=0, notes=[why_not or ""])
     rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
+    wanted = {c.id: _web_queries(c) for c in rows}
+    queries = [q for w in wanted.values() for q in w.values()]
+    await report(f"Searching the web ({searcher.name})", 0, len(rows))
+    out = await run_searches(searcher, queries, 10, calls, workspace_id)
     got = {"websites": 0, "instagram": 0, "facebook": 0}
-    notes: list[str] = []
-    for i, c in enumerate(rows):
-        await report("Searching the web", i, len(rows))
-        place = " ".join(x for x in (c.city, c.state) if x)
-        try:
-            if not c.domain:
-                if domain := pick_website(c.name, await searx.search(f"{quoted(c.name)} {place} official website".strip())):
-                    c.domain, c.website_url = domain, f"https://{domain}"
-                    got["websites"] += 1
-            if not c.instagram_url:
-                if url := pick_instagram(c.name, await searx.search(f"site:instagram.com {quoted(c.name)}")):
-                    c.instagram_url = url
-                    got["instagram"] += 1
-            if not c.facebook_url:
-                if url := pick_facebook(c.name, await searx.search(f"site:facebook.com {quoted(c.name)} {place}".strip())):
-                    c.facebook_url = url
-                    got["facebook"] += 1
-        except SearchError as exc:
-            notes.append(exc.message)
-            break
+    for c in rows:
+        w = wanted[c.id]
+        if (q := w.get("website")) in out.hits and (domain := pick_website(c.name, out.hits[q])):
+            c.domain, c.website_url = domain, f"https://{domain}"
+            got["websites"] += 1
+        if (q := w.get("instagram")) in out.hits and (url := pick_instagram(c.name, out.hits[q])):
+            c.instagram_url = url
+            got["instagram"] += 1
+        if (q := w.get("facebook")) in out.hits and (url := pick_facebook(c.name, out.hits[q])):
+            c.facebook_url = url
+            got["facebook"] += 1
     await companies.save_all(rows)
-    return WebSearchResult(searched=len(rows), notes=notes, **got)
+    # Searched: the companies every search of which was answered (a refusal partway leaves the rest unsearched).
+    searched = sum(1 for w in wanted.values() if all(q in out.hits for q in w.values()))
+    return WebSearchResult(searched=searched, searches=len(out.hits), cost_usd=round(out.cost_usd, 4) if out.cost_usd else None,
+                           remaining=out.remaining, notes=out.notes, **got)  # fmt: skip
 
 
 @router.post("/people-web", response_model=PeopleWebResult, dependencies=[Depends(require_manager)])
@@ -666,27 +704,28 @@ async def people_from_the_web(
     stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
     calls: ProviderCallRepo = Depends(get_provider_call_repo),
     apify: ApifyClient | None = Depends(get_optional_apify),
-    searx: SearxClient | None = Depends(get_optional_searx),
+    brave: BraveSearch | None = Depends(get_optional_brave),
 ) -> PeopleWebResult:
     """People at qualified companies found by web searches for LinkedIn profiles that name the company and a title
-    (free), then read from LinkedIn (Apify, paid per profile). Someone whose current job is elsewhere is left out."""
-    if searx is None:
-        return PeopleWebResult(companies=0, profiles=0, new=0, notes=["Web search isn't set up (SEARXNG_URL), so it was skipped."])
+    (Brave, free; or Google through Apify, paid), then read from LinkedIn (Apify, paid per profile). Someone whose
+    current job is elsewhere is left out."""
+    searcher, why_not = web_searcher(body.engine, brave, apify)
+    if searcher is None:
+        return PeopleWebResult(companies=0, profiles=0, new=0, notes=[why_not or ""])
     if apify is None:
         raise HTTPException(status_code=503, detail="APIFY_TOKEN is not set")
     rows = [c for c in await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids))) if c.status == "qualified"]
     titles = [t.strip() for t in body.titles if t.strip()][:6] or ["Owner", "Founder", "CEO"]
     record = apify_recorder(calls, workspace_id, "Find stakeholders")
+    role = " OR ".join(quoted(t) for t in titles)
+    query = {c.id: f"site:linkedin.com/in {quoted(c.name)} ({role})" for c in rows}
+    await report(f"Searching the web for people ({searcher.name})", 0, len(rows))
+    searched = await run_searches(searcher, list(query.values()), 20, calls, workspace_id)
     profiles = new = 0
-    cost, notes = 0.0, []
+    cost, notes = searched.cost_usd or 0.0, list(searched.notes)
     for i, c in enumerate(rows):
-        await report("Searching the web for people", i, len(rows))
-        role = " OR ".join(quoted(t) for t in titles)
-        try:
-            urls = pick_profiles(c.name, await searx.search(f"site:linkedin.com/in {quoted(c.name)} ({role})", 20), body.max_per_company)
-        except SearchError as exc:
-            notes.append(exc.message)
-            break
+        await report("Reading the people found", i, len(rows))
+        urls = pick_profiles(c.name, searched.hits.get(query[c.id], []), body.max_per_company)
         if not urls:
             continue
         try:

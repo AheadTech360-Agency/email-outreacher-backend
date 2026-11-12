@@ -45,7 +45,7 @@ from services.google_places import PlacesClient
 from services.jina import JinaClient
 from services.briefs import BriefWriter
 from services.scoring import CompanyScorer
-from services.searxng import SearxClient
+from services.websearch import BraveSearch
 from services.sending import InboxesClient, SequencerClient
 from services.website import WebsiteReader
 
@@ -392,10 +392,10 @@ async def get_website_reader() -> AsyncIterator[WebsiteReader]:
         await jina.aclose()
 
 
-async def get_optional_searx() -> AsyncIterator[SearxClient | None]:
-    """Web search through the workspace's SearXNG instance (SEARXNG_URL), or None when it isn't set."""
-    url = get_settings().searxng_url
-    client = SearxClient(url) if url else None
+async def get_optional_brave() -> AsyncIterator[BraveSearch | None]:
+    """Web search through Brave's Search API (BRAVE_API_KEY), or None when it isn't set."""
+    key = get_settings().brave_api_key
+    client = BraveSearch(key) if key else None
     try:
         yield client
     finally:

@@ -1064,6 +1064,12 @@ class CompanyIdsIn(ApiModel):
     company_ids: list[UUID] = Field(min_length=1, max_length=25)
 
 
+class WebSearchIn(ApiModel):
+    company_ids: list[UUID] = Field(min_length=1, max_length=25)
+    # brave: Brave Search API, free up to its monthly allowance. google: Google through Apify, paid per search.
+    engine: Literal["brave", "google"] = "brave"
+
+
 class WebSearchResult(ApiModel):
     """Web searches for these companies' missing website, Instagram and Facebook: how many of each were found."""
 
@@ -1071,6 +1077,9 @@ class WebSearchResult(ApiModel):
     websites: int
     instagram: int
     facebook: int
+    searches: int = 0
+    cost_usd: float | None = None
+    remaining: int | None = None  # Brave: searches left this month
     notes: list[str] = []
 
 
@@ -1078,6 +1087,7 @@ class PeopleWebIn(ApiModel):
     company_ids: list[UUID] = Field(min_length=1, max_length=10)
     titles: list[str] = Field(default=[], max_length=30)
     max_per_company: int = Field(default=3, ge=1, le=10)
+    engine: Literal["brave", "google"] = "brave"
 
 
 class PeopleWebResult(ApiModel):
@@ -1684,6 +1694,8 @@ class QuickstartIn(ApiModel):
     # google_maps: find on Google Maps; existing: companies already here; linkedin: find on LinkedIn, search the web,
     # verify, find people, read posts, and end with a brief per company.
     source: Literal["google_maps", "existing", "linkedin"] = "google_maps"
+    # The LinkedIn option's web searches: Brave (free up to its monthly allowance) or Google through Apify (paid).
+    web_search: Literal["brave", "google"] = "brave"
     smart_list_id: UUID | None = None
     search_terms: list[str] = Field(default=[], max_length=10)
     places: list[str] = Field(default=[], max_length=10)
