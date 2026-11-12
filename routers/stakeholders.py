@@ -17,7 +17,8 @@ import anthropic
 
 from background import report
 from crud import (
-    CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, PromptRepo, ProviderCallRepo, SmartListRepo, StakeholderRepo, WorkspaceCompanyRepo,
+    CompanyRepo, ExclusionRepo, IcpProfileRepo, PeopleFilters, PostRepo, PromptRepo, ProviderCallRepo, SmartListRepo, StakeholderRepo,
+    WorkspaceCompanyRepo,
     lead_from_stakeholder,
 )  # fmt: skip
 from database import get_session
@@ -65,6 +66,10 @@ from schemas import (
     RevealOutcome,
     StakeholderDetailOut,
     StakeholderOut,
+    PeoplePageOut,
+    PersonBriefOut,
+    PersonIdsIn,
+    PersonRowOut,
     StakeholderRevealIn,
     StakeholderRevealResult,
     StakeholderSearchIn,
@@ -375,6 +380,67 @@ async def list_stakeholders(
     people = await stakeholders.list(workspace_id, company_id, icp_id, light=True)
     queued = await stakeholders.queued_at([s.lead_id for s in people if s.lead_id])
     return [StakeholderOut.model_validate(s).model_copy(update={"queued_at": queued.get(s.lead_id)}) for s in people]
+
+
+PRESENCE = "^(all|yes|no)$"
+MATCHING_CAP = 20000
+
+
+def people_filters(
+    archive: str = Query(default="active", pattern="^(active|archived|all)$"),
+    q: str | None = Query(default=None, max_length=200),
+    found_by: str | None = Query(default=None, alias="foundBy", pattern="^(all|company|linkedin|manual|[0-9a-fA-F-]{36})$"),
+    status: str | None = Query(default=None, pattern="^(all|hidden|revealed|lead|notlead)$"),
+    email: str | None = Query(default=None, pattern="^(all|has|verified|none)$"),
+    linkedin: str | None = Query(default=None, pattern=PRESENCE),
+    post_state: str | None = Query(default=None, alias="postState", pattern=PRESENCE),
+    email_state: str | None = Query(default=None, alias="emailState", max_length=60),
+    company_text: str | None = Query(default=None, alias="companyText", max_length=200),
+    pipeline_company_id: UUID | None = Query(default=None, alias="pipelineCompanyId"),
+) -> PeopleFilters:
+    return PeopleFilters(archive, q, found_by, status, email, linkedin, post_state, email_state, company_text, pipeline_company_id)
+
+
+@router.get("/page", response_model=PeoplePageOut)
+async def page_people(
+    f: PeopleFilters = Depends(people_filters),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    workspace_id: UUID = Depends(require_workspace_id),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+) -> PeoplePageOut:
+    """One page of the People list, filtered in the database (only the rows shown are read)."""
+    rows, total = await stakeholders.page(workspace_id, f, limit, offset)
+    leads = [s.lead_id for s, _ in rows if s.lead_id]
+    queued = await stakeholders.queued_at(leads)
+    posts = await stakeholders.post_counts(leads)
+    items = [
+        PersonRowOut.model_validate(s).model_copy(update={
+            "queued_at": queued.get(s.lead_id), "company_name": name, "post_count": posts.get(s.lead_id, 0) if s.lead_id else 0,
+        })
+        for s, name in rows
+    ]  # fmt: skip
+    return PeoplePageOut(items=items, total=total, limit=limit, offset=offset, email_statuses=await stakeholders.email_statuses(workspace_id, f))
+
+
+@router.get("/matching", response_model=list[PersonBriefOut])
+async def matching_people(
+    f: PeopleFilters = Depends(people_filters),
+    workspace_id: UUID = Depends(require_workspace_id),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+) -> list[PersonBriefOut]:
+    """Every person matching these filters, in list order, as the few fields selecting needs (Select all)."""
+    return [PersonBriefOut.model_validate(r) for r in await stakeholders.matching(workspace_id, f, MATCHING_CAP)]
+
+
+@router.post("/lead-ids", response_model=dict[str, UUID | None])
+async def people_lead_ids(
+    body: PersonIdsIn,
+    workspace_id: UUID = Depends(require_workspace_id),
+    stakeholders: StakeholderRepo = Depends(get_stakeholder_repo),
+) -> dict[str, UUID | None]:
+    """Each of these people's lead (after Add as leads), without reading the whole People list."""
+    return {str(k): v for k, v in (await stakeholders.lead_ids(workspace_id, body.ids)).items()}
 
 
 @router.get("/export.csv", response_class=Response)

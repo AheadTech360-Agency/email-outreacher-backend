@@ -21,7 +21,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from crud import (
-    PRODUCT_FIELDS, CompanyRepo, EmailRepo, ExampleRepo, ExclusionRepo, FeedbackRepo, IcpProfileRepo, ProductRepo, PromptRepo,
+    PRODUCT_FIELDS, CompanyRepo, EmailFilters, EmailRepo, ExampleRepo, ExclusionRepo, FeedbackRepo, IcpProfileRepo, ProductRepo, PromptRepo,
     ProviderCallRepo, SendingRepo, SettingsRepo, StakeholderRepo, exclusion_note, person_keys,
 )  # fmt: skip
 from dependencies import (
@@ -53,6 +53,9 @@ from schemas import (
     AddAsLeadsIn,
     EmailLeadOut,
     EmailOut,
+    EmailBriefOut,
+    EmailsPageOut,
+    RatedOut,
     Page,
     EmailPointOut,
     EmailPostOut,
@@ -484,22 +487,89 @@ async def list_emails(
     return await _out(emails, rows, feedback)
 
 
-@router.get("/page", response_model=Page[EmailOut])
-async def page_emails(
+PRESENCE = "^(all|yes|no)$"
+MATCHING_CAP = 20000
+
+
+def email_filters(
     statuses: str | None = Query(default=None, pattern=STATUSES, description="Comma-separated statuses"),
     lead_id: UUID | None = Query(default=None, alias="leadId"),
     icp_id: str | None = Query(default=None, alias="icpId", pattern=ICP),
+    icp: str | None = Query(default=None, pattern="^(all|none|[0-9a-fA-F-]{36})$", description="The page's ICP filter"),
+    search: str | None = Query(default=None, max_length=300, description="Review: the whole text in any one field"),
+    terms: str | None = Query(default=None, max_length=300, description="Feedback: every word somewhere"),
+    score_band: str | None = Query(default=None, alias="scoreBand", pattern="^(all|low|medium|high|unscored)$"),
+    hook: str | None = Query(default=None, pattern="^(all|yes|no|with|without)$"),
+    flags: str | None = Query(default=None, pattern=PRESENCE),
+    rating: str | None = Query(default=None, pattern="^(all|good|bad|unrated)$", description="Review's rating filter"),
+    rated: str | None = Query(default=None, pattern="^(all|good|bad|unrated)$", description="Feedback's rating tab"),
+    written: str | None = Query(default=None, pattern="^(all|7|30|90)$"),
+    tag: str | None = Query(default=None, pattern="^(all|[a-z_]{2,40})$"),
+    sort: str = Query(default="newest", pattern="^(newest|oldest|score-low|score-high|rated)$"),
+) -> EmailFilters:
+    return EmailFilters(statuses.split(",") if statuses else None, lead_id, icp_id, icp, search, terms, score_band, hook, flags,
+                        rating, rated, written, tag, sort)  # fmt: skip
+
+
+async def _with_icp_names(f: EmailFilters, lead_intel: LeadIntelRepo) -> EmailFilters:
+    """Feedback's search also matches ICP names, which live in Lead Intel: read them only when searching."""
+    if f.terms and f.terms.strip():
+        f.icp_names = {row["id"]: row.get("name") or "" for row in await lead_intel.list_icps()}
+    return f
+
+
+@router.get("/page", response_model=EmailsPageOut)
+async def page_emails(
+    f: EmailFilters = Depends(email_filters),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     workspace_id: UUID = Depends(require_workspace_id),
     emails: EmailRepo = Depends(get_email_repo),
     feedback: FeedbackRepo = Depends(get_feedback_repo),
-) -> Page[EmailOut]:
-    """One page of first emails, newest first, and how many there are in all."""
-    wanted = statuses.split(",") if statuses else None
-    rows = await emails.list(workspace_id, None, lead_id, statuses=wanted, icp_id=icp_id, limit=limit, offset=offset)
-    total = await emails.count(workspace_id, wanted, lead_id, icp_id)
-    return Page[EmailOut](items=await _out(emails, rows, feedback), total=total, limit=limit, offset=offset)
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+) -> EmailsPageOut:
+    """One page of first emails, filtered, sorted and counted in the database (only the rows shown are read)."""
+    f, now = await _with_icp_names(f, lead_intel), datetime.now(UTC)
+    rows, total = await emails.page(workspace_id, f, limit, offset, now)
+    statuses, ratings = await emails.breakdown(workspace_id, f, now)
+    return EmailsPageOut(items=await _out(emails, rows, feedback), total=total, limit=limit, offset=offset, statuses=statuses,
+                         ratings=ratings)  # fmt: skip
+
+
+@router.get("/ids", response_model=list[UUID])
+async def email_ids(
+    f: EmailFilters = Depends(email_filters),
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+    lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
+) -> list[UUID]:
+    """Every matching email's id in the page's order: the drawer's previous and next across pages."""
+    return await emails.ids(workspace_id, await _with_icp_names(f, lead_intel), datetime.now(UTC), MATCHING_CAP)
+
+
+@router.get("/brief", response_model=list[EmailBriefOut])
+async def email_brief(
+    f: EmailFilters = Depends(email_filters),
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+) -> list[EmailBriefOut]:
+    """Matching emails as who they're to and how sure the address is (Queue all approved)."""
+    rows = await emails.brief(workspace_id, f, datetime.now(UTC), MATCHING_CAP)
+    return [
+        EmailBriefOut(id=i, status=s, lead_name=f"{first} {last}".strip() or email or "Unnamed lead", lead_email=email, email_status=es)
+        for i, s, first, last, email, es in rows
+    ]  # fmt: skip
+
+
+@router.get("/rated", response_model=RatedOut)
+async def email_rated(
+    icp_id: str | None = Query(default=None, alias="icpId", pattern=ICP),
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+) -> RatedOut:
+    """How many first emails there are (in an ICP, or all) and how many are rated."""
+    total, rated = await emails.rated(workspace_id, icp_id)
+    return RatedOut(total=total, rated=rated)
 
 
 @router.get("/counts", response_model=dict[str, int])
@@ -522,6 +592,20 @@ async def feedback_stats(
     for icp_id, rating, n in await feedback.stats(workspace_id):
         by_icp.setdefault(icp_id, {"good": 0, "bad": 0})[rating] = n
     return [FeedbackStat(icp_id=k, **v) for k, v in by_icp.items()]
+
+
+@router.get("/{email_id}", response_model=EmailOut)
+async def get_email(
+    email_id: UUID,
+    workspace_id: UUID = Depends(require_workspace_id),
+    emails: EmailRepo = Depends(get_email_repo),
+    feedback: FeedbackRepo = Depends(get_feedback_repo),
+) -> EmailOut:
+    """One email, whatever its status or step: the email open in Review or Feedback stays open while it changes."""
+    found = await emails.get(workspace_id, email_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return (await _out(emails, [found], feedback))[0]
 
 
 @router.put("/{email_id}/feedback", response_model=EmailOut)

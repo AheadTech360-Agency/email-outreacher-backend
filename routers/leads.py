@@ -1,13 +1,17 @@
 import csv
 import io
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
-from crud import ExclusionRepo, LeadRepo, exclusion_note, person_keys
+from crud import ExclusionRepo, LeadFilters, LeadRepo, exclusion_note, person_keys
 from dependencies import get_exclusion_repo, get_lead_intel_repo, get_lead_repo, require_manager, require_workspace_id
 from lead_intel import LeadIntelRepo
-from schemas import ColumnMapping, ImportResult, LeadIdsIn, LeadIn, LeadMoveIn, LeadOut, LeadsChanged, Page, RowOutcome
+from schemas import (
+    ColumnMapping, ImportResult, LeadBriefIn, LeadBriefOut, LeadIdsIn, LeadIn, LeadMoveIn, LeadOut, LeadsChanged, LeadsPageOut,
+    LeadSummaryOut, Page, RowOutcome,
+)  # fmt: skip
 from services.leads import (
     TEMPLATE_ROWS,
     CsvError,
@@ -61,6 +65,77 @@ async def list_leads(
     queued = await leads.queued_at([r.id for r in rows])
     items = [LeadOut.model_validate(r).model_copy(update={"post_count": posts.get(r.id, 0), "queued_at": queued.get(r.id)}) for r in rows]
     return Page[LeadOut](items=items, total=total, limit=limit, offset=offset)
+
+
+PRESENCE = "^(all|yes|no)$"
+MATCHING_CAP = 20000
+
+
+def lead_filters(
+    icp_id: UUID | None = Query(default=None, alias="icpId"),
+    status: str | None = Query(default=None, pattern=f"^(all|{'|'.join(LEAD_STATUSES)})$"),
+    source: str | None = Query(default=None, pattern="^(all|linkedin|instagram|facebook|website|none)$"),
+    email: str | None = Query(default=None, pattern="^(all|has|verified|none)$"),
+    linkedin: str | None = Query(default=None, pattern=PRESENCE),
+    posts: str | None = Query(default=None, pattern=PRESENCE),
+    score: str | None = Query(default=None, pattern="^(all|low|medium|high|unscored)$"),
+    queued_within: str | None = Query(default=None, alias="queuedWithin", pattern="^(all|7|30|90)$"),
+    q: str | None = Query(default=None, max_length=200),
+) -> LeadFilters:
+    """The Leads pages list only leads whose first email was queued (they count as leads from then on)."""
+    return LeadFilters(True, icp_id, status, source, email, linkedin, posts, score, queued_within, q)
+
+
+@router.get("/page", response_model=LeadsPageOut)
+async def page_leads(
+    f: LeadFilters = Depends(lead_filters),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    workspace_id: UUID = Depends(require_workspace_id),
+    leads: LeadRepo = Depends(get_lead_repo),
+) -> LeadsPageOut:
+    """One page of the leads in sequence, filtered in the database (only the rows shown are read)."""
+    rows, total = await leads.page(workspace_id, f, limit, offset, datetime.now(UTC))
+    posts = await leads.post_counts([r.id for r in rows])
+    queued = await leads.queued_at([r.id for r in rows])
+    items = [LeadOut.model_validate(r).model_copy(update={"post_count": posts.get(r.id, 0), "queued_at": queued.get(r.id)}) for r in rows]
+    queued_total, no_email, statuses = await leads.queued_counts_by(workspace_id, f.icp_id)
+    return LeadsPageOut(items=items, total=total, limit=limit, offset=offset, queued_total=queued_total, no_email=no_email, statuses=statuses)
+
+
+@router.get("/matching", response_model=list[LeadBriefOut])
+async def matching_leads(
+    f: LeadFilters = Depends(lead_filters),
+    workspace_id: UUID = Depends(require_workspace_id),
+    leads: LeadRepo = Depends(get_lead_repo),
+) -> list[LeadBriefOut]:
+    """Every lead in sequence matching these filters, as the few fields selecting needs (Select all)."""
+    return [LeadBriefOut.model_validate(r) for r in await leads.matching(workspace_id, f, datetime.now(UTC), MATCHING_CAP)]
+
+
+@router.post("/brief", response_model=list[LeadBriefOut])
+async def brief_leads(
+    body: LeadBriefIn, workspace_id: UUID = Depends(require_workspace_id), leads: LeadRepo = Depends(get_lead_repo)
+) -> list[LeadBriefOut]:
+    """These leads, as the few fields the Fetch posts and Write emails dialogs read."""
+    return [LeadBriefOut.model_validate(r) for r in await leads.brief(workspace_id, body.ids)] if body.ids else []
+
+
+@router.get("/summary", response_model=list[LeadSummaryOut])
+async def leads_summary(
+    workspace_id: UUID = Depends(require_workspace_id), leads: LeadRepo = Depends(get_lead_repo)
+) -> list[LeadSummaryOut]:
+    """Each ICP's leads per status (every lead), for the ICP pages' pipelines and counts."""
+    by_icp: dict[UUID | None, dict[str, int]] = {}
+    for icp_id, status, n in await leads.summary(workspace_id):
+        by_icp.setdefault(icp_id, {})[status] = n
+    return [LeadSummaryOut(icp_id=k, statuses=v) for k, v in by_icp.items()]
+
+
+@router.get("/extra-keys", response_model=list[str])
+async def lead_extra_keys(workspace_id: UUID = Depends(require_workspace_id), leads: LeadRepo = Depends(get_lead_repo)) -> list[str]:
+    """Every column name in the leads' extra fields, for prompt variables."""
+    return await leads.extra_keys(workspace_id)
 
 
 @router.post("/delete", response_model=LeadsChanged, dependencies=[Depends(require_manager)])

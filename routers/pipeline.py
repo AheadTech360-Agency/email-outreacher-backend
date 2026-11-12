@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from config import get_settings
 from background import report
 from services import enrich, exports, record_data
-from crud import PRODUCT_FIELDS, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
+from crud import PRODUCT_FIELDS, CompanyFilters, SmartListRepo, CompanyRepo, ExclusionRepo, IcpProfileRepo, PostRepo, ProductRepo, PromptRepo, ProviderCallRepo, SettingsRepo, StakeholderRepo
 from dependencies import (
     get_smart_list_repo,
     get_company_repo,
@@ -56,6 +56,9 @@ from schemas import (
     FindCompaniesResult,
     PipelineCompanyListOut,
     PipelineCompanyOut,
+    PipelineCompanyRowOut,
+    CompaniesPageOut,
+    CompanyBriefOut,
     PipelineStakeholdersIn,
     ResearchIn,
     ResearchResult,
@@ -98,6 +101,62 @@ async def list_companies(
     companies: CompanyRepo = Depends(get_company_repo),
 ) -> list[PipelineCompanyListOut]:
     return [PipelineCompanyListOut.model_validate(c) for c in await companies.list(workspace_id, icp_id, status, light=True)]
+
+
+PRESENCE = "^(all|yes|no)$"
+MATCHING_CAP = 20000
+
+
+def company_filters(
+    icp_id: UUID | None = Query(default=None, alias="icpId"),
+    archive: str = Query(default="active", pattern="^(active|archived|all)$"),
+    status: str = Query(default="all", pattern="^(all|found|review|qualified|not_fit|error)$"),
+    q: str | None = Query(default=None, max_length=200),
+    source: str | None = Query(default=None, max_length=40),
+    location: str | None = Query(default=None, max_length=200),
+    website: str | None = Query(default=None, pattern=PRESENCE),
+    contacts: str | None = Query(default=None, pattern=PRESENCE),
+    score_band: str | None = Query(default=None, alias="scoreBand", pattern="^(all|low|medium|high|unscored)$"),
+    icp_state: str | None = Query(default=None, alias="icpState", pattern=PRESENCE),
+) -> CompanyFilters:
+    return CompanyFilters(icp_id, archive, status, q, source, location, website, contacts, score_band, icp_state)
+
+
+@router.get("/companies/page", response_model=CompaniesPageOut)
+async def page_companies(
+    f: CompanyFilters = Depends(company_filters),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+) -> CompaniesPageOut:
+    """One page of the Companies list, filtered and counted in the database (only the rows shown are read)."""
+    rows, total = await companies.page(workspace_id, f, limit, offset)
+    people = await companies.people_counts([c.id for c in rows])
+    counts = await companies.status_counts(workspace_id, f)
+    return CompaniesPageOut(
+        items=[PipelineCompanyRowOut.model_validate(c).model_copy(update={"people_count": people.get(c.id, 0)}) for c in rows],
+        total=total, limit=limit, offset=offset, counts={"all": sum(counts.values()), **counts},
+        sources=await companies.sources(workspace_id, f),
+    )  # fmt: skip
+
+
+@router.get("/companies/matching", response_model=list[CompanyBriefOut])
+async def matching_companies(
+    f: CompanyFilters = Depends(company_filters),
+    workspace_id: UUID = Depends(require_workspace_id),
+    companies: CompanyRepo = Depends(get_company_repo),
+) -> list[CompanyBriefOut]:
+    """Every company matching these filters, in list order, as the few fields selecting needs (Select all)."""
+    return [CompanyBriefOut.model_validate(r) for r in await companies.matching(workspace_id, f, MATCHING_CAP)]
+
+
+@router.get("/companies/lead-intel-ids", response_model=list[UUID])
+async def lead_intel_ids(
+    workspace_id: UUID = Depends(require_workspace_id), companies: CompanyRepo = Depends(get_company_repo)
+) -> list[UUID]:
+    """The Lead Intel businesses already in the pipeline."""
+    return await companies.lead_intel_ids(workspace_id)
 
 
 @router.get("/companies.csv", response_class=Response)

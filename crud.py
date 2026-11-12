@@ -1,10 +1,11 @@
 """Reads and writes for our own `outreach.eo_` tables. Lead Intel is read in lead_intel.py, never here."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Uuid, case, cast, delete, exists, func, inspect, or_, select, tuple_, update
+from sqlalchemy import Text, Uuid, and_, case, cast, delete, exists, func, inspect, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, array, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, defer, load_only
@@ -20,6 +21,7 @@ from services.google_places import Place
 from services.identity import identity_keys
 from services.leads import Existing, LeadInput, clean_lead
 from services.prompts import DEFAULTS
+from services import listing
 from services.smart_lists import company_key, person_key
 
 
@@ -247,6 +249,22 @@ class PromptRepo:
 _full_name = func.lower(func.trim(func.concat(Lead.first_name, " ", Lead.last_name)))
 
 
+@dataclass
+class LeadFilters:
+    """The Leads pages' filters (app/leads/page.tsx, app/icps/[id]/leads/page.tsx)."""
+
+    queued: bool = True
+    icp_id: UUID | None = None
+    status: str | None = None
+    source: str | None = None
+    email: str | None = None
+    linkedin: str | None = None
+    posts: str | None = None
+    score: str | None = None
+    queued_within: str | None = None
+    q: str | None = None
+
+
 class LeadRepo:
     """Reads and writes `outreach.eo_leads` only."""
 
@@ -333,6 +351,79 @@ class LeadRepo:
             .group_by(Email.lead_id)
         )
         return dict(rows.all())
+
+    # When a lead's first email was queued (see queued_at): a lead counts as a lead from then on.
+    QUEUED_AT = (
+        select(func.min(func.coalesce(Email.queued_at, Email.updated_at)))
+        .where(Email.lead_id == Lead.id, Email.step == 1, Email.sequencer_campaign_id.is_not(None))
+        .scalar_subquery()
+    )  # fmt: skip
+    QUEUED = exists().where(Email.lead_id == Lead.id, Email.step == 1, Email.sequencer_campaign_id.is_not(None))
+    ORDER = (Lead.created_at.desc(), Lead.id)
+
+    def _matching(self, workspace_id: UUID, f: LeadFilters, now: datetime) -> list[Any]:
+        """Everything the Leads pages filter on, as the browser did."""
+        def url(column: Any) -> Any:  # a source the lead has (leadSources: any non-empty value)
+            return func.coalesce(column, "") != ""
+
+        sources = {"linkedin": url(Lead.linkedin_url), "instagram": url(Lead.instagram_url), "facebook": url(Lead.facebook_url),
+                   "website": url(Lead.website),
+                   "none": and_(~url(Lead.linkedin_url), ~url(Lead.instagram_url), ~url(Lead.facebook_url))}  # fmt: skip
+        verified = and_(url(Lead.email), func.lower(Lead.email_status).in_(("verified", "valid")))
+        email = {"none": ~url(Lead.email), "has": url(Lead.email), "verified": verified}.get(f.email or "all")
+        text = func.concat(func.trim(func.concat(Lead.first_name, " ", Lead.last_name)), " ", func.coalesce(Lead.email, ""), " ",
+                           func.coalesce(Lead.company, ""), " ", func.coalesce(Lead.title, ""))  # fmt: skip
+        source = None
+        if f.source and f.source != "all":
+            source = sources.get(f.source, literal(False))
+        return [Lead.workspace_id == workspace_id, *listing.where(
+            self.QUEUED if f.queued else None,
+            Lead.lead_intel_icp_id == f.icp_id if f.icp_id else None,
+            Lead.status == f.status if f.status and f.status != "all" else None,
+            source, email,
+            listing.presence(f.linkedin, listing.has_text(Lead.linkedin_url)),
+            listing.presence(f.posts, exists().where(Post.lead_id == Lead.id)),
+            listing.score_band(f.score, Lead.score),
+            listing.recent(f.queued_within, self.QUEUED_AT, now),
+            listing.whole_text(f.q, text),
+        )]  # fmt: skip
+
+    async def page(self, workspace_id: UUID, f: LeadFilters, limit: int, offset: int, now: datetime) -> tuple[list[Lead], int]:
+        """One page of leads (without their score reasons), and how many match."""
+        where = self._matching(workspace_id, f, now)
+        total = (await self.session.execute(select(func.count()).select_from(Lead).where(*where))).scalar_one()
+        query = select(Lead).where(*where).options(*_skip(Lead.score_reasons)).order_by(*self.ORDER).limit(limit).offset(offset)
+        return list(await self.session.scalars(query)), total
+
+    BRIEF = (Lead.id, Lead.lead_intel_icp_id, Lead.status, Lead.linkedin_url, Lead.instagram_url)
+
+    async def matching(self, workspace_id: UUID, f: LeadFilters, now: datetime, cap: int) -> list[Any]:
+        """Every matching lead in list order, as the few fields selection and the run dialogs read."""
+        query = select(*self.BRIEF).where(*self._matching(workspace_id, f, now)).order_by(*self.ORDER).limit(cap)
+        return list((await self.session.execute(query)).all())
+
+    async def brief(self, workspace_id: UUID, ids: list[UUID]) -> list[Any]:
+        query = select(*self.BRIEF).where(Lead.workspace_id == workspace_id, Lead.id.in_(ids))
+        return list((await self.session.execute(query)).all())
+
+    async def queued_counts_by(self, workspace_id: UUID, icp_id: UUID | None) -> tuple[int, int, dict[str, int]]:
+        """Leads (queued ones only, as the Leads pages list them), those without an email, and how many are in each
+        status, for one ICP or the workspace."""
+        where = [Lead.workspace_id == workspace_id, self.QUEUED, *([Lead.lead_intel_icp_id == icp_id] if icp_id else [])]
+        no_email = (await self.session.execute(select(func.count()).select_from(Lead).where(*where, func.coalesce(Lead.email, "") == ""))).scalar_one()
+        by_status = {s: n for s, n in await self.session.execute(select(Lead.status, func.count()).where(*where).group_by(Lead.status))}
+        return sum(by_status.values()), no_email, by_status
+
+    async def summary(self, workspace_id: UUID) -> list[tuple[UUID | None, str, int]]:
+        """How many leads each ICP has in each status (every lead, queued or not): the ICP pages' pipelines."""
+        query = select(Lead.lead_intel_icp_id, Lead.status, func.count()).where(Lead.workspace_id == workspace_id)
+        return list((await self.session.execute(query.group_by(Lead.lead_intel_icp_id, Lead.status))).all())
+
+    async def extra_keys(self, workspace_id: UUID) -> list[str]:
+        """Every column name found in the leads' extra fields (prompt variables lead.extra.<column>)."""
+        keys = func.jsonb_object_keys(Lead.extra)
+        found = await self.session.scalars(select(keys).where(Lead.workspace_id == workspace_id, func.jsonb_typeof(Lead.extra) == "object").distinct())
+        return sorted(found)
 
     async def post_counts(self, lead_ids: list[UUID]) -> dict[UUID, int]:
         """How many posts each of these leads has (their own, not their company's)."""
@@ -800,6 +891,22 @@ def _person_values(icp_id: UUID | None, person: Any, company: Company | None, or
     }  # fmt: skip
 
 
+@dataclass
+class PeopleFilters:
+    """The People page's filters (components/people/people-view.tsx)."""
+
+    archive: str = "active"
+    q: str | None = None
+    found_by: str | None = None
+    status: str | None = None
+    email: str | None = None
+    linkedin: str | None = None
+    post_state: str | None = None
+    email_state: str | None = None
+    company_text: str | None = None
+    pipeline_company_id: UUID | None = None
+
+
 class StakeholderRepo:
     """People found at a company, before and after their email is revealed. `outreach.eo_stakeholders`."""
 
@@ -818,6 +925,84 @@ class StakeholderRepo:
         if icp_id:
             query = query.where(Stakeholder.lead_intel_icp_id == icp_id)
         return list(await self.session.scalars(query.order_by(Stakeholder.found_at.desc(), Stakeholder.id)))
+
+    # Where they were found, as the People page shows it: the pipeline company's name, else the organisation's.
+    COMPANY = func.coalesce(
+        func.nullif(select(Company.name).where(Company.id == Stakeholder.company_id).scalar_subquery(), ""),
+        func.nullif(Stakeholder.organization_name, ""), "—",
+    )  # fmt: skip
+    QUEUED = exists().where(Email.lead_id == Stakeholder.lead_id, Email.step == 1, Email.sequencer_campaign_id.is_not(None))
+    POSTS = exists().where(Post.lead_id == Stakeholder.lead_id)
+    ORDER = (Stakeholder.found_at.desc(), Stakeholder.id)
+
+    @staticmethod
+    def _base(workspace_id: UUID, f: PeopleFilters) -> list[Any]:
+        out: list[Any] = [Stakeholder.workspace_id == workspace_id]
+        if f.pipeline_company_id:
+            out.append(Stakeholder.company_id == f.pipeline_company_id)
+        if f.archive == "active":
+            out.append(Stakeholder.archived.is_(False))
+        elif f.archive == "archived":
+            out.append(Stakeholder.archived.is_(True))
+        return out
+
+    def _matching(self, workspace_id: UUID, f: PeopleFilters) -> list[Any]:
+        """Everything the People page filters on, as the browser did."""
+        found = {
+            "company": and_(Stakeholder.source == "apollo", Stakeholder.lead_intel_icp_id.is_(None)),
+            "linkedin": Stakeholder.source == "apify_linkedin", "manual": Stakeholder.source == "manual",
+        }  # fmt: skip
+        found_by = None
+        if f.found_by and f.found_by != "all":
+            found_by = found.get(f.found_by)
+            if found_by is None:
+                try:
+                    found_by = Stakeholder.lead_intel_icp_id == UUID(f.found_by)
+                except ValueError:
+                    found_by = literal(False)
+        status = {"lead": self.QUEUED, "notlead": ~self.QUEUED, "revealed": Stakeholder.revealed_at.is_not(None),
+                  "hidden": Stakeholder.revealed_at.is_(None)}.get(f.status or "all")  # fmt: skip
+        verified = and_(func.coalesce(Stakeholder.email, "") != "", func.lower(Stakeholder.email_status).in_(("verified", "valid")))
+        email = {"none": ~listing.has_text(Stakeholder.email), "has": listing.has_text(Stakeholder.email), "verified": verified}.get(f.email or "all")
+        email_state = func.coalesce(func.nullif(Stakeholder.email_status, ""), "unknown")
+        text = func.concat(Stakeholder.first_name, " ", Stakeholder.last_name, " ", Stakeholder.title, " ", self.COMPANY, " ",
+                           func.coalesce(Stakeholder.email, ""))  # fmt: skip
+        return [*self._base(workspace_id, f), *listing.where(
+            listing.presence(f.linkedin, listing.has_text(Stakeholder.linkedin_url)),
+            listing.presence(f.post_state, self.POSTS),
+            listing.all_terms(f.company_text, self.COMPANY),
+            email_state == f.email_state if f.email_state and f.email_state != "all" else None,
+            found_by, status, email,
+            listing.whole_text(f.q, text),
+        )]  # fmt: skip
+
+    async def page(self, workspace_id: UUID, f: PeopleFilters, limit: int, offset: int) -> tuple[list[tuple[Stakeholder, str]], int]:
+        """One page of the People list with each person's company name, and how many match."""
+        where = self._matching(workspace_id, f)
+        total = (await self.session.execute(select(func.count()).select_from(Stakeholder).where(*where))).scalar_one()
+        query = select(Stakeholder, self.COMPANY).where(*where).options(*_skip(Stakeholder.raw)).order_by(*self.ORDER).limit(limit).offset(offset)
+        return [(s, name) for s, name in await self.session.execute(query)], total
+
+    async def matching(self, workspace_id: UUID, f: PeopleFilters, cap: int) -> list[Any]:
+        """Every matching person in list order, as the few fields selection and bulk actions read."""
+        query = (
+            select(Stakeholder.id, Stakeholder.email, Stakeholder.revealed_at, Stakeholder.linkedin_url, Stakeholder.lead_id)
+            .where(*self._matching(workspace_id, f)).order_by(*self.ORDER).limit(cap)
+        )  # fmt: skip
+        return list((await self.session.execute(query)).all())
+
+    async def email_statuses(self, workspace_id: UUID, f: PeopleFilters) -> list[str]:
+        """The verification statuses in the list (archive filter only): the Email verification filter's options."""
+        state = func.coalesce(func.nullif(Stakeholder.email_status, ""), "unknown")
+        found = await self.session.scalars(select(state).where(*self._base(workspace_id, f)).distinct())
+        return sorted((s for s in found if s and s.strip()), key=lambda s: (s.lower(), s))
+
+    async def post_counts(self, lead_ids: list[UUID]) -> dict[UUID, int]:
+        return await LeadRepo(self.session).post_counts(lead_ids)
+
+    async def lead_ids(self, workspace_id: UUID, ids: list[UUID]) -> dict[UUID, UUID | None]:
+        query = select(Stakeholder.id, Stakeholder.lead_id).where(Stakeholder.workspace_id == workspace_id, Stakeholder.id.in_(ids))
+        return {i: lead for i, lead in await self.session.execute(query)}
 
     async def get_many(self, workspace_id: UUID, ids: list[UUID]) -> list[Stakeholder]:
         query = select(Stakeholder).where(Stakeholder.workspace_id == workspace_id, Stakeholder.id.in_(ids))
@@ -1401,6 +1586,22 @@ class PostRepo:
         return list(await self.session.scalars(query.order_by(Post.posted_at.desc().nulls_last(), Post.id)))
 
 
+@dataclass
+class CompanyFilters:
+    """The Companies page's filters (components/companies/companies-view.tsx)."""
+
+    icp_id: UUID | None = None
+    archive: str = "active"
+    status: str | None = None
+    q: str | None = None
+    source: str | None = None
+    location: str | None = None
+    website: str | None = None
+    contacts: str | None = None
+    score_band: str | None = None
+    icp_state: str | None = None
+
+
 class CompanyRepo:
     """The workspace's company pipeline. Reads and writes `outreach.eo_companies` and `eo_company_pages` only."""
 
@@ -1409,6 +1610,81 @@ class CompanyRepo:
 
     async def workspace_exists(self, workspace_id: UUID) -> bool:
         return (await self.session.get(Workspace, workspace_id)) is not None
+
+    @staticmethod
+    def _base(workspace_id: UUID, f: "CompanyFilters") -> list[Any]:
+        """The ICP and the archive filter: what the tab counts and the source options cover."""
+        out: list[Any] = [Company.workspace_id == workspace_id]
+        if f.icp_id:
+            out.append(Company.icp_id == f.icp_id)
+        if f.archive == "active":
+            out.append(Company.archived.is_(False))
+        elif f.archive == "archived":
+            out.append(Company.archived.is_(True))
+        return out
+
+    @staticmethod
+    def _people_at() -> Any:
+        return exists().where(Stakeholder.company_id == Company.id)
+
+    def _matching(self, workspace_id: UUID, f: "CompanyFilters") -> list[Any]:
+        """Everything the page filters on, as the browser did: tab, source, location, website, people found, score,
+        ICP assignment and the search (the whole query inside "name domain")."""
+        website = case((Company.website_url != "", Company.website_url), else_=Company.domain)
+        return [*self._base(workspace_id, f), *listing.where(
+            Company.status == f.status if f.status and f.status != "all" else None,
+            Company.source == f.source if f.source and f.source != "all" else None,
+            listing.all_terms(f.location, Company.city, Company.state),
+            listing.presence(f.website, listing.has_text(website)),
+            listing.presence(f.contacts, self._people_at()),
+            listing.score_band(f.score_band, Company.score),
+            listing.presence(f.icp_state, Company.icp_id.is_not(None)),
+            listing.whole_text(f.q, func.concat(Company.name, " ", func.coalesce(Company.domain, ""))),
+        )]  # fmt: skip
+
+    ORDER = (Company.score.desc().nulls_last(), Company.created_at.desc(), Company.id)
+
+    async def page(self, workspace_id: UUID, f: "CompanyFilters", limit: int, offset: int) -> tuple[list[Company], int]:
+        """One page of the Companies list (without research and the score and rule breakdowns), and how many match."""
+        where = self._matching(workspace_id, f)
+        total = (await self.session.execute(select(func.count()).select_from(Company).where(*where))).scalar_one()
+        query = (
+            select(Company).where(*where)
+            .options(*_skip(Company.research, Company.raw, Company.score_detail, Company.rule_detail))
+            .order_by(*self.ORDER).limit(limit).offset(offset)
+        )  # fmt: skip
+        return list(await self.session.scalars(query)), total
+
+    async def matching(self, workspace_id: UUID, f: "CompanyFilters", cap: int) -> list[Any]:
+        """Every matching company in list order, as the few fields selection and bulk actions read."""
+        query = (
+            select(Company.id, Company.status, Company.source, Company.researched_at, Company.name, Company.domain)
+            .where(*self._matching(workspace_id, f)).order_by(*self.ORDER).limit(cap)
+        )  # fmt: skip
+        return list((await self.session.execute(query)).all())
+
+    async def status_counts(self, workspace_id: UUID, f: "CompanyFilters") -> dict[str, int]:
+        """Companies per status under the ICP and archive filter only (the tabs ignore search and facets)."""
+        query = select(Company.status, func.count()).where(*self._base(workspace_id, f)).group_by(Company.status)
+        return {s: n for s, n in await self.session.execute(query)}
+
+    async def sources(self, workspace_id: UUID, f: "CompanyFilters") -> list[str]:
+        query = select(Company.source).where(*self._base(workspace_id, f)).distinct()
+        return sorted(s for s in await self.session.scalars(query) if s and s.strip())
+
+    async def people_counts(self, company_ids: list[UUID]) -> dict[UUID, int]:
+        """People found at each of these companies (archived people too, as before)."""
+        if not company_ids:
+            return {}
+        query = select(Stakeholder.company_id, func.count()).where(Stakeholder.company_id.in_(company_ids)).group_by(Stakeholder.company_id)
+        return {cid: n for cid, n in await self.session.execute(query)}
+
+    async def lead_intel_ids(self, workspace_id: UUID) -> list[UUID]:
+        """The Lead Intel businesses already in the pipeline (the import dialog marks them)."""
+        query = select(Company.lead_intel_business_id).where(
+            Company.workspace_id == workspace_id, Company.lead_intel_business_id.is_not(None)
+        )
+        return list(await self.session.scalars(query))
 
     async def get_many(self, workspace_id: UUID, ids: list[UUID]) -> list[Company]:
         query = select(Company).where(Company.workspace_id == workspace_id, Company.id.in_(ids))
@@ -1630,6 +1906,38 @@ class CompanyRepo:
         await self.session.refresh(company)
 
 
+# Feedback tags as the Feedback page labels them (components/feedback/feedback-control.tsx): its search matches them.
+TAG_LABEL = {
+    "strong_hook": "Strong hook", "right_tone": "Right tone", "clear_cta": "Clear ask", "send_as_is": "Would send as is",
+    "too_long": "Too long", "too_generic": "Too generic", "wrong_hook": "Wrong hook", "tone_off": "Tone off",
+    "made_up_facts": "Made-up facts", "weak_cta": "Weak ask", "wrong_person": "Wrong person",
+}  # fmt: skip
+SCORED = ("draft", "edited", "approved", "queued")  # the lead's score belongs to its current draft only
+
+
+@dataclass
+class EmailFilters:
+    """Review's and Feedback's filters (components/review/drafts-view.tsx, components/feedback/feedback-view.tsx).
+    `icp_id` scopes to an ICP's route; `icp` is the ICP filter on the page. `search` is Review's (the whole query in
+    any one field), `terms` Feedback's (every word somewhere in the email, its rating, its tags or its ICP's name)."""
+
+    statuses: list[str] | None = None
+    lead_id: UUID | None = None
+    icp_id: str | None = None
+    icp: str | None = None
+    search: str | None = None
+    terms: str | None = None
+    score_band: str | None = None
+    hook: str | None = None
+    flags: str | None = None
+    rating: str | None = None  # Review's rating filter (good, bad or unrated)
+    rated: str | None = None  # Feedback's tab (good, bad or unrated)
+    written: str | None = None
+    tag: str | None = None
+    sort: str = "newest"
+    icp_names: dict[UUID, str] | None = None
+
+
 class EmailRepo:
     """Drafted emails and the ranked points behind them. `outreach.eo_emails`, `eo_insights`, and the lead's status."""
 
@@ -1745,6 +2053,107 @@ class EmailRepo:
     async def count(self, workspace_id: UUID, statuses: list[str] | None, lead_id: UUID | None, icp_id: str | None) -> int:
         where = self._first_emails(workspace_id, statuses, lead_id, icp_id)
         return (await self.session.execute(select(func.count()).select_from(Email).join(Lead, Lead.id == Email.lead_id).where(*where))).scalar_one()
+
+    SCORE = case((Email.status.in_(SCORED), Lead.score), else_=None)
+    BODY = func.coalesce(Email.edited_body, Email.body)
+
+    def _filtered(self, workspace_id: UUID, f: EmailFilters, now: datetime, statuses: bool = True, rating: bool = True) -> Any:
+        """First emails with their lead and rating, filtered as Review and Feedback did (`statuses` and `rating` off
+        for the tab counts: Review's status tabs and Feedback's rating tabs, each under all the other filters)."""
+        name = func.coalesce(func.nullif(func.trim(func.concat(Lead.first_name, " ", Lead.last_name)), ""), func.nullif(Lead.email, ""),
+                             "Unnamed lead")  # fmt: skip
+        conditions = self._first_emails(workspace_id, f.statuses if statuses else None, f.lead_id, f.icp_id)
+        if f.icp and f.icp != "all":
+            conditions.append(Lead.lead_intel_icp_id.is_(None) if f.icp == "none" else Lead.lead_intel_icp_id == UUID(f.icp))
+        hook = {"yes": listing.has_text(Email.hook), "no": ~listing.has_text(Email.hook),
+                "with": func.coalesce(Email.hook, "") != "", "without": func.coalesce(Email.hook, "") == ""}.get(f.hook or "all")  # fmt: skip
+        rated = {"good": EmailFeedback.rating == "good", "bad": EmailFeedback.rating == "bad", "unrated": EmailFeedback.id.is_(None)}
+        conditions += listing.where(
+            listing.score_band(f.score_band, self.SCORE), hook,
+            listing.presence(f.flags, func.cardinality(Email.flags) > 0),
+            rated.get(f.rating, literal(False)) if f.rating and f.rating != "all" else None,
+            rated.get(f.rated, literal(False)) if rating and f.rated and f.rated != "all" else None,
+            listing.recent(f.written, Email.created_at, now),
+            EmailFeedback.tags.any(f.tag) if f.tag and f.tag != "all" else None,
+            listing.any_field(f.search, name, Lead.company, Lead.title, Lead.email, Email.subject, self.BODY),
+            self._terms(f),
+        )  # fmt: skip
+        return (
+            select(Email, Lead).join(Lead, Lead.id == Email.lead_id)
+            .outerjoin(EmailFeedback, EmailFeedback.email_id == Email.id).where(*conditions)
+        )  # fmt: skip
+
+    def _terms(self, f: EmailFilters) -> Any | None:
+        """Feedback's search: every word in the subject, body, lead, hook, rating note, tag labels or ICP name."""
+        words = listing.terms(f.terms)
+        if not words:
+            return None
+        names = f.icp_names or {}
+        fields = (Email.subject, self.BODY, Lead.first_name, Lead.last_name, Lead.email, Lead.title, Lead.company, Email.hook, EmailFeedback.note)
+        each = []
+        for word in words:
+            tags = [t for t, label in TAG_LABEL.items() if word in label.lower()]
+            icps = [i for i, n in names.items() if word in (n or "").lower()]
+            each.append(or_(
+                *[listing.any_field(word, field) for field in fields],
+                *([EmailFeedback.tags.op("&&")(cast(tags, PG_ARRAY(Text)))] if tags else []),
+                *([Lead.lead_intel_icp_id.in_(icps)] if icps else []),
+                *([Lead.lead_intel_icp_id.is_(None)] if word in "no icp" else []),
+            ))  # fmt: skip
+        return and_(*each)
+
+    def _order(self, f: EmailFilters) -> tuple[Any, ...]:
+        """Newest first (Review always); Feedback can also sort oldest first, by score (unscored last) or by when it
+        was rated (unrated last). Ties keep the newest-first order, as the browser's stable sort did."""
+        newest = (Email.created_at.desc(), Email.id)
+        return {
+            "oldest": (Email.created_at.asc(), Email.id),
+            "score-low": (self.SCORE.asc().nulls_last(), *newest),
+            "score-high": (self.SCORE.desc().nulls_last(), *newest),
+            "rated": (EmailFeedback.updated_at.desc().nulls_last(), *newest),
+        }.get(f.sort, newest)
+
+    async def page(self, workspace_id: UUID, f: EmailFilters, limit: int, offset: int, now: datetime) -> tuple[list[tuple[Email, Lead]], int]:
+        """One page of first emails in the page's order, and how many match."""
+        query = self._filtered(workspace_id, f, now)
+        total = (await self.session.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
+        rows = await self.session.execute(query.order_by(*self._order(f)).limit(limit).offset(offset))
+        return [(e, lead) for e, lead in rows], total
+
+    async def ids(self, workspace_id: UUID, f: EmailFilters, now: datetime, cap: int) -> list[UUID]:
+        """Every matching email's id in the page's order (the drawer's previous and next)."""
+        query = self._filtered(workspace_id, f, now).with_only_columns(Email.id).order_by(*self._order(f)).limit(cap)
+        return list(await self.session.scalars(query))
+
+    async def brief(self, workspace_id: UUID, f: EmailFilters, now: datetime, cap: int) -> list[Any]:
+        """Matching emails as id, status, the lead's name and email status (Queue all approved)."""
+        query = self._filtered(workspace_id, f, now).with_only_columns(
+            Email.id, Email.status, Lead.first_name, Lead.last_name, Lead.email, Lead.email_status
+        ).order_by(*self._order(f)).limit(cap)  # fmt: skip
+        return list((await self.session.execute(query)).all())
+
+    async def breakdown(self, workspace_id: UUID, f: EmailFilters, now: datetime) -> tuple[dict[str, int], dict[str, int]]:
+        """Under the same search and filters: how many emails are in each status (Review's tabs) and how many are
+        unrated, good or bad (Feedback's tabs)."""
+        sub = self._filtered(workspace_id, f, now, statuses=False, rating=False).with_only_columns(
+            Email.status.label("status"), func.coalesce(EmailFeedback.rating, "unrated").label("rating")
+        ).subquery()  # fmt: skip
+        by_status: dict[str, int] = {}
+        by_rating: dict[str, int] = {}
+        for status, rating, n in await self.session.execute(select(sub.c.status, sub.c.rating, func.count()).group_by(sub.c.status, sub.c.rating)):
+            by_status[status] = by_status.get(status, 0) + n
+            by_rating[rating] = by_rating.get(rating, 0) + n
+        return by_status, by_rating
+
+    async def rated(self, workspace_id: UUID, icp_id: str | None) -> tuple[int, int]:
+        """How many first emails there are (in an ICP, or all) and how many of them are rated."""
+        where = self._first_emails(workspace_id, None, None, icp_id)
+        query = (
+            select(func.count(), func.count(EmailFeedback.id)).select_from(Email).join(Lead, Lead.id == Email.lead_id)
+            .outerjoin(EmailFeedback, EmailFeedback.email_id == Email.id).where(*where)
+        )  # fmt: skip
+        total, rated = (await self.session.execute(query)).one()
+        return total, rated
 
     async def counts(self, workspace_id: UUID, icp_id: str | None = None) -> dict[str, int]:
         """How many first emails are in each status: one small row per status, not the emails."""

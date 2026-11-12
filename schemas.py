@@ -671,6 +671,37 @@ class StakeholderOut(ApiModel):
     queued_at: datetime | None = None
 
 
+class PersonRowOut(StakeholderOut):
+    """A row of the People page: the person, where they were found and how many of their posts are stored."""
+
+    company_name: str = "—"
+    post_count: int = 0
+
+
+class PeoplePageOut(ApiModel):
+    """One page of people, how many match, and the email verification statuses in the list."""
+
+    items: list[PersonRowOut]
+    total: int
+    limit: int
+    offset: int
+    email_statuses: list[str]
+
+
+class PersonBriefOut(ApiModel):
+    """What selecting a person and the People page's bulk actions need."""
+
+    id: UUID
+    email: str | None
+    revealed_at: datetime | None
+    linkedin_url: str | None
+    lead_id: UUID | None
+
+
+class PersonIdsIn(ApiModel):
+    ids: list[UUID] = Field(max_length=5000)
+
+
 class StakeholderDetailOut(StakeholderOut):
     """A person for their page: everything stored about them, grouped ({group: {label: value}})."""
 
@@ -923,6 +954,34 @@ class PipelineCompanyListOut(ApiModel):
     score: int | None
     researched_at: datetime | None
     created_at: datetime
+
+
+class PipelineCompanyRowOut(PipelineCompanyListOut):
+    """A row of the Companies page: the list fields and how many people were found there."""
+
+    people_count: int = 0
+
+
+class CompaniesPageOut(ApiModel):
+    """One page of companies, how many match, the tab counts (ICP and archive filter only) and the sources."""
+
+    items: list[PipelineCompanyRowOut]
+    total: int
+    limit: int
+    offset: int
+    counts: dict[str, int]
+    sources: list[str]
+
+
+class CompanyBriefOut(ApiModel):
+    """What selecting a company and its bulk actions need."""
+
+    id: UUID
+    status: str
+    source: str
+    researched_at: datetime | None
+    name: str
+    domain: str | None
 
 
 class PipelineCompanyOut(PipelineCompanyListOut):
@@ -1178,11 +1237,38 @@ class EmailLeadOut(ApiModel):
     linkedin_url: str | None
 
 
+class EmailsPageOut(ApiModel):
+    """One page of emails and how many match; and, under the same search and filters, how many are in each status
+    (Review's tabs) and how many are unrated, good or bad (Feedback's tabs)."""
+
+    items: list["EmailOut"]
+    total: int
+    limit: int
+    offset: int
+    statuses: dict[str, int]
+    ratings: dict[str, int]
+
+
 class FeedbackOut(ApiModel):
     rating: Literal["good", "bad"]
     tags: list[str]
     note: str
     updated_at: datetime
+
+
+class EmailBriefOut(ApiModel):
+    """An email as Queue all approved needs it: who it's to and how sure their address is."""
+
+    id: UUID
+    status: str
+    lead_name: str
+    lead_email: str | None
+    email_status: str | None
+
+
+class RatedOut(ApiModel):
+    total: int
+    rated: int
 
 
 class EmailOut(ApiModel):
@@ -1447,6 +1533,40 @@ class ExampleEmailOut(ExampleEmailIn):
 
 class SaveAsExampleIn(ApiModel):
     note: str = Field(default="", max_length=2000)
+
+
+class LeadsPageOut(ApiModel):
+    """One page of leads and how many match; and, for the leads in sequence (in this ICP, or all), how many there are,
+    how many have no email and how many are in each status."""
+
+    items: list[LeadOut]
+    total: int
+    limit: int
+    offset: int
+    queued_total: int
+    no_email: int
+    statuses: dict[str, int]
+
+
+class LeadBriefOut(ApiModel):
+    """What selecting a lead and the Fetch posts and Write emails dialogs need."""
+
+    id: UUID
+    icp_id: UUID | None = Field(validation_alias="lead_intel_icp_id")
+    status: str
+    linkedin_url: str | None
+    instagram_url: str | None
+
+
+class LeadSummaryOut(ApiModel):
+    """How many leads an ICP has in each status (every lead, queued or not); icp_id null is leads with no ICP."""
+
+    icp_id: UUID | None
+    statuses: dict[str, int]
+
+
+class LeadBriefIn(ApiModel):
+    ids: list[UUID] = Field(max_length=5000)
 
 
 class LeadIdsIn(ApiModel):
