@@ -2756,7 +2756,7 @@ class QuickstartRepo:
         query = select(Email).where(Email.lead_id.in_(lead_ids), Email.step == 1).order_by(Email.created_at)
         return list(await self.session.scalars(query.execution_options(populate_existing=True)))
 
-    async def briefs(self, company_ids: list[UUID]) -> list[dict[str, Any]]:
+    async def briefs(self, company_ids: list[UUID], workspace_id: UUID) -> list[dict[str, Any]]:
         """The analysed companies of a run: what the analysis page shows, with the brief read out of the research JSON
         (not the whole research), and each company's three latest posts (its own or its people's)."""
         if not company_ids:
@@ -2765,12 +2765,13 @@ class QuickstartRepo:
             select(Company.id, Company.name, Company.domain, Company.website_url, Company.linkedin_url, Company.instagram_url,
                    Company.facebook_url, Company.city, Company.state, Company.score, Company.status, Company.research.op("->")("brief"),
                    Company.raw.op("->>")("employees"), Company.raw.op("->>")("industry"))
-            .where(Company.id.in_(company_ids), Company.research.op("?")("brief"))
+            .where(Company.workspace_id == workspace_id, Company.id.in_(company_ids), Company.research.op("?")("brief"))
             .order_by(Company.score.desc().nulls_last(), Company.name)
         )).all()  # fmt: skip
         ids = [r[0] for r in rows]
         people = (await self.session.execute(
-            select(Stakeholder.company_id, Stakeholder.lead_id).where(Stakeholder.company_id.in_(ids), Stakeholder.lead_id.is_not(None))
+            select(Stakeholder.company_id, Stakeholder.lead_id)
+            .where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(ids), Stakeholder.lead_id.is_not(None))
         )).all() if ids else []  # fmt: skip
         company_of_lead = {lead: cid for cid, lead in people}
         recent: dict[UUID, list[dict[str, Any]]] = {}
@@ -2778,7 +2779,7 @@ class QuickstartRepo:
             owners = [Post.company_id.in_(ids)] + ([Post.lead_id.in_(list(company_of_lead))] if company_of_lead else [])
             posts = await self.session.execute(
                 select(Post.company_id, Post.lead_id, Post.source, Post.url, Post.posted_at, func.left(Post.text, 400))
-                .where(or_(*owners)).order_by(Post.posted_at.desc().nulls_last()).limit(len(ids) * 12)
+                .where(Post.workspace_id == workspace_id, or_(*owners)).order_by(Post.posted_at.desc().nulls_last()).limit(len(ids) * 12)
             )  # fmt: skip
             for cid, lead, source, url, posted, text_ in posts:  # noqa: B007
                 key = cid or company_of_lead.get(lead)
@@ -2789,7 +2790,8 @@ class QuickstartRepo:
         if ids:
             for cid, first, last, title, email, linkedin in await self.session.execute(
                 select(Stakeholder.company_id, Stakeholder.first_name, Stakeholder.last_name, Stakeholder.title, Stakeholder.email,
-                       Stakeholder.linkedin_url).where(Stakeholder.company_id.in_(ids)).order_by(Stakeholder.found_at)
+                       Stakeholder.linkedin_url)
+                .where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id.in_(ids)).order_by(Stakeholder.found_at)
             ):  # fmt: skip
                 contacts.setdefault(cid, []).append({"name": f"{first} {last}".strip(), "title": title or "", "email": email, "linkedin_url": linkedin})
         return [

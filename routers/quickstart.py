@@ -241,7 +241,7 @@ async def run_briefs(
 ) -> list[QuickstartBriefOut]:
     """The company briefs a LinkedIn run wrote (best score first), with each company's links and latest posts."""
     run = await _run(runs, workspace_id, run_id, user)
-    return [QuickstartBriefOut.model_validate(b) for b in await runs.briefs(list(run.company_ids))]
+    return [QuickstartBriefOut.model_validate(b) for b in await runs.briefs(list(run.company_ids), workspace_id)]
 
 
 @router.get("/runs/{run_id}/people", response_model=list[QuickstartPersonOut])

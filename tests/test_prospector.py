@@ -123,7 +123,7 @@ class FakeRuns:
         self.created.append(run)
         return run
 
-    async def briefs(self, company_ids):
+    async def briefs(self, company_ids, workspace_id=None):
         return []
 
     async def save(self, run):
