@@ -28,6 +28,7 @@ class World:
         self.sites_before: set[str] = set()  # ...before the run started
         self.contacted: set = set()  # people already emailed
         self.write_ages: list[int] = []  # the post age limit each write was sent
+        self.briefs: list[dict] = []  # what each analysis was sent
         for name in ("Ink Co", "Tee Shop", "Big Box"):
             c = SimpleNamespace(id=uuid4(), name=name, domain=None, status="found", status_reason=None, score=None, researched_at=None)
             self.companies[c.id] = c
@@ -36,7 +37,7 @@ class World:
         self.calls.append(path)
         run.job_ids = [*run.job_ids, uuid4()]
         if path == "/pipeline/find":
-            return True, {"googleMaps": {"found": 20, "added": 3, "error": None}}, None
+            return True, {"googleMaps": {"found": 20, "added": 3, "error": None, "companyIds": [str(c) for c in self.companies]}}, None
         if path == "/pipeline/research":
             for cid in body["companyIds"]:
                 c = next(c for c in self.companies.values() if str(c.id) == cid)
@@ -76,6 +77,9 @@ class World:
             return True, {"instagram": 1, "linkedinCompanies": 1}, None
         if path == "/stakeholders/enrich":
             return True, {"linkedinPeople": len(body["stakeholderIds"])}, None
+        if path == "/pipeline/briefs":
+            self.briefs.append(body)
+            return True, {"written": len(body["companyIds"]), "failed": 0, "costUsd": 0.0}, None
         if path == "/emails/generate":
             # Written only from posts within the run's age limit, not older ones stored from an earlier read.
             assert body["maxPostAgeDays"] == run.settings["max_post_age_days"]
@@ -409,3 +413,27 @@ def test_sites_a_crashed_batch_saved_are_counted_as_read_now_not_before(world) -
     run = new_run(source="existing", smart_list_id=None, search_terms=[], places=[])
     run_all(run, world)
     assert run.progress["website"]["note"] == "3 read now"
+
+
+def test_a_prospectors_google_run_ends_with_the_analysis_they_are_allowed(world, monkeypatch) -> None:
+    """An admin decides a Prospector's searches, posts and analysis (2026-11-13): their Google run verifies only the
+    companies its own search added, reads no posts when none are allowed, never writes emails, and the analysis reads
+    and writes only what's allowed."""
+    other = SimpleNamespace(id=uuid4(), name="Someone else's", domain=None, status="found", status_reason=None, score=None, researched_at=None)
+    run = new_run(prospector=True, source="google_maps", post_sources=[], analysis_reads=["website"], analysis_writes=["company"])
+    world.companies[other.id] = other  # unresearched, but not found by this run's search
+    real_job = world.job
+
+    async def only_ours(session, run, path, body, label):
+        out = await real_job(session, run, path, body, label)
+        if path == "/pipeline/find":
+            out[1]["googleMaps"]["companyIds"] = [i for i in out[1]["googleMaps"]["companyIds"] if i != str(other.id)]
+        return out
+
+    monkeypatch.setattr(quickstart, "_job", only_ours)
+    run_all(run, world)
+    assert quickstart.steps_for(run.settings)[-1] == "analysis" and "write" not in quickstart.steps_for(run.settings)
+    assert other.id not in run.company_ids and len(run.company_ids) == 3
+    assert "/posts/fetch" not in world.calls and run.progress["posts"]["state"] == "skipped"
+    assert "/emails/generate" not in world.calls and world.calls[-1] == "/pipeline/briefs"
+    assert world.briefs[0]["reads"] == ["website"] and world.briefs[0]["writes"] == ["company"]

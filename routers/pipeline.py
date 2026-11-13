@@ -72,6 +72,7 @@ from schemas import (
     PeopleWebIn,
     PeopleWebResult,
     WebSearchIn,
+    BriefsIn,
     WebSearchResult,
     ResearchIn,
     ResearchResult,
@@ -347,10 +348,11 @@ async def _find_on_google_maps(
         to_add.append((place, None if kind == "platform" else domain))
     if chains:
         notes.append(f"{chains} national chain location{'s' if chains != 1 else ''} skipped.")
-    added, dupes = await companies.add_google_maps(workspace_id, body.icp_id, to_add)
+    added_ids: list[UUID] = []
+    added, dupes = await companies.add_google_maps(workspace_id, body.icp_id, to_add, added_ids)
     return SourceFindResult(
         found=len(found), added=added, duplicates=dupes, error=fatal, searches=searches + lookups, cost_usd=cost, notes=notes,
-        excluded=excluded,
+        excluded=excluded, company_ids=added_ids,
     )
 
 
@@ -782,7 +784,7 @@ async def people_from_the_web(
 
 @router.post("/briefs", response_model=BriefsResult, dependencies=[Depends(require_manager)])
 async def write_briefs(
-    body: CompanyIdsIn,
+    body: BriefsIn,
     workspace_id: UUID = Depends(require_workspace_id),
     lead_intel: LeadIntelRepo = Depends(get_lead_intel_repo),
     companies: CompanyRepo = Depends(get_company_repo),
@@ -829,7 +831,9 @@ async def write_briefs(
             "contacts": research.get("contacts"),
             **material,
         }
-        result = await writer.write(evidence)
+        evidence = _readable(evidence, body.reads)
+        writes = tuple(body.writes or ("company", "people"))
+        result = await writer.write(evidence, writes)
         call_cost = cost_usd(result.model, result.input_tokens, result.output_tokens) if result.input_tokens else 0
         cost += call_cost
         await calls.record(workspace_id, "claude", "messages", "failed" if result.error else "succeeded", cost_usd=round(call_cost, 4),
@@ -838,10 +842,28 @@ async def write_briefs(
             failed += 1
             notes.append(f"{c.name}: {result.error}")
             continue
-        c.research = {**research, "brief": result.brief.model_dump(), "brief_at": datetime.now(UTC).isoformat()}
+        c.research = {**research, "brief": {**result.brief.model_dump(), "parts": list(writes)}, "brief_at": datetime.now(UTC).isoformat()}
         written += 1
     await companies.save_all(rows)
     return BriefsResult(written=written, failed=failed, cost_usd=round(cost, 4) or None, notes=notes)
+
+
+def _readable(evidence: dict[str, Any], reads: list[str] | None) -> dict[str, Any]:
+    """The evidence an analysis may read (a Prospector's run: what an admin allowed). None: all of it."""
+    if reads is None:
+        return evidence
+    out = dict(evidence)
+    if "website" not in reads:
+        for key in ("website", "website_pages", "contacts"):
+            out.pop(key, None)
+    if "posts" not in reads:
+        out.pop("posts", None)
+    if "company_profile" not in reads:
+        out.pop("company_listing", None)
+        out.pop("instagram", None)
+    if "people_profiles" not in reads:
+        out["people"] = [{k: p[k] for k in ("name", "title") if k in p} for p in out.get("people") or []]
+    return out
 
 
 @router.post("/stakeholders", response_model=StakeholderSearchResult, dependencies=[Depends(require_manager)])

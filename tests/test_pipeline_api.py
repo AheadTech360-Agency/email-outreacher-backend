@@ -65,14 +65,16 @@ class FakeCompanies:
                 added += 1
         return added, dupes
 
-    async def add_google_maps(self, ws, icp_id, places):
+    async def add_google_maps(self, ws, icp_id, places, added_ids=None):
         added = dupes = 0
         for place, domain in places:
             if any(r.google_place_id == place.place_id or (domain and r.domain == domain) for r in self.rows.values()):
                 dupes += 1
             else:
-                self._row(source="google_maps", google_place_id=place.place_id, name=place.name, domain=domain,
-                          website_url=place.website_url, phone=place.phone, status="found")  # fmt: skip
+                row = self._row(source="google_maps", google_place_id=place.place_id, name=place.name, domain=domain,
+                                website_url=place.website_url, phone=place.phone, status="found")  # fmt: skip
+                if added_ids is not None:
+                    added_ids.append(row.id)
                 added += 1
         return added, dupes
 
@@ -132,7 +134,7 @@ def test_find_from_both_sources_dedupes_by_domain(client, env) -> None:
     result = find(client).json()
     assert result["leadIntel"] == {
         "found": 1, "added": 1, "duplicates": 0, "upgraded": 0, "totalAvailable": 1, "error": None,
-        "searches": None, "costUsd": None, "notes": [], "excluded": 0,
+        "searches": None, "costUsd": None, "notes": [], "excluded": 0, "companyIds": [],
     }  # fmt: skip
     # Apollo's Glow Med Spa has the same domain as the Lead Intel company: a duplicate, not a second row.
     assert (result["apollo"]["found"], result["apollo"]["added"], result["apollo"]["duplicates"]) == (2, 1, 1)

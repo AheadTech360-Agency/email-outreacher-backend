@@ -79,7 +79,7 @@ class FakeUsers:
 
     def add(self, email, role="sales", status="active", auth_user_id=None, workspaces=()):
         row = SimpleNamespace(id=uuid4(), auth_user_id=auth_user_id, email=email, name=email.split("@")[0], role=role,
-                              status=status, last_active_at=None, created_at=datetime.now(UTC))  # fmt: skip
+                              status=status, last_active_at=None, created_at=datetime.now(UTC), permissions={})  # fmt: skip
         self.rows[row.id] = row
         self.ws[row.id] = list(workspaces)
         return row
@@ -110,11 +110,11 @@ class FakeUsers:
     async def by_email(self, email):
         return next((r for r in self.rows.values() if r.email == email), None)
 
-    async def create(self, name, email, role, workspace_ids, auth_user_id=None):
+    async def create(self, name, email, role, workspace_ids, auth_user_id=None, permissions=None):
         if self.fail_create:
             raise RuntimeError("database down")
         row = self.add(email, role, "invited", auth_user_id=auth_user_id, workspaces=workspace_ids)
-        row.name = name
+        row.name, row.permissions = name, permissions or {}
         return row
 
     async def update(self, user, values, workspace_ids):

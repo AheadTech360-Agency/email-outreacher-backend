@@ -41,6 +41,8 @@ class CurrentUser:
     name: str
     role: str  # sales | management | admin | prospector
     workspace_ids: list[UUID] = field(default_factory=list)
+    # A Prospector's: what an admin lets them do (schemas.ProspectorPermissions, as stored).
+    permissions: dict = field(default_factory=dict)
 
     @property
     def is_admin(self) -> bool:

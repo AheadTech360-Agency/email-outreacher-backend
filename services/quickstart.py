@@ -66,7 +66,9 @@ def steps_for(settings: dict[str, Any]) -> list[str]:
     if source == "linkedin":
         return LINKEDIN_STEPS
     plain = [s for s in STEPS if s not in ("google", "analysis")]
-    return plain if source == "existing" else [s for s in plain if s not in EXISTING_ONLY]
+    steps = plain if source == "existing" else [s for s in plain if s not in EXISTING_ONLY]
+    # A Prospector's Google run ends like a LinkedIn one: the analysis, never emails.
+    return [("analysis" if s == "write" else s) for s in steps] if settings.get("prospector") else steps
 RESEARCH_BATCH, PEOPLE_BATCH, POSTS_BATCH, WRITE_BATCH = 10, 10, 25, 25
 CRASHED = "Something went wrong running it. The worker's log has the details."
 
@@ -135,8 +137,13 @@ async def _find(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
     maps = (out or {}).get("googleMaps") or {}
     if not ok or maps.get("error"):
         return _fail(run, "find", detail or maps.get("error"))
-    run.company_ids = await repo.new_companies(run.workspace_id, run.icp_id, s["companies"])
-    note = f"{maps.get('found', 0)} found on Google Maps, {maps.get('added', 0)} new. {len(run.company_ids)} to verify."
+    if _plain(run):
+        # A Prospector's run verifies only what its own search added, never companies others found.
+        run.company_ids = [UUID(i) for i in maps.get("companyIds") or []][: s["companies"]]
+        note = f"{maps.get('found', 0)} found, {maps.get('added', 0)} new. {len(run.company_ids)} to verify."
+    else:
+        run.company_ids = await repo.new_companies(run.workspace_id, run.icp_id, s["companies"])
+        note = f"{maps.get('found', 0)} found on Google Maps, {maps.get('added', 0)} new. {len(run.company_ids)} to verify."
     _set(run, "find", state="done", done=len(run.company_ids), total=s["companies"], note=note)
     if not run.company_ids:
         return _finish(run, "No new companies to verify. Try other search terms or places.")
@@ -417,6 +424,10 @@ def _after_profiles(run: QuickstartRun) -> bool:
     if run.settings["posts_per_lead"] == 0:
         _set(run, "posts", state="skipped", note="Posts per lead is 0")
         return _next(run, _after_posts(run))
+    if run.settings.get("post_sources") == []:
+        # A Prospector whose admin allows them no posts.
+        _set(run, "posts", state="skipped", note="Posts aren't part of your runs")
+        return _next(run, _after_posts(run))
     return _next(run, "posts")
 
 
@@ -479,8 +490,8 @@ async def _posts(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
 
 
 def _after_posts(run: QuickstartRun) -> str:
-    """The LinkedIn option ends with company briefs; the others with email drafts."""
-    return "analysis" if run.settings.get("source") == "linkedin" else "write"
+    """The LinkedIn option, and any Prospector's run, ends with the analysis; the others with email drafts."""
+    return "analysis" if run.settings.get("source") == "linkedin" or run.settings.get("prospector") else "write"
 
 
 async def _analysis(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool:
@@ -491,7 +502,13 @@ async def _analysis(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> b
     todo = [i for i in qualified if str(i) not in tried][:BRIEF_BATCH]
     written = int(run.progress.get("_briefs", 0))
     if todo:
-        ok, out, detail = await _job(session, run, "/pipeline/briefs", {"companyIds": [str(i) for i in todo]}, "Quick Start: analysing companies")
+        body = {"companyIds": [str(i) for i in todo]}
+        # A Prospector's run: the analysis reads and writes only what an admin allows.
+        if run.settings.get("analysis_reads") is not None:
+            body["reads"] = run.settings["analysis_reads"]
+        if run.settings.get("analysis_writes") is not None:
+            body["writes"] = run.settings["analysis_writes"]
+        ok, out, detail = await _job(session, run, "/pipeline/briefs", body, "Quick Start: analysing companies")
         if not ok:
             return _fail(run, "analysis", detail)
         written += int((out or {}).get("written", 0))
@@ -561,6 +578,9 @@ async def _icp_titles(session: Any, run: QuickstartRun) -> list[str]:
 async def _post_sources(session: Any, run: QuickstartRun) -> list[str]:
     profile = (await IcpProfileRepo(session).get_many(run.workspace_id, [run.icp_id])).get(run.icp_id)
     on = set(profile.enabled_sources) if profile and profile.enabled_sources else {"linkedin", "instagram"}
+    # A Prospector's run: only the posts an admin allows them.
+    if run.settings.get("post_sources") is not None:
+        on &= set(run.settings["post_sources"])
     return [s for s in ("linkedin", "instagram") if s in on]
 
 

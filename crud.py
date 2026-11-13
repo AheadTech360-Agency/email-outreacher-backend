@@ -843,8 +843,9 @@ class UserRepo:
             await self.session.refresh(user)
         return user
 
-    async def create(self, name: str, email: str, role: str, workspace_ids: list[UUID], auth_user_id: UUID | None = None) -> User:
-        user = User(name=name, email=email.strip().lower(), role=role, status="invited", auth_user_id=auth_user_id)
+    async def create(self, name: str, email: str, role: str, workspace_ids: list[UUID], auth_user_id: UUID | None = None,
+                     permissions: dict[str, Any] | None = None) -> User:  # fmt: skip
+        user = User(name=name, email=email.strip().lower(), role=role, status="invited", auth_user_id=auth_user_id, permissions=permissions or {})
         self.session.add(user)
         await self.session.flush()
         await self._set_workspaces(user.id, workspace_ids)
@@ -1968,7 +1969,8 @@ class CompanyRepo:
         await self.session.commit()
         return new_ids, dupes
 
-    async def add_google_maps(self, workspace_id: UUID, icp_id: UUID, places: list[tuple[Place, str | None]]) -> tuple[int, int]:
+    async def add_google_maps(self, workspace_id: UUID, icp_id: UUID, places: list[tuple[Place, str | None]],
+                              added_ids: list[UUID] | None = None) -> tuple[int, int]:  # fmt: skip
         """Add Google Maps businesses to be researched, each with its website domain (or None).
         Returns (added, duplicates). A duplicate shares any identity key with a company already here,
         from any source: place id, domain, phone, or name and city (Lead Intel's keys)."""
@@ -1997,6 +1999,9 @@ class CompanyRepo:
                 },
             )  # fmt: skip
             self.session.add(row)
+            if added_ids is not None:
+                await self.session.flush()
+                added_ids.append(row.id)
             known |= set(keys)
             added += 1
         await self.session.commit()
@@ -2627,7 +2632,7 @@ class QuickstartRepo:
         """The latest runs; with started_by, only that person's LinkedIn runs (what a Prospector sees)."""
         query = select(QuickstartRun).where(QuickstartRun.workspace_id == workspace_id)
         if started_by is not None:
-            query = query.where(QuickstartRun.created_by == started_by, QuickstartRun.settings["source"].astext == "linkedin")
+            query = query.where(QuickstartRun.created_by == started_by)
         query = query.order_by(QuickstartRun.created_at.desc())
         return list(await self.session.scalars(query.limit(limit)))
 

@@ -1,3 +1,8 @@
+import os
+
+# The tests run against the default schema whatever this machine's .env says (DB_SCHEMA=public for its own database).
+os.environ["DB_SCHEMA"] = "outreach"
+
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4

@@ -1,5 +1,6 @@
-"""The Prospector role: only Quick Start's LinkedIn option, only the runs they start, and no more than the workspace's
-cap per run. Inside their own run (the worker) only the LinkedIn steps get through: never email writing."""
+"""The Prospector role: only the Quick Start searches an admin allows them (LinkedIn by default), only the runs they
+start, and no more than the workspace's cap per run. Inside their own run (the worker) only the search, verify, people,
+posts and analysis steps get through: never email writing."""
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -81,7 +82,7 @@ def test_inside_their_run_only_the_linkedin_steps_get_through() -> None:
     user = CurrentUser(uuid4(), "p@example.com", "P", "prospector", [WORKSPACE_ID])
     for path in PROSPECTOR_STEPS:
         assert _gate("POST", path, user, in_job=True) is None
-    for path in ("/emails/generate", "/emails/test-prompt", "/sending/queue", "/pipeline/find", "/leads/delete", "/companies/import"):
+    for path in ("/emails/generate", "/emails/test-prompt", "/sending/queue", "/leads/delete", "/companies/import"):
         with pytest.raises(HTTPException) as refused:
             _gate("POST", path, user, in_job=True)
         assert refused.value.status_code == 403
@@ -114,7 +115,7 @@ class FakeRuns:
     async def recent(self, workspace_id, limit=20, started_by=None):
         rows = list(self.rows.values())
         if started_by is not None:
-            rows = [r for r in rows if r.created_by == started_by and r.settings.get("source") == "linkedin"]
+            rows = [r for r in rows if r.created_by == started_by]
         return rows
 
     async def create(self, workspace_id, user_id, icp_id, settings, limit):
@@ -164,12 +165,12 @@ async def _none_profiles(workspace_id, ids):
     return {}
 
 
-def test_a_prospector_sees_only_their_own_linkedin_runs(world) -> None:
+def test_a_prospector_sees_only_their_own_runs(world) -> None:
     c = world.client
     listed = [r["id"] for r in c.get("/api/v1/quickstart/runs", headers=H).json()]
-    assert listed == [str(world.mine.id)]
+    assert listed == [str(world.mine.id), str(world.my_maps.id)]
     assert c.get(f"/api/v1/quickstart/runs/{world.theirs.id}/briefs", headers=H).status_code == 404
-    assert c.get(f"/api/v1/quickstart/runs/{world.my_maps.id}/briefs", headers=H).status_code == 404
+    assert c.get(f"/api/v1/quickstart/runs/{world.my_maps.id}/briefs", headers=H).status_code == 200
     assert c.get(f"/api/v1/quickstart/runs/{world.mine.id}/briefs", headers=H).status_code == 200
     assert c.post(f"/api/v1/quickstart/runs/{world.theirs.id}/stop", headers=H).status_code == 404
 
@@ -190,6 +191,34 @@ def test_a_prospector_starts_linkedin_runs_within_the_cap_and_free_search_only(w
     ok = _start(c)
     assert ok.status_code == 201, ok.text
     assert world.runs.created[0].settings["source"] == "linkedin" and world.runs.created[0].settings["web_search"] == "brave"
+
+
+def test_an_admin_decides_which_searches_posts_and_analysis_a_prospector_gets(world) -> None:
+    c = world.client
+    # Google search allowed, LinkedIn not: only Google gets through.
+    world.me.permissions = {"search": ["google_maps"], "posts": [], "analysis_reads": ["website"], "analysis_writes": ["company"]}
+    assert _start(c).status_code == 403
+    ok = _start(c, source="google_maps", places=["Austin"], googleRequests=2, companies=3, peoplePerCompany=1, leads=3)
+    assert ok.status_code == 201, ok.text
+    s = world.runs.created[-1].settings
+    assert s["source"] == "google_maps" and s["prospector"] is True
+    assert s["post_sources"] == [] and s["analysis_reads"] == ["website"] and s["analysis_writes"] == ["company"]
+    # A Google run is held to the cap too: the most it could spend, Google's requests included.
+    assert _start(c, source="google_maps", places=["Austin"], googleRequests=80, companies=25).status_code == 422
+    # Both searches.
+    world.me.permissions = {"search": ["google_maps", "linkedin"]}
+    assert _start(c).status_code == 201
+    assert world.runs.created[-1].settings["post_sources"] == ["linkedin", "instagram"]
+
+
+def test_a_prospectors_stored_permissions_default_to_what_they_could_always_do() -> None:
+    from schemas import permissions_of
+
+    p = permissions_of({})
+    assert p.search == ["linkedin"] and p.posts == ["linkedin", "instagram"]
+    assert p.analysis_reads == ["website", "posts", "company_profile", "people_profiles"] and p.analysis_writes == ["company", "people"]
+    assert permissions_of({"search": ["telepathy"]}) == p  # unreadable: the defaults
+    assert permissions_of(None) == p and permissions_of({"posts": []}).posts == []
 
 
 def test_a_prospector_starts_runs_only_for_an_icp_they_can_see(world) -> None:
@@ -256,3 +285,55 @@ def test_a_prospector_decides_only_companies_they_can_see(client, monkeypatch) -
     body = {"companyIds": [str(mine), str(other)], "status": "qualified"}
     assert client.post("/api/v1/pipeline/companies/decide", headers=H, json=body).status_code == 200
     assert decided == [mine]
+
+
+def test_the_analysis_reads_only_what_a_prospector_is_allowed() -> None:
+    from routers.pipeline import _readable
+
+    evidence = {
+        "company": {"name": "Ink Co"}, "verdict": {}, "icp_and_product": {},
+        "website": {"summary": "s"}, "website_pages": [{"url": "u"}], "contacts": {"emails": []},
+        "company_listing": {"followers": 10}, "instagram": {"bio": "b"},
+        "posts": [{"text": "t"}],
+        "people": [{"name": "Ann", "title": "Owner", "headline": "h", "about": "a"}],
+    }  # fmt: skip
+    assert _readable(evidence, None) == evidence
+    only_site = _readable(evidence, ["website"])
+    assert {"website", "website_pages", "contacts"} <= set(only_site)
+    assert not {"posts", "company_listing", "instagram"} & set(only_site)
+    assert only_site["people"] == [{"name": "Ann", "title": "Owner"}]  # who they are, not their profiles
+    nothing = _readable(evidence, [])
+    assert set(nothing) == {"company", "verdict", "icp_and_product", "people"}
+    assert _readable(evidence, ["people_profiles"])["people"] == evidence["people"]
+
+
+def test_the_analysis_writes_only_the_parts_allowed(monkeypatch) -> None:
+    import asyncio
+
+    from services import briefs
+
+    asked = []
+
+    class Messages:
+        async def parse(self, **kw):
+            asked.append(kw["messages"][0]["content"])
+            raise RuntimeError("stop here")
+
+    writer = briefs.BriefWriter.__new__(briefs.BriefWriter)
+    writer._client, writer._gate, writer._model = SimpleNamespace(messages=Messages()), asyncio.Semaphore(1), "m"
+    for parts in (("company", "people"), ("company",), ("people",)):
+        asyncio.run(writer.write({"company": {"name": "Ink Co"}}, parts))
+    assert "Write only" not in asked[0]
+    assert "leave people empty" in asked[1]
+    assert "Write only the people part" in asked[2]
+
+
+def test_permissions_are_kept_once_each_and_need_a_search_and_something_to_write() -> None:
+    from pydantic import ValidationError
+
+    from schemas import ProspectorPermissions
+
+    assert ProspectorPermissions(search=["linkedin", "linkedin"]).search == ["linkedin"]
+    for bad in ({"search": []}, {"analysis_writes": []}, {"posts": ["tiktok"]}):
+        with pytest.raises(ValidationError):
+            ProspectorPermissions(**bad)

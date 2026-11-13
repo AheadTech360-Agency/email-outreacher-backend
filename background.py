@@ -104,7 +104,7 @@ async def _user(users: UserRepo, user_id: UUID | None) -> CurrentUser | None:
     row = await users.get(user_id) if user_id else None
     if row is None or row.status == "deactivated":
         return None
-    return CurrentUser(row.id, row.email, row.name, row.role, await users.workspace_ids(row.id))
+    return CurrentUser(row.id, row.email, row.name, row.role, await users.workspace_ids(row.id), dict(row.permissions or {}))
 
 
 async def run_job(job_id: UUID) -> None:

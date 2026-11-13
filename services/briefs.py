@@ -92,7 +92,14 @@ class BriefWriter:
     async def aclose(self) -> None:
         await self._client.close()
 
-    async def write(self, evidence: dict[str, Any]) -> BriefResult:
+    async def write(self, evidence: dict[str, Any], parts: tuple[str, ...] = ("company", "people")) -> BriefResult:
+        """`parts`: what to write, the company part, the people part or both (a Prospector's run: what's allowed)."""
+        ask = "Write the brief for this company."
+        if "people" not in parts:
+            ask += " Write only the company part: leave people empty."
+        if "company" not in parts:
+            ask += (" Write only the people part: one sentence of summary and fit, and leave signals, posting themes, hooks,"
+                    " best contacts and cautions empty.")  # fmt: skip
         async with self._gate:
             try:
                 response = await self._client.messages.parse(
@@ -103,7 +110,7 @@ class BriefWriter:
                     system=SYSTEM,
                     output_config={"effort": "medium"},
                     output_format=CompanyBrief,
-                    messages=[{"role": "user", "content": "Write the brief for this company.\n\n" + evidence_text(evidence)}],
+                    messages=[{"role": "user", "content": ask + "\n\n" + evidence_text(evidence)}],
                 )
             except anthropic.APIError as exc:
                 return BriefResult(None, self._model, error_message(exc))

@@ -20,7 +20,7 @@ from dependencies import (
     get_user_repo, require_admin,
 )  # fmt: skip
 from lead_intel import LeadIntelRepo
-from schemas import AccessIn, AccessOut, UserAdded, UserIn, UserOut, UserUpdate
+from schemas import AccessIn, AccessOut, UserAdded, UserIn, UserOut, UserUpdate, permissions_of
 from services.access import AccessRepo
 from services.supabase_admin import SupabaseAdmin, SupabaseAdminError
 from services.auth import CurrentUser
@@ -32,6 +32,7 @@ def _out(user, workspace_ids: list[UUID]) -> UserOut:
     return UserOut.model_validate({
         "id": user.id, "name": user.name, "email": user.email, "role": user.role, "status": user.status,
         "workspace_ids": workspace_ids, "last_active_at": user.last_active_at, "created_at": user.created_at,
+        "permissions": permissions_of(user.permissions),
     })  # fmt: skip
 
 
@@ -70,7 +71,8 @@ async def add_user(
     except SupabaseAdminError as exc:
         raise HTTPException(status_code=502 if (exc.status or 500) >= 500 else 422, detail=exc.message) from exc
     try:
-        user = await users.create(body.name.strip() or email.split("@")[0], email, body.role, body.workspace_ids, auth_user_id=auth_id)
+        user = await users.create(body.name.strip() or email.split("@")[0], email, body.role, body.workspace_ids, auth_user_id=auth_id,
+                                  permissions=body.permissions.model_dump(mode="json") if body.permissions else None)
     except Exception:
         if auth_id:
             await supabase.delete_user(auth_id)  # no half-made person: the sign-in goes too
@@ -86,7 +88,9 @@ async def update_user(
     user = await users.get(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    values = body.model_dump(exclude_unset=True, exclude={"workspace_ids"})
+    values = body.model_dump(exclude_unset=True, exclude={"workspace_ids", "permissions"})
+    if body.permissions is not None:
+        values["permissions"] = body.permissions.model_dump(mode="json")
     if "name" in values:
         values["name"] = (values["name"] or "").strip() or user.name
     losing_admin = user.role == "admin" and (

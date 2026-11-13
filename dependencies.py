@@ -135,7 +135,7 @@ async def get_current_user(
         raise HTTPException(status_code=403, detail=NOT_ADDED)
     if user.status == "deactivated":
         raise HTTPException(status_code=403, detail="Your account is deactivated. Ask an admin to turn it back on.")
-    current = CurrentUser(user.id, user.email, user.name, user.role, await users.workspace_ids(user.id))
+    current = CurrentUser(user.id, user.email, user.name, user.role, await users.workspace_ids(user.id), dict(user.permissions or {}))
     if len(_sign_ins) > 1000:
         _sign_ins.clear()
     _sign_ins[claims.auth_user_id] = (time.monotonic(), current)
@@ -232,7 +232,7 @@ PROSPECTOR_PAGES = {
     ("GET", "/sources"),
 }  # fmt: skip
 PROSPECTOR_STEPS = {
-    "/pipeline/find-linkedin", "/pipeline/web-search", "/pipeline/research", "/pipeline/stakeholders",
+    "/pipeline/find", "/pipeline/find-linkedin", "/pipeline/web-search", "/pipeline/research", "/pipeline/stakeholders",
     "/stakeholders/add-as-leads", "/posts/fetch", "/pipeline/people-web", "/pipeline/briefs",
 }  # fmt: skip
 PROSPECTORS_ONLY = "Your account can only use Quick Start's LinkedIn search and the companies and people you find with it."

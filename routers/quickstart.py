@@ -23,6 +23,7 @@ from schemas import (
     QuickstartPersonOut, QuickstartRunOut,
     QuickstartStep,
 )  # fmt: skip
+from schemas import permissions_of
 from services.auth import CurrentUser
 from services.quickstart import steps_for
 
@@ -67,7 +68,19 @@ LINKEDIN_PRICES = {"search": 0.004, "verify": 0.004, "people_lookup": 0.02, "per
                    "profile": 0.004, "post": 0.002, "brief": 0.002}  # fmt: skip
 
 
-def linkedin_worst_case(body: QuickstartIn) -> float:
+def worst_case(body: QuickstartIn, posts_allowed: bool = True) -> float:
+    """The most a run with these settings can spend, LinkedIn or Google (see linkedin_worst_case)."""
+    if body.source == "linkedin":
+        return linkedin_worst_case(body, posts_allowed)
+    p, n = LINKEDIN_PRICES, body.companies
+    people = n * body.people_per_company
+    leads = min(body.leads, people)
+    return round(body.google_requests * 0.035 + n * (p["verify"] + p["people_lookup"] + p["brief"])
+                 + people * (p["person_email"] if body.find_emails else p["person"])
+                 + (leads * body.posts_per_lead * p["post"] if posts_allowed else 0), 4)  # fmt: skip
+
+
+def linkedin_worst_case(body: QuickstartIn, posts_allowed: bool = True) -> float:
     """The most a LinkedIn run with these settings can spend: every company found qualifies, every person is found and
     has posts. The spend limit is checked between steps, so a Prospector's run must fit under their cap from the
     start (one step could otherwise go past it)."""
@@ -77,11 +90,11 @@ def linkedin_worst_case(body: QuickstartIn) -> float:
     leads = min(body.leads, people)
     return round(searched * p["search"] + n * (p["verify"] + p["people_lookup"] + p["brief"])
                  + people * ((p["person_email"] if body.find_emails else p["person"]) + p["profile"])
-                 + leads * body.posts_per_lead * p["post"], 4)  # fmt: skip
+                 + (leads * body.posts_per_lead * p["post"] if posts_allowed else 0), 4)  # fmt: skip
 
 
 async def _run(runs: QuickstartRepo, workspace_id: UUID, run_id: UUID, user: CurrentUser) -> QuickstartRun:
-    """The run. A Prospector sees only the LinkedIn runs they started: anyone else's reads as not found."""
+    """The run. A Prospector sees only the runs they started: anyone else's reads as not found."""
     run = await runs.get(workspace_id, run_id)
     if run is None or (user.is_prospector and not _theirs(run, user)):
         raise HTTPException(status_code=404, detail="Quick Start run not found")
@@ -95,7 +108,7 @@ async def _approved_since(runs: QuickstartRepo, run: QuickstartRun) -> bool:
 
 
 def _theirs(run: QuickstartRun, user: CurrentUser) -> bool:
-    return run.created_by == user.id and run.settings.get("source") == "linkedin"
+    return run.created_by == user.id
 
 
 @router.post("/runs", response_model=QuickstartRunOut, status_code=201)
@@ -113,16 +126,17 @@ async def start_run(
 ) -> QuickstartRunOut:
     """Start a run. The ICP must say what we sell, or no email could be written at the end. A Prospector starts
     only LinkedIn runs, with free web search, spending at most the workspace's cap."""
-    if user.is_prospector:
+    perms = permissions_of(user.permissions) if user.is_prospector else None
+    if perms is not None:
         await scope.check("icp", body.icp_id)
         cap = (await settings_repo.general(workspace_id))["prospector_run_limit_usd"]
-        if body.source != "linkedin":
-            raise HTTPException(status_code=403, detail="Your account can only start a LinkedIn search.")
+        if body.source not in perms.search:
+            raise HTTPException(status_code=403, detail="Your account can't use this search. Ask an admin to allow it.")
         if body.web_search != "brave":
-            raise HTTPException(status_code=403, detail="Your account can't use paid Google search. Leave it on Brave.")
+            raise HTTPException(status_code=403, detail="Your account can't use the paid web search. Leave it on the free one.")
         if body.spend_limit_usd > cap:
             raise HTTPException(status_code=422, detail=f"Your runs can spend at most ${cap:,.2f}. Lower the spend limit.")
-        if (worst := linkedin_worst_case(body)) > cap:
+        if (worst := worst_case(body, bool(perms.posts))) > cap:
             raise HTTPException(status_code=422, detail=f"These settings could cost up to ${worst:,.2f}, over your ${cap:,.2f} a run. "
                                                         "Find fewer companies or people, or read fewer posts.")
     icp = await lead_intel.get_icp(body.icp_id)
@@ -135,8 +149,12 @@ async def start_run(
     settings = body.model_dump(mode="json", exclude={"icp_id", "spend_limit_usd"})
     settings["search_terms"] = [t.strip() for t in body.search_terms if t.strip()]
     settings["places"] = [p.strip() for p in body.places if p.strip()]
-    # A Prospector's run goes on with the companies verified on their own: they can't approve the borderline ones.
     settings["prospector"] = user.is_prospector
+    if perms is not None:
+        # What an admin allows them: whose posts are read, and what the analysis reads and writes.
+        settings["post_sources"] = list(perms.posts)
+        settings["analysis_reads"] = list(perms.analysis_reads)
+        settings["analysis_writes"] = list(perms.analysis_writes)
     if body.source == "google_maps":
         if not settings["search_terms"] or not settings["places"]:
             raise HTTPException(status_code=422, detail="Add at least one search term and one place.")

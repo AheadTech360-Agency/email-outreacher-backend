@@ -612,6 +612,39 @@ class FollowUpRunOut(ApiModel):
 UserRole = Literal["sales", "management", "admin", "prospector"]
 
 
+SearchKind = Literal["google_maps", "linkedin"]
+PostKind = Literal["linkedin", "instagram"]
+AnalysisRead = Literal["website", "posts", "company_profile", "people_profiles"]
+AnalysisWrite = Literal["company", "people"]
+
+
+class ProspectorPermissions(ApiModel):
+    """What an admin lets a Prospector do. Stored on eo_users.permissions; a key left out has its default, which is
+    what Prospectors could do before these were set (so `{}` changes nothing)."""
+
+    # Which searches they may start: Google search (local businesses), LinkedIn search (company profiles), or both.
+    search: list[SearchKind] = Field(default=["linkedin"], min_length=1, max_length=2)
+    # Whose posts their runs read: none, LinkedIn, Instagram or both.
+    posts: list[PostKind] = Field(default=["linkedin", "instagram"], max_length=2)
+    # What the analysis reads about each company and its people.
+    analysis_reads: list[AnalysisRead] = Field(default=["website", "posts", "company_profile", "people_profiles"], max_length=4)
+    # What it writes: the company part, the people part, or both.
+    analysis_writes: list[AnalysisWrite] = Field(default=["company", "people"], min_length=1, max_length=2)
+
+    @field_validator("search", "posts", "analysis_reads", "analysis_writes")
+    @classmethod
+    def _once_each(cls, v: list[str]) -> list[str]:
+        return list(dict.fromkeys(v))
+
+
+def permissions_of(raw: Any) -> ProspectorPermissions:
+    """A user's stored permissions, with the defaults for anything not set (an unreadable value: all defaults)."""
+    try:
+        return ProspectorPermissions.model_validate(raw or {})
+    except ValueError:
+        return ProspectorPermissions()
+
+
 class UserIn(ApiModel):
     name: str = Field(default="", max_length=100)
     email: str = Field(pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$", max_length=254)
@@ -620,6 +653,8 @@ class UserIn(ApiModel):
     # Their first password, which the admin passes on. Unused when the email already has a sign-in
     # (shared with Lead Intel): that one keeps its own password.
     password: str = Field(min_length=12, max_length=72)
+    # A Prospector's: what they may do (left out, the defaults).
+    permissions: ProspectorPermissions | None = None
 
 
 class UserUpdate(ApiModel):
@@ -627,6 +662,7 @@ class UserUpdate(ApiModel):
     role: UserRole | None = None
     status: Literal["active", "deactivated"] | None = None
     workspace_ids: list[UUID] = Field(default=[], max_length=100)
+    permissions: ProspectorPermissions | None = None
 
 
 class UserOut(ApiModel):
@@ -639,6 +675,8 @@ class UserOut(ApiModel):
     workspace_ids: list[UUID]
     last_active_at: datetime | None
     created_at: datetime
+    # What a Prospector may do (everyone else: the defaults, unused).
+    permissions: ProspectorPermissions = Field(default_factory=ProspectorPermissions)
 
 
 class UserAdded(UserOut):
@@ -925,6 +963,8 @@ class SourceFindResult(ApiModel):
     searches: int | None = None
     cost_usd: float | None = None
     notes: list[str] = []
+    # Google Maps: the companies this search added (a Prospector's run verifies only those, never anyone else's).
+    company_ids: list[UUID] = []
 
 
 class FindCompaniesResult(ApiModel):
@@ -1067,6 +1107,13 @@ class AccessIn(ApiModel):
 class QuickstartLimitsOut(ApiModel):
     # A Prospector's most per run; None: no cap beyond the form's own.
     spend_limit_usd: float | None = None
+
+
+class BriefsIn(ApiModel):
+    company_ids: list[UUID] = Field(min_length=1, max_length=25)
+    # A Prospector's run: what the analysis may read and what it writes (None: everything).
+    reads: list[AnalysisRead] | None = None
+    writes: list[AnalysisWrite] | None = None
 
 
 class LinkedInFindIn(ApiModel):

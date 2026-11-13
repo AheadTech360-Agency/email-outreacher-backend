@@ -124,6 +124,8 @@ class User(Base):
     email: Mapped[str] = mapped_column(Text, unique=True)  # stored lower-cased
     role: Mapped[str] = mapped_column(Text, server_default="sales")
     status: Mapped[str] = mapped_column(Text, server_default="invited")
+    # A Prospector's: which searches, posts and analysis they may use (schemas.ProspectorPermissions; {}: the defaults).
+    permissions: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}")
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = _created()
     updated_at: Mapped[datetime] = _updated()
