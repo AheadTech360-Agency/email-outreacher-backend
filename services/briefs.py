@@ -4,6 +4,7 @@ Quick Start's LinkedIn option ends with one per company. Stored in the company's
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,22 +13,39 @@ from pydantic import BaseModel, Field
 
 from services.claude import error_message
 
-SYSTEM = """You prepare a short outreach brief on one company for a salesperson who is about to email it.
-You get everything gathered about the company: its LinkedIn listing, its website text, its social profiles, its recent
-posts, the people found there, and how well it fits the ideal customer profile (ICP) and the product being sold.
+log = logging.getLogger(__name__)
+
+SYSTEM = """You prepare a short outreach brief on one company, and the people found there, for a salesperson who is about
+to email them. You get everything gathered: the company's listing, its website text, its social profiles, its recent
+posts, each person found there (their role, headline, about text, how long they've been there, their own posts), and how
+well the company fits the ideal customer profile (ICP) and the product being sold.
 
 Rules:
 - Use only the evidence given. Never invent facts, numbers, names or events. When something isn't known, say so.
 - Be specific and plain. No hype, no filler, no em dashes.
+- Never name the tools, databases or services the evidence came from. Say "their LinkedIn", "their website" or "a post"
+  about the company or person, never how it was found.
 - Hooks are openings for a cold email: each ties something real and recent about the company (a post, a launch, a page
   on their site, their positioning) to the problem the product solves. Name the evidence each hook rests on.
-- Rank hooks best first. Only include hooks the evidence supports; fewer good hooks beat more weak ones."""
+- For each person, say who they are in the business and what they likely care about, given their role, and give an
+  angle and an opening line written for them, not for the company in general. Use their own posts and profile when
+  there are any; when there's little on them, say so and lean on their role.
+- Rank hooks and people best first. Only include what the evidence supports; fewer good ones beat more weak ones."""
 
 
 class Hook(BaseModel):
     hook: str = Field(description="The opening idea in one sentence, as it could start an email.")
     why: str = Field(description="Why it should land with this company, tied to the product's value.")
     evidence: str = Field(description="The exact thing it rests on: which post, page or fact.")
+
+
+class PersonBrief(BaseModel):
+    name: str = Field(description="The person's name, as given.")
+    title: str = Field(description="Their title, as given.")
+    who: str = Field(description="One sentence: their part in the business and what they likely care about.")
+    angle: str = Field(description="How to approach this person in particular, tied to the product's value.")
+    opener: str = Field(description="An opening line for an email to them, specific to them.")
+    evidence: str = Field(description="What it rests on: their post, profile, role or tenure. Say so when there's little.")
 
 
 class CompanyBrief(BaseModel):
@@ -38,6 +56,7 @@ class CompanyBrief(BaseModel):
     posting_themes: list[str] = Field(description="Up to 4 themes their recent posts are about; empty if no posts were found.")
     hooks: list[Hook] = Field(description="Up to 4 hooks, best first.")
     best_contacts: list[str] = Field(description="Up to 3 of the people found to email first, as 'Name (title): why'.")
+    people: list[PersonBrief] = Field(description="Each person found there (up to 6), best to email first.")
     cautions: list[str] = Field(description="Up to 3 things to be careful about (weak evidence, poor fit signs, sensitive topics).")
 
 
@@ -78,7 +97,9 @@ class BriefWriter:
             try:
                 response = await self._client.messages.parse(
                     model=self._model,
-                    max_tokens=2000,
+                    # Room for the brief and a section per person; 2,000 cut long ones short, and a cut-off answer
+                    # can't be read (it crashed the whole step).
+                    max_tokens=8000,
                     system=SYSTEM,
                     output_config={"effort": "medium"},
                     output_format=CompanyBrief,
@@ -86,7 +107,12 @@ class BriefWriter:
                 )
             except anthropic.APIError as exc:
                 return BriefResult(None, self._model, error_message(exc))
+            except Exception as exc:  # noqa: BLE001 - an answer that can't be read fails this company, never the step
+                log.exception("company brief couldn't be read")
+                return BriefResult(None, self._model, f"Claude's answer couldn't be read ({exc.__class__.__name__}).")
         tokens = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        if response.stop_reason == "max_tokens":
+            return BriefResult(None, self._model, "Claude's answer was too long and was cut off.", **tokens)
         if response.stop_reason == "refusal":
             return BriefResult(None, self._model, "Claude declined to write this brief.", **tokens)
         if response.parsed_output is None:

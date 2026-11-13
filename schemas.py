@@ -1871,6 +1871,13 @@ class BriefPostOut(ApiModel):
     whose: str
 
 
+class BriefContactOut(ApiModel):
+    name: str
+    title: str
+    email: str | None
+    linkedin_url: str | None
+
+
 class QuickstartBriefOut(ApiModel):
     """An analysed company of a LinkedIn run: its data, links, latest posts and the brief (summary, fit, signals,
     online presence, posting themes, hooks, who to email first, cautions)."""
@@ -1890,6 +1897,7 @@ class QuickstartBriefOut(ApiModel):
     industry: str | None
     brief: dict[str, Any]
     posts: list[BriefPostOut]
+    people: list[BriefContactOut] = []
 
 
 class QuickstartDetailOut(QuickstartRunOut):

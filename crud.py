@@ -1625,6 +1625,22 @@ class CompanyFilters:
     scope: Any = None
 
 
+def _person_material(p: Stakeholder) -> dict[str, Any]:
+    """What a person's part of the analysis is written from: their role and what their profile says about them."""
+    raw = p.raw if isinstance(p.raw, dict) else {}
+    location = raw.get("location")
+    here = next((e for e in raw.get("experience") or [] if isinstance(e, dict) and not e.get("endDate")), {})
+    out = {
+        "name": f"{p.first_name} {p.last_name}".strip(), "title": p.title, "seniority": p.seniority, "has_email": bool(p.email),
+        "headline": raw.get("headline"), "about": (raw.get("about") or "")[:700] or None,
+        "location": (location.get("parsed") or {}).get("text") if isinstance(location, dict) else location,
+        "in_role_since": (here.get("startDate") or {}).get("text") if isinstance(here.get("startDate"), dict) else here.get("startDate"),
+        "role_description": (here.get("description") or "")[:400] or None,
+        "skills": [s.get("name") if isinstance(s, dict) else s for s in (raw.get("topSkills") or raw.get("skills") or [])][:8] or None,
+    }  # fmt: skip
+    return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
 class CompanyRepo:
     """The workspace's company pipeline. Reads and writes `outreach.eo_companies` and `eo_company_pages` only."""
 
@@ -1756,10 +1772,10 @@ class CompanyRepo:
             .order_by(CompanyPage.fetched_at, CompanyPage.url).limit(4)
         ))  # fmt: skip
         people = list(await self.session.scalars(
-            select(Stakeholder).options(*_skip(Stakeholder.raw))
-            .where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id == company.id).limit(10)
+            select(Stakeholder).where(Stakeholder.workspace_id == workspace_id, Stakeholder.company_id == company.id).limit(8)
         ))  # fmt: skip
         lead_ids = [p.lead_id for p in people if p.lead_id]
+        name_of_lead = {p.lead_id: f"{p.first_name} {p.last_name}".strip() for p in people if p.lead_id}
         owners = [Post.company_id == company.id] + ([Post.lead_id.in_(lead_ids)] if lead_ids else [])
         posts = list(await self.session.scalars(
             select(Post).options(*_skip(Post.raw)).where(Post.workspace_id == workspace_id, or_(*owners))
@@ -1767,9 +1783,9 @@ class CompanyRepo:
         ))  # fmt: skip
         return {
             "website_pages": [{"url": p.url, "text": (p.text or "")[:3000]} for p in pages],
-            "posts": [{"source": p.source, "whose": "person" if p.lead_id else "company", "posted": p.posted_at.date().isoformat() if p.posted_at else None,
-                       "text": (p.text or "")[:800], "url": p.url} for p in posts],  # fmt: skip
-            "people": [{"name": f"{p.first_name} {p.last_name}".strip(), "title": p.title, "email": bool(p.email), "linkedin": p.linkedin_url} for p in people],
+            "posts": [{"where": p.source, "whose": name_of_lead.get(p.lead_id, "a person there") if p.lead_id else "the company",
+                       "posted": p.posted_at.date().isoformat() if p.posted_at else None, "text": (p.text or "")[:800]} for p in posts],  # fmt: skip
+            "people": [_person_material(p) for p in people],
         }
 
     async def pages(self, workspace_id: UUID, company_id: UUID) -> list[CompanyPage]:
@@ -2764,14 +2780,22 @@ class QuickstartRepo:
                 select(Post.company_id, Post.lead_id, Post.source, Post.url, Post.posted_at, func.left(Post.text, 400))
                 .where(or_(*owners)).order_by(Post.posted_at.desc().nulls_last()).limit(len(ids) * 12)
             )  # fmt: skip
-            for cid, lead, source, url, posted, text_ in posts:
+            for cid, lead, source, url, posted, text_ in posts:  # noqa: B007
                 key = cid or company_of_lead.get(lead)
                 if key and len(recent.setdefault(key, [])) < 3:
                     recent[key].append({"source": source, "url": url, "posted_at": posted, "text": text_, "whose": "person" if lead else "company"})
+        # The people at each, with how to reach them (the analysis names them; the page shows their email and profile).
+        contacts: dict[UUID, list[dict[str, Any]]] = {}
+        if ids:
+            for cid, first, last, title, email, linkedin in await self.session.execute(
+                select(Stakeholder.company_id, Stakeholder.first_name, Stakeholder.last_name, Stakeholder.title, Stakeholder.email,
+                       Stakeholder.linkedin_url).where(Stakeholder.company_id.in_(ids)).order_by(Stakeholder.found_at)
+            ):  # fmt: skip
+                contacts.setdefault(cid, []).append({"name": f"{first} {last}".strip(), "title": title or "", "email": email, "linkedin_url": linkedin})
         return [
             {"id": r[0], "name": r[1], "domain": r[2], "website_url": r[3], "linkedin_url": r[4], "instagram_url": r[5], "facebook_url": r[6],
              "city": r[7], "state": r[8], "score": r[9], "status": r[10], "brief": r[11], "employees": int(r[12]) if (r[12] or "").isdigit() else None,
-             "industry": r[13], "posts": recent.get(r[0], [])}
+             "industry": r[13], "posts": recent.get(r[0], []), "people": contacts.get(r[0], [])}
             for r in rows
         ]  # fmt: skip
 

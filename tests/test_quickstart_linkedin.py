@@ -268,3 +268,69 @@ def test_a_facebook_page_listed_as_the_website_is_their_facebook_not_their_domai
     assert (ig.website_url, ig.instagram_url) == (None, "instagram.com/inkco")
     assert found_company({"name": "Ink Co", "website": "https://www.yelp.com/biz/ink-co"}).website_url is None
     assert found_company({"name": "Ink Co", "website": "https://inkco.com"}).website_url == "https://inkco.com"
+
+
+# ---------- The analysis: never crashes the step, covers the people, and a Prospector's run names no tools ----------
+
+
+def _writer(behaviour):
+    from services.briefs import BriefWriter
+
+    class Messages:
+        async def parse(self, **kw):
+            assert kw["max_tokens"] >= 8000  # room for the brief and a part per person
+            return behaviour(kw)
+
+    return BriefWriter("key", "claude-haiku-5-5", client=SimpleNamespace(messages=Messages()))
+
+
+def test_an_answer_that_cant_be_read_fails_that_company_not_the_step() -> None:
+    def broken(kw):
+        raise ValueError("truncated JSON")
+
+    out = asyncio.run(_writer(broken).write({"company": {"name": "Ink Co"}}))
+    assert out.brief is None and "couldn't be read" in out.error
+
+
+def test_a_cut_off_answer_is_said_as_such() -> None:
+    usage = SimpleNamespace(input_tokens=100, output_tokens=8000)
+    out = asyncio.run(_writer(lambda kw: SimpleNamespace(stop_reason="max_tokens", usage=usage, parsed_output=None)).write({}))
+    assert out.brief is None and "cut off" in out.error and out.output_tokens == 8000
+
+
+def test_the_analysis_asks_for_each_person_and_never_names_the_tools() -> None:
+    from services.briefs import SYSTEM, CompanyBrief
+
+    assert "people" in CompanyBrief.model_fields and "Never name the tools" in SYSTEM
+
+
+def test_a_persons_part_is_written_from_their_profile() -> None:
+    from crud import _person_material
+
+    p = SimpleNamespace(first_name="Ana", last_name="Ruiz", title="Founder", seniority=None, email="a@x.com", raw={
+        "headline": "Founder at Ink Co", "about": "I build brands.", "location": {"parsed": {"text": "Austin, TX"}},
+        "experience": [{"companyName": "Ink Co", "startDate": {"text": "Mar 2019"}, "description": "Runs it", "endDate": None}],
+        "topSkills": [{"name": "Branding"}, "Print"]})  # fmt: skip
+    m = _person_material(p)
+    assert m == {"name": "Ana Ruiz", "title": "Founder", "has_email": True, "headline": "Founder at Ink Co", "about": "I build brands.",
+                 "location": "Austin, TX", "in_role_since": "Mar 2019", "role_description": "Runs it", "skills": ["Branding", "Print"]}  # fmt: skip
+    assert _person_material(SimpleNamespace(first_name="Bo", last_name="", title="", seniority=None, email=None, raw=None)) == {"name": "Bo", "has_email": False}
+
+
+def test_a_prospectors_run_messages_name_no_tools() -> None:
+    from services.quickstart import _say
+
+    mine = SimpleNamespace(settings={"prospector": True})
+    note = _say(mine, "LinkedIn's search answered nothing for \"x\", twice. It does that now and then: try again in a few minutes.")
+    assert "LinkedIn" not in note and "try again" in note.lower()
+    assert "Brave" not in _say(mine, "Brave Search refused the key (BRAVE_API_KEY).")
+    team = SimpleNamespace(settings={})
+    assert _say(team, "Brave Search refused") == "Brave Search refused"  # everyone else still sees what happened
+
+
+def test_a_prospectors_run_steps_say_what_not_which_tool(world, monkeypatch) -> None:
+    run, _ = linkedin_run(world, monkeypatch, settings={"prospector": True})
+    run_all(run, world)
+    text = " ".join(str(v.get("note", "")) for v in run.progress.values() if isinstance(v, dict)) + " " + (run.detail or "")
+    for name in ("LinkedIn", "Brave", "Apify", "Claude", "Apollo", "Google"):
+        assert name not in text, (name, text)

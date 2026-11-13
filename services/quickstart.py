@@ -154,18 +154,22 @@ async def _find_on_linkedin(session: Any, run: QuickstartRun) -> bool:
         return _fail(run, "find", detail)
     out = out or {}
     run.company_ids = [UUID(i) for i in out.get("companyIds", [])]
-    note = f"{out.get('added', 0)} new on LinkedIn" + (f", {out['duplicates']} already here" if out.get("duplicates") else "")
+    plain = _plain(run)
+    where = "" if plain else " on LinkedIn"
+    added = out.get("added", 0)
+    note = f"{added} new " + (("company" if added == 1 else "companies") if plain else "on LinkedIn") + (
+        f", {out['duplicates']} already here" if out.get("duplicates") else "")
     if out.get("notes"):
-        note += f". {out['notes'][0]}"
+        note += f". {_say(run, out['notes'][0])}"
     _set(run, "find", state="done", done=len(run.company_ids), total=s["companies"], note=note)
     if not run.company_ids:
         # LinkedIn answering nothing (it happens) is said as it is, not as "try other search terms".
         why = next((n for n in out.get("notes") or [] if "answered nothing" in n), None)
         if why:
-            return _finish(run, f"No companies this time. {why}")
+            return _finish(run, f"No companies this time. {_say(run, why)}")
         if out.get("duplicates"):
-            return _finish(run, f"Every company LinkedIn found ({out['duplicates']}) is here already. Try other search terms or places.")
-        return _finish(run, "No new companies were found on LinkedIn. Try other search terms or places.")
+            return _finish(run, f"Every company the search found ({out['duplicates']}) is here already. Try other search terms or places.")
+        return _finish(run, f"No new companies were found{where}. Try other search terms or places.")
     return _next(run, "google")
 
 
@@ -183,7 +187,7 @@ async def _google(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
         out = out or {}
         if not out.get("searched") and out.get("notes"):
             # Web search isn't set up, or refused: verify with what LinkedIn gave.
-            _set(run, "google", state="skipped", note=out["notes"][0])
+            _set(run, "google", state="skipped", note=_say(run, out["notes"][0]))
             return _next(run, "research")
         for key in ("websites", "instagram", "facebook"):
             found[key] = found.get(key, 0) + out.get(key, 0)
@@ -192,16 +196,33 @@ async def _google(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
         if out.get("notes"):
             # Refused partway (Brave's allowance ran out, say): the rest are verified with what LinkedIn gave.
             run.progress = {**run.progress, "_webbed": [str(i) for i in run.company_ids], "_web": found}
-            _set(run, "google", state="done", done=len(run.company_ids), total=len(run.company_ids), note=out["notes"][0])
+            _set(run, "google", state="done", done=len(run.company_ids), total=len(run.company_ids), note=_say(run, out["notes"][0]))
             return _next(run, "research")
         run.progress = {**run.progress, "_webbed": sorted(tried | {str(i) for i in todo}), "_web": found}
     tried = set(run.progress.get("_webbed", []))
     left = [i for i in run.company_ids if str(i) not in tried]
     note = f"{found.get('websites', 0)} websites, {found.get('instagram', 0)} Instagram and {found.get('facebook', 0)} Facebook pages found"
     if found.get("remaining") is not None:
-        note += f". {found['remaining']:,} free Brave searches left this month"
+        if not _plain(run):
+            note += f". {found['remaining']:,} free Brave searches left this month"
     _set(run, "google", state="running" if left else "done", done=len(tried), total=len(run.company_ids), note=note)
     return True if left else _next(run, "research")
+
+
+def _plain(run: QuickstartRun) -> bool:
+    """A Prospector's run: its messages say what happened, never which tool or source did it."""
+    return bool(run.settings.get("prospector"))
+
+
+def _say(run: QuickstartRun, note: str) -> str:
+    """A step's note as the run shows it: for a Prospector, without the names of the tools behind it."""
+    if not _plain(run):
+        return note
+    if "answered nothing" in note:
+        return "The search found nothing for one of your search words this time. Try again in a few minutes."
+    for name in ("LinkedIn's search", "Brave Search", "Brave", "Apify", "SearXNG", "Google (Apify)", "Google", "Claude", "Apollo", "Lead Intel"):
+        note = note.replace(name, "the search" if "search" in name.lower() else "the service")
+    return note
 
 
 def _engine(run: QuickstartRun) -> str:
@@ -309,7 +330,8 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
             # Web search not set up: no company is tried again.
             done = qualified if not (out or {}).get("companies") and (out or {}).get("notes") else nobody
             run.progress = {**run.progress, "_peopleweb": sorted(webbed | {str(i) for i in done})}
-            _set(run, "people", state="running", note="Looking on the web for people at companies LinkedIn found no one at")
+            _set(run, "people", state="running", note="Looking further for people at companies where no one was found yet"
+                 if _plain(run) else "Looking on the web for people at companies LinkedIn found no one at")  # fmt: skip
             return True
     if not left:
         # Small shops are often not on LinkedIn but publish an address on their site (orders@, info@), which
@@ -325,7 +347,7 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
     found = [p for p in people if str(p.id) not in had and p.email_status != "website"]
     from_site = sum(1 for p in people if str(p.id) not in had and p.email_status == "website")
     parts = [f"{len(already)} already here"] if already else []
-    parts.append(f"{len(found)} found on LinkedIn")
+    parts.append(f"{len(found)} found" + ("" if _plain(run) else " on LinkedIn"))
     if s["find_emails"] or already:
         parts.append(f"{sum(1 for p in [*already, *found] if p.email)} with an email")
     note = ", ".join(parts)
@@ -335,7 +357,8 @@ async def _people(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> boo
     if left:
         return True
     if not people:
-        return _finish(run, "No one was found on LinkedIn at the qualified companies, and none of their websites lists an email.")
+        return _finish(run, "No one was found at the qualified companies, and none of their websites lists an email." if _plain(run)
+                       else "No one was found on LinkedIn at the qualified companies, and none of their websites lists an email.")  # fmt: skip
     return _next(run, "leads")
 
 
@@ -444,7 +467,7 @@ async def _posts(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
             return _fail(run, "posts", detail)
         run.progress = {**run.progress, "_fetched": sorted(tried | {str(i) for i in todo})}
         if (out or {}).get("error"):
-            _set(run, "posts", note=f"Apify: {(out or {})['error']}")
+            _set(run, "posts", note="Their posts couldn't be read this time." if _plain(run) else f"Apify: {(out or {})['error']}")
     counts = await repo.post_counts(list(run.lead_ids))
     tried = set(run.progress.get("_fetched", []))
     left = [lead.id for lead in leads if str(lead.id) not in tried and lead.status in ("imported", "failed")]
@@ -507,7 +530,10 @@ async def _write(session: Any, repo: QuickstartRepo, run: QuickstartRun) -> bool
 
 
 async def _job(session: Any, run: QuickstartRun, path: str, body: dict[str, Any], label: str) -> tuple[bool, Any, str | None]:
-    """Run one endpoint as an ordinary job, as the run's starter, and read its answer."""
+    """Run one endpoint as an ordinary job, as the run's starter, and read its answer. A Prospector sees their jobs
+    (Background activity), so theirs are named for what they do, not the tool doing it."""
+    if _plain(run):
+        label = _say(run, label.replace(" on LinkedIn", ""))
     job = await JobRepo(session).create(run.workspace_id, run.created_by, path, label, {"path": path, "body": body})
     run.job_ids = [*run.job_ids, job.id]
     await session.commit()

@@ -627,7 +627,7 @@ async def find_on_linkedin(
         left = body.max_companies - len(ids)
         if left <= 0:
             break
-        await report("Searching LinkedIn", i, len(terms))
+        await report("Searching for companies", i, len(terms))
         wanted = min(left + max(3, min(left // 2, 25)), 1000)
         found: list = []
         stop = skip = False
@@ -708,7 +708,7 @@ async def web_search_companies(
     rows = await companies.get_many(workspace_id, list(dict.fromkeys(body.company_ids)))
     wanted = {c.id: _web_queries(c) for c in rows}
     queries = [q for w in wanted.values() for q in w.values()]
-    await report(f"Searching the web ({searcher.name})", 0, len(rows))
+    await report("Searching the web", 0, len(rows))
     out = await run_searches(searcher, queries, 10, calls, workspace_id)
     got = {"websites": 0, "instagram": 0, "facebook": 0}
     for c in rows:
@@ -752,7 +752,7 @@ async def people_from_the_web(
     record = apify_recorder(calls, workspace_id, "Find stakeholders")
     role = " OR ".join(quoted(t) for t in titles)
     query = {c.id: f"site:linkedin.com/in {quoted(c.name)} ({role})" for c in rows}
-    await report(f"Searching the web for people ({searcher.name})", 0, len(rows))
+    await report("Looking for people", 0, len(rows))
     searched = await run_searches(searcher, list(query.values()), 20, calls, workspace_id)
     profiles = new = 0
     cost, notes = searched.cost_usd or 0.0, list(searched.notes)
@@ -821,8 +821,8 @@ async def write_briefs(
             "icp_and_product": context,
             "company": {"name": c.name, "website": c.website_url or c.domain, "city": c.city, "state": c.state, "phone": c.phone,
                         "linkedin": c.linkedin_url, "instagram": c.instagram_url, "facebook": c.facebook_url, "twitter": c.twitter_url,
-                        "source": c.source, "status": c.status},  # fmt: skip
-            "linkedin_listing": c.raw if c.source == "linkedin" else None,
+                        "status": c.status},  # fmt: skip
+            "company_listing": c.raw if c.source == "linkedin" else None,
             "verdict": {"score": c.score, "detail": c.score_detail, "reason": c.status_reason},
             "website": research.get("website"),
             "instagram": research.get("instagram"),
