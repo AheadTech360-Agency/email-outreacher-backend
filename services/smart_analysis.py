@@ -7,6 +7,8 @@ import anthropic
 from pydantic import Field, ValidationError
 from sqlalchemy import text
 
+from models import OUTREACH_SCHEMA
+
 from schemas import ApiModel
 from services.claude import cost_usd, error_message
 from services.prompts import PLACEHOLDER, render
@@ -43,7 +45,7 @@ left join lateral (
 where e.workspace_id=:w and e.step=1 and e.sent_at>=:start and e.sent_at<:end
   and (cast(:icp as uuid) is null or l.lead_intel_icp_id=cast(:icp as uuid))
 order by e.sent_at,e.id limit 10001
-""")
+""".replace("outreach.", f"{OUTREACH_SCHEMA}."))
 ACTIVITY = text("""
 select count(*) as drafted,
  count(*) filter(where e.status in ('draft','edited')) as awaiting_review,
@@ -52,7 +54,7 @@ select count(*) as drafted,
 from outreach.eo_emails e join outreach.eo_leads l on l.id=e.lead_id and l.workspace_id=e.workspace_id
 where e.workspace_id=:w and e.step=1 and e.created_at>=:start and e.created_at<:end
  and (cast(:icp as uuid) is null or l.lead_intel_icp_id=cast(:icp as uuid))
-""")
+""".replace("outreach.", f"{OUTREACH_SCHEMA}."))
 
 
 def source_of(row):

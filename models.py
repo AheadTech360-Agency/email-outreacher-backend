@@ -33,8 +33,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from config import get_settings
 
-OUTREACH_SCHEMA = "outreach"
+
+# Where the eo_ tables live (config.db_schema, DB_SCHEMA): "outreach", or "public" in Coldbrew's own database.
+OUTREACH_SCHEMA = get_settings().db_schema
+# The schema the tables are declared in: none for `public` (the default schema), so Alembic, which reads the default
+# schema's tables without a name, matches them.
+TABLE_SCHEMA = None if OUTREACH_SCHEMA == "public" else OUTREACH_SCHEMA
 TABLE_PREFIX = "eo_"
 
 # Constraint and index names derive from the table name, so they carry the eo_ prefix too.
@@ -85,7 +91,7 @@ FALLBACK_5 = (
 
 
 class Base(DeclarativeBase):
-    metadata = MetaData(schema=OUTREACH_SCHEMA, naming_convention=NAMING)
+    metadata = MetaData(schema=TABLE_SCHEMA, naming_convention=NAMING)
 
 
 # ---------- People and workspaces ----------

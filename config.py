@@ -27,6 +27,9 @@ class Settings(BaseSettings):
 
     # Shared Lead Intel database (Supabase Postgres).
     database_url: str | None = None
+    # The Postgres schema Coldbrew's own eo_ tables live in: "outreach" while it shared Lead Intel's database,
+    # "public" (the default schema) in its own. Lead Intel's tables it reads (icps, businesses...) are in public either way.
+    db_schema: str = "outreach"
     supabase_url: str | None = None
     supabase_service_role_key: str | None = None
     # Where Supabase publishes the public keys its sign-in tokens are signed with. Defaults to the

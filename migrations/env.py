@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from config import get_settings
 from database import to_async_url
-from models import OUTREACH_SCHEMA, Base
+from models import OUTREACH_SCHEMA, TABLE_SCHEMA, Base
 
 config = context.config
 if config.config_file_name:
@@ -28,14 +28,18 @@ target_metadata = Base.metadata
 
 def include_name(name, type_, parent_names) -> bool:
     if type_ == "schema":
-        return name == OUTREACH_SCHEMA
+        # `public` is the default schema, which Alembic names None.
+        return name == OUTREACH_SCHEMA or (name is None and OUTREACH_SCHEMA == "public")
     return True
 
 
 def include_object(obj, name, type_, reflected, compare_to) -> bool:
+    """Only our eo_ tables. In Coldbrew's own database they share `public` with Lead Intel's (icps, businesses...),
+    which Alembic must never see, let alone propose dropping."""
     table = obj if type_ == "table" else getattr(obj, "table", None)
     schema = getattr(table, "schema", None) if table is not None else None
-    return schema == OUTREACH_SCHEMA
+    ours = schema == OUTREACH_SCHEMA or (schema is None and OUTREACH_SCHEMA == "public")
+    return ours and (table is None or table.name.startswith("eo_"))
 
 
 def _configure(connection=None, url=None) -> None:
@@ -47,7 +51,7 @@ def _configure(connection=None, url=None) -> None:
         include_name=include_name,
         include_object=include_object,
         version_table="eo_alembic_version",
-        version_table_schema=OUTREACH_SCHEMA,
+        version_table_schema=TABLE_SCHEMA,
         literal_binds=connection is None,
     )
 
@@ -63,6 +67,14 @@ def _run_sync(connection) -> None:
     _configure(connection=connection)
     with context.begin_transaction():
         context.run_migrations()
+        if OUTREACH_SCHEMA == "public":
+            # Supabase's Data API publishes `public` to anyone with the publishable key: every eo_ table, a new one
+            # included, gets row level security with no rules, so it reads nothing there (the backend owns the tables).
+            exposed = connection.execute(
+                text("select tablename from pg_tables where schemaname = 'public' and tablename like 'eo\\_%' and not rowsecurity")
+            ).scalars().all()
+            for table in exposed:
+                connection.execute(text(f'alter table public."{table}" enable row level security'))
 
 
 async def run_migrations_online() -> None:

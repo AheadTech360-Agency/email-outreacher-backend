@@ -5,6 +5,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
+
+from models import OUTREACH_SCHEMA
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_session
@@ -27,7 +29,7 @@ select
   (select count(*) from outreach.eo_smart_lists where workspace_id = :w and icp_draft is not null and lead_intel_icp_id is null) as draft_icps,
   (select count(distinct lead_id) from outreach.eo_send_events where workspace_id = :w and type = 'replied'
      and occurred_at > now() - interval '14 days') as replies
-""")
+""".replace("outreach.", f"{OUTREACH_SCHEMA}."))
 
 # Every person in exactly one stage: the furthest their first email got.
 STAGES = text("""
@@ -50,7 +52,7 @@ select icp_id,
   end as stage,
   count(*) as n
 from person group by 1, 2
-""")
+""".replace("outreach.", f"{OUTREACH_SCHEMA}."))
 
 # Companies with no ICP, by the smart list they're in (none: not sorted yet), so a whole list gets one at once.
 NO_ICP = text("""
@@ -60,11 +62,11 @@ left join outreach.eo_smart_list_members m on m.workspace_id = c.workspace_id an
 left join outreach.eo_smart_lists l on l.id = m.list_id
 where c.workspace_id = :w and c.icp_id is null and c.status <> 'not_fit'
 group by 1, 2, 4 order by 3 desc
-""")
+""".replace("outreach.", f"{OUTREACH_SCHEMA}."))
 
 COMPANIES = text("""
 select icp_id, status, count(*) as n from outreach.eo_companies where workspace_id = :w group by 1, 2
-""")
+""".replace("outreach.", f"{OUTREACH_SCHEMA}."))
 
 
 @router.get("")

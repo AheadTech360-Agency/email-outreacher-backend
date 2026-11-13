@@ -67,10 +67,17 @@ def test_alembic_filters_out_everything_but_outreach() -> None:
     assert namespace["include_name"]("outreach", "schema", {}) is True
     assert namespace["include_name"]("public", "schema", {}) is False
     assert namespace["include_name"](None, "schema", {}) is False
-    public_table = SimpleNamespace(schema=None)
+    public_table = SimpleNamespace(schema=None, name="businesses")
     assert namespace["include_object"](public_table, "businesses", "table", True, None) is False
-    assert namespace["include_object"](SimpleNamespace(schema="public"), "icps", "table", True, None) is False
-    assert namespace["include_object"](SimpleNamespace(schema="outreach"), "x", "table", False, None) is True
+    assert namespace["include_object"](SimpleNamespace(schema="public", name="icps"), "icps", "table", True, None) is False
+    assert namespace["include_object"](SimpleNamespace(schema="outreach", name="eo_leads"), "eo_leads", "table", False, None) is True
+
+    # In Coldbrew's own database the eo_ tables are in `public` (DB_SCHEMA=public), next to Lead Intel's: Alembic
+    # sees ours and never Lead Intel's, so it can never propose changing or dropping them.
+    namespace["OUTREACH_SCHEMA"] = "public"
+    assert namespace["include_object"](SimpleNamespace(schema="public", name="eo_leads"), "eo_leads", "table", False, None) is True
+    for lead_intel in ("icps", "businesses", "field_metadata", "identity_keys"):
+        assert namespace["include_object"](SimpleNamespace(schema="public", name=lead_intel), lead_intel, "table", True, None) is False
 
 
 def test_supabase_url_is_converted_for_asyncpg() -> None:
