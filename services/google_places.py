@@ -3,8 +3,8 @@
 Lead Intel doesn't scrape Google Maps: it calls Google's own Places Text Search, over a grid of
 points around a place. The same here:
 
-1. The place ("Miami, FL") resolves to a centre point, guarded so a vague name can't land on a
-   business or in another country.
+1. The place ("Miami, FL", "Karachi") resolves to a centre point, guarded so a vague name can't land on a
+   business. Any country: the US only breaks ties ("Springfield" is the one in the US).
 2. A grid of circles covers the radius around it. Each circle is searched for the term, up to
    3 pages of 20 (Google never returns more than 60 for one search).
 3. A circle that comes back full may hold more than Google showed, so it splits into smaller
@@ -37,7 +37,7 @@ CENTER_COST_USD = 0.032
 # Never widen casually: each field can move the request to a dearer SKU.
 SEARCH_FIELDS = ",".join([
     "places.id", "places.displayName", "places.formattedAddress", "places.addressComponents",
-    "places.location", "places.nationalPhoneNumber", "places.websiteUri", "places.rating",
+    "places.location", "places.nationalPhoneNumber", "places.internationalPhoneNumber", "places.websiteUri", "places.rating",
     "places.userRatingCount", "places.businessStatus", "places.primaryType", "nextPageToken",
 ])  # fmt: skip
 # Pro-tier only: the centre needs no phone or website, and asking would cost more for nothing.
@@ -225,7 +225,8 @@ def _to_place(raw: dict[str, Any]) -> Place | None:
         place_id=raw["id"],
         name=name,
         website_url=(raw.get("websiteUri") or "").strip() or None,
-        phone=raw.get("nationalPhoneNumber"),
+        # US numbers as Americans write them; elsewhere with the country code, so they can be dialled from here.
+        phone=raw.get("nationalPhoneNumber") if _component(raw, "country", "shortText") in (None, "US") else (raw.get("internationalPhoneNumber") or raw.get("nationalPhoneNumber")),
         address=raw.get("formattedAddress"),
         city=_component(raw, "locality", "longText"),
         state=_component(raw, "administrative_area_level_1", "shortText"),
@@ -273,17 +274,14 @@ class PlacesClient:
         return area.lat, area.lng, area.label
 
     async def area(self, location: str, country: str = "US") -> Area:
-        """The centre point of a city, state or postcode, and for a state or country its boundary box.
-        Raises PlacesError when it resolves to a business or to somewhere outside `country`, rather
-        than searching the wrong place."""
+        """The centre point of a city, state or postcode, and for a state or country its boundary box, anywhere in
+        the world. `country` only breaks ties between places with the same name. Raises PlacesError when it
+        resolves to a business rather than an area, rather than searching the wrong place."""
         data = await self._post(CENTER_FIELDS, {"textQuery": location, "pageSize": 1, "regionCode": country})
         found = (data.get("places") or [None])[0]
         if not found or not found.get("location"):
             raise PlacesError(f'No place matched "{location}".')
         name = (found.get("displayName") or {}).get("text") or location
-        resolved = (_component(found, "country", "shortText") or "").upper()
-        if resolved != country.upper():
-            raise PlacesError(f'"{location}" resolved to {name}{f" in {resolved}" if resolved else ""}, not {country}. Add a state, e.g. "Springfield, IL".')
         types = set(found.get("types") or [])
         if "establishment" in types or not types & AREA_TYPES:
             raise PlacesError(f'"{location}" resolved to a business ({name}), not a city or area. Try a city, state or postcode.')

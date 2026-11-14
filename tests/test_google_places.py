@@ -128,8 +128,12 @@ async def test_center_resolves_and_guards() -> None:
 
     karachi = {"places": [{"displayName": {"text": "Springfield School"}, "location": {"latitude": 24.8, "longitude": 67.0},
                            "types": ["school", "establishment"], "addressComponents": [{"shortText": "PK", "types": ["country"]}]}]}  # fmt: skip
-    with pytest.raises(PlacesError, match="not US"):
+    with pytest.raises(PlacesError, match="business"):
         await client_for(FakeGoogle(center=karachi)).center("Springfield")
+    # Any country: Karachi itself is searched, not refused (2026-11-14).
+    city = {"places": [{"displayName": {"text": "Karachi"}, "formattedAddress": "Karachi, Pakistan", "location": {"latitude": 24.86, "longitude": 67.0},
+                        "types": ["locality", "political"], "addressComponents": [{"shortText": "PK", "types": ["country"]}]}]}  # fmt: skip
+    assert await client_for(FakeGoogle(center=city)).center("Karachi") == (24.86, 67.0, "Karachi, Pakistan")
     shop = {"places": [{"displayName": {"text": "Ink Co"}, "location": {"latitude": 41.9, "longitude": -87.6},
                         "types": ["store", "establishment"], "addressComponents": [{"shortText": "US", "types": ["country"]}]}]}  # fmt: skip
     with pytest.raises(PlacesError, match="business"):
@@ -292,3 +296,15 @@ def test_the_request_limit_is_shared_by_every_term_and_place(client, env) -> Non
     # 30 between 3 terms: 10 each (each fake search uses 4 of its share, so the rest passes on).
     assert [a[3] for a in fake.asked] == [10, 13, 22]
     assert r["googleMaps"]["searches"] == 12
+
+
+def test_phones_outside_the_us_keep_their_country_code() -> None:
+    from services.google_places import _to_place
+
+    def raw(country):
+        return {"id": "p", "displayName": {"text": "Shop"}, "nationalPhoneNumber": "021 3456789", "internationalPhoneNumber": "+92 21 3456789",
+                "addressComponents": [{"shortText": country, "types": ["country"]}]}  # fmt: skip
+
+    assert _to_place(raw("PK")).phone == "+92 21 3456789"
+    us = raw("US") | {"nationalPhoneNumber": "(312) 555-0100", "internationalPhoneNumber": "+1 312-555-0100"}
+    assert _to_place(us).phone == "(312) 555-0100"
